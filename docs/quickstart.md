@@ -2,375 +2,267 @@
 
 [English](quickstart.md) | [简体中文](quickstart.zh-CN.md)
 
-This guide gets you productive in Late in under 5 minutes.
+Get from install to your first autonomous coding task in a couple of minutes.
 
-## Contents
-- [Setup](#setup)
-- [Interface](#interface)
-- [Giving Good Instructions](#giving-good-instructions)
-- [Tool Approval](#tool-approval)
-- [Configuration](#configuration)
-- [MCP Integration](#mcp-integration)
-- [Agent Skills](#agent-skills)
-- [Plugins](#plugins)
-- [File Exclusions](#file-exclusions)
-- [Common Flags](#common-flags)
-- [Sessions](#sessions)
-- [Git Worktrees](#git-worktrees)
+## Install
 
-## Setup
-
-**1. Set your endpoint** (any OpenAI-compatible API, e.g. llama.cpp, [DeepSeek](https://api-docs.deepseek.com/), [Google](https://ai.google.dev/gemini-api/docs/openai), [Anthropic](https://platform.claude.com/docs/en/api/openai-sdk), [OpenRouter](https://openrouter.ai/docs/quickstart)): 
+### Homebrew — Linux / macOS
 
 ```bash
-# Local (e.g. llama.cpp)
-export OPENAI_BASE_URL="http://localhost:8080"
-
-# Cloud (e.g. DeepSeek)
-export OPENAI_BASE_URL="https://api.deepseek.com/"
-export OPENAI_API_KEY="your-api-key"
-export OPENAI_MODEL="deepseek-v4-pro"
+brew tap mlhher/late && brew install late
 ```
 
-> **Windows:** Use your preferred shell's syntax for all environment variables for example `$env:OPENAI_BASE_URL="http://localhost:8080"` in PowerShell.
+### Universal installer — Linux / macOS / Windows WSL
 
-**2. Launch Late from your project directory:**
+```bash
+curl -sfL https://raw.githubusercontent.com/mlhher/late-cli/main/install.sh | bash
+```
+
+Manual binaries for Linux, macOS, and native Windows are available from the [GitHub Releases](https://github.com/mlhher/late-cli/releases).
+
+---
+
+## Local Models: Zero Configuration
+
+Late automatically looks for an OpenAI-compatible `llama-server` on `localhost:8080`.
+
+Start `llama-server` with your GGUF model as usual, then launch Late from your project:
 
 ```bash
 cd your-project
 late
 ```
 
-> **macOS:** If macOS blocks the binary, run this command in your terminal (adjust the path if needed): `xattr -d com.apple.quarantine ~/.local/bin/late`
+That's it. If `llama-server` is already running on `:8080`, Late finds it automatically—no Late configuration required.
 
-**3. Hybrid Routing (Optional):**
-By default, Late uses the same model for both the Lead Architect (orchestrator) and the ephemeral workers (subagents). You can mix and match models by setting separate environment variables.
-Check the [Configuration](#configuration) section to find out how to persist these settings.
+---
 
-This is useful for using a large, smart model for planning and a fast, cheap model for execution:
+## Cloud/Remote Models
+
+Late works with OpenAI-compatible APIs including DeepSeek, Claude, GPT, Kimi, GLM, OpenRouter, and others.
+
+Set:
 
 ```bash
-export LATE_SUBAGENT_MODEL="gemma-4-e4b"
-export LATE_SUBAGENT_BASE_URL="http://10.8.0.2:8080" # (Optional) falls back to OPENAI_BASE_URL
-export LATE_SUBAGENT_API_KEY="your-other-key"        # (Optional) falls back to OPENAI_API_KEY
+# DeepSeek
+export OPENAI_BASE_URL="https://api.deepseek.com" # your-api-url
+export OPENAI_API_KEY="sk-123" # your-api-key
+export OPENAI_MODEL="deepseek-flash" # your-model-name
 ```
 
-## Interface
+Then run:
 
-Late is a terminal UI with three areas: the **chat viewport** (scrollable history), the **input box** (bottom), and the **status bar** (shows mode, status, token count, and available keybindings).
-
-### Keybindings
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Send your message (`Alt+Enter` for a new line) |
-| `↑` `↓` `PgUp` `PgDn` | Scroll chat viewport |
-| `Home` / `End` | Move cursor to line start/end (scrolls chat viewport if input is empty) |
-| `Shift+Home/End` | Scroll chat viewport to top/bottom |
-| `Tab` | Switch between agent tabs (orchestrator ↔ subagents) |
-| `Ctrl+O` | Open the file picker to attach files |
-| `Ctrl+X` | Clear all attached files |
-| `Ctrl+H` | Show keyboard help overlay |
-| `Esc` / `Ctrl+G` | Stop the current agent (cancel generation) |
-| `Ctrl+D` / `Ctrl+C` | Quit Late |
-| `Double-click` | Copy message to clipboard |
-
-> **Tip:** Late supports standard terminal editing like `Alt+Arrows` (word jump), and `Alt+Backspace/Del` (delete word).
-
-### Slash Commands
-
-Type `/` into the input box to bring up a command picker. You can navigate through the available commands with the `Up`/`Down` arrow keys and select one by pressing `Enter`. You do not have to type out the full command.
-
-| Command | Description |
-| --- | --- |
-| `/compose` | Open your system's default external editor (`$EDITOR`) to draft long or complex instructions. |
-| `/help` | Show default keybindings. |
-| `/log` | Open the Git commit log viewer. |
-| `/model` | Select the model used by the orchestrator and each subagent type. |
-| `/new` | Start a new session/chat. |
-| `/quit` | Exit Late. |
-| `/rewind` | Open a visual history of your messages to rewind the conversation to an earlier point. |
-| `/themes` | Open the theme picker or switch themes (`/themes [name]`). |
-
-### File Attachments
-
-Press `Ctrl+O` to open the file picker. Navigate with arrow keys, press `Enter` to select a file or enter a folder, `Backspace` to go up, and `Esc` to cancel.
-
-- **Text files** (source code, configs, logs, etc.) are attached as inline content and work with all models.
-- **Images** (PNG, JPEG, etc.) are only allowed if the model supports vision. Late checks the actual file content (not the extension) to determine the file type. If you try to attach an image to a model without vision support, Late will reject it with an error.
-
-Attached files appear in the status bar as a green counter. Use `Ctrl+X` to clear all attachments before sending. Attachments are automatically cleared after you send a message.
-
-### Agent Tabs
-
-When Late spawns subagents, each one gets its own tab. Use `Tab` to cycle through them:
-
-- **Main** — the orchestrator (Lead Architect). It plans and delegates.
-- **Subagent tabs** — ephemeral workers executing isolated tasks. They appear when spawned and disappear when finished.
-
-The status bar at the bottom shows which agent you're currently viewing and its state (Idle, Thinking, Streaming, etc.).
-
-> **Tip:** If a subagent seems stuck, switch to it with `Tab` to see what it's doing. You can stop it with `Esc` or `Ctrl+G` without affecting the orchestrator.
-
-## Giving Good Instructions
-
-Late works best with clear, specific instructions. Some examples:
-
+```bash
+cd your-project
+late
 ```
-# Good
+
+You can later persist model settings in Late's `config.json` instead of exporting environment variables every time.
+
+---
+
+## Give Late a Task
+
+Talk to Late like you would another engineer.
+
+For example:
+
+```text
 Add input validation to the CreateUser handler in api/users.go.
-Check for empty email and name fields, return 400 with a JSON error.
-
-# Good
-Refactor the database package to use connection pooling.
-The pool config should come from environment variables.
-
-# Bad
-Make the code better.
+Check for empty email and name fields, return 400 with a JSON error,
+and add regression tests.
 ```
 
-Late will read your codebase, plan the implementation, and ask you for approval. Make sure to read the generated implementation plan (`./implementation_plan.md`) and the intended changes before approving.
+Or give it something much larger:
+
+```text
+Refactor the database package to use connection pooling.
+Keep existing behavior intact, update affected tests, and verify
+the full test suite still passes.
+```
+
+Late's orchestrator plans the work and delegates implementation and research to isolated subagents rather than carrying every file read, command result, edit, and test log in one growing context.
+
+---
+
+## The TUI
+
+Late keeps the orchestrator and active subagents visible inside the same terminal interface.
+
+The essentials:
+
+| Key / Command       | Action                                               |
+| ------------------- | ---------------------------------------------------- |
+| `Tab`               | Switch between the orchestrator and active subagents |
+| `Ctrl+O`            | Attach a file                                        |
+| `Esc` / `Ctrl+G`    | Stop the currently running agent                     |
+| `/model`            | Change orchestrator or worker models                 |
+| `/rewind`           | Rewind to an earlier point in the conversation       |
+| `/themes`           | Change the TUI theme                                 |
+| `/compose`          | Draft a longer instruction in your `$EDITOR`         |
+| `Ctrl+D` / `Ctrl+C` | Quit                                                 |
+
+Type `/` at any time to open the command picker.
+
+When Late creates subagents, each appears in its own tab while it works and disappears after completing its task.
+
+---
 
 ## Tool Approval
 
-When the agent wants to run a command or edit a file, you'll see a confirmation prompt:
+Potentially destructive commands and file changes require approval unless you have already granted permission for that scope.
 
+When prompted, you can approve:
+
+* once;
+* for the current session;
+* for the current project;
+* globally.
+
+Read-only operations are generally handled automatically.
+
+Approvals decay over time rather than becoming permanent trust forever.
+
+---
+
+## Run Fully Autonomously with Podman
+
+For unattended work, large refactors, or overnight runs, use `late-podman`.
+
+It runs Late inside an isolated rootless Podman container rather than giving the agent unrestricted access to your host.
+
+From a project with a supported devcontainer:
+
+```bash
+late-podman
 ```
-The agent wants to execute a bash command.
-   {"command":"npm run build"}
-> Press [y] Allow once | [s] Allow always (session) | [p] Allow always (project) | [g] Allow always (global) | [n] Deny
+
+Late automatically looks for container configuration in the project, including `.devcontainer/devcontainer.json`. For an example check Late's own [devocontainer.json](../.devcontainer/devcontainer.json).
+
+You can also specify an image explicitly:
+
+```bash
+late-podman --image your-development-image
 ```
 
-- **Read-only commands** (`ls`, `cat`, `grep`, etc.) are auto-approved for speed (Note: the listed commands can still require permission if Late deems the agents activity suspicious)
-- **Everything else** requires explicit approval.
-- Use **`[y] Allow once`** to approve only this single tool call.
-- Use **`[s] Allow always (session)`** to auto-approve matching requests for the rest of the current session.
-- Use **`[p] Allow always (project)`** to remember approval for this project.
-- Use **`[g] Allow always (global)`** to remember approval across all projects on this machine.
-- Use **`[n] Deny`** to block the request.
+Arguments after `--` are forwarded to Late:
 
-This keeps one-off actions safe while reducing repetitive prompts when you trust a tool in a broader scope.
+```bash
+late-podman -- --continue
+```
 
-> **Tip:** Approval keys (`y`, `n`, etc.) only work if the input box is **empty**. If you have already started typing a message, Late will prioritize your text. You can send your message first (it will be **queued** and processed after the tool call finishes) and then use the single-key shortcuts once the input box is cleared.
+Your current workspace is mounted read-write at `/workspace`. Late keeps its own session and cache volumes, forwards your SSH agent when available, and mounts your Late configuration read-only if present. Your host home directory and container socket are not exposed by default.
 
+> **Note:** `late-podman` requires Linux with Podman installed. Silverblue and Universal Blue are supported out of the box, including SELinux-aware container handling.
 
-### Permission Decay (TTL)
+> **Note:** Devcontainer configurations may declare additional mounts. Late respects those when constructing the sandbox.
 
-"Always" approvals are not permanent. Late uses TTL (time-to-live) so trust decays over time:
+---
 
-- **Session scope** (`[s]`) lasts **30 minutes**.
-- **Project scope** (`[p]`) lasts **30 days**.
-- **Global scope** (`[g]`) lasts **30 days**.
+## Hybrid Model Routing
 
-When a TTL expires, the approval is automatically ignored and Late will prompt you again. This is intentional: it reduces long-lived stale permissions while keeping day-to-day workflows smooth.
+By default, Late uses the same model for the orchestrator and its workers.
 
-Notes:
+You can instead use one model for planning and another for execution:
 
-- Re-approving a tool/command in the same scope refreshes its TTL.
-- Session approvals are in-memory and expire quickly by design.
-- Project/global approvals are persisted with an expiry timestamp and checked at load time.
+```bash
+export LATE_SUBAGENT_MODEL="worker-model"
+export LATE_SUBAGENT_BASE_URL="http://localhost:8080"
+export LATE_SUBAGENT_API_KEY="your-other-key"
+```
+
+Or use `/model` from inside Late to change models interactively.
+
+This is useful for routing architecture and planning to a stronger model while using smaller or faster models for worker tasks.
+
+---
+
+## Start with a Prompt
+
+For scripts or unattended workflows:
+
+```bash
+late --prompt "Run the test suite, diagnose the failures, and fix them."
+```
+
+If using `late-podman`:
+
+```bash
+late-podman -- --prompt "Refactor this package and verify all tests."
+```
+
+---
+
+## Resume Previous Work
+
+Late automatically saves sessions.
+
+Resume the previous session:
+
+```bash
+late --continue
+```
+
+Or inspect saved sessions:
+
+```bash
+late session list
+```
+
+---
+
+## Plugins, Skills, and MCP
+
+Late supports:
+
+* Plugins
+* Agent Skills
+* MCP servers
+* Custom slash commands
+* Themes
+* Lifecycle hooks
+* Custom tools
+
+Install a plugin:
+
+```bash
+late plugin install <package>
+```
+
+Plugins can be installed from npm, Git repositories, local directories, or a configured registry.
+
+For plugin development and the manifest format, see [Plugin SDK](plugin-sdk.md).
+
+---
 
 ## Configuration
 
-You can set your preferred model selection (orchestrator, subagents) and their respective configuration (host, keys) permanently inside the `config.json`.
+Persistent configuration lives at:
 
-**File Locations:**
-* **Linux:** `~/.config/late/config.json`
-* **macOS:** `~/Library/Application Support/late/config.json`
-* **Windows:** `%APPDATA%\late\config.json`
+**Linux**
 
-**Setting Precedence:**
-1. Non-empty environment variables
+```text
+~/.config/late/config.json
+```
+
+**macOS**
+
+```text
+~/Library/Application Support/late/config.json
+```
+
+**Windows**
+
+```text
+%APPDATA%\late\config.json
+```
+
+Configuration precedence is:
+
+1. Environment variables
 2. `config.json`
-3. Defaults
+3. Late defaults
 
+For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
 
-```json
-{
-  "openai_base_url": "http://localhost:8080",
-  "openai_api_key": "your-api-key",
-  "openai_model": "qwen3.6-35b-a3b",
-  "late_subagent_base_url": "http://10.8.0.2:8080",
-  "late_subagent_api_key": "your-other-api-key",
-  "late_subagent_model": "gemma-4-e4b"
-}
-```
-
-## MCP Integration
-
-Late supports the Model Context Protocol. Add your MCP servers to one of the following locations:
-
-* **Global (Linux):** `~/.config/late/mcp_config.json`
-* **Global (macOS):** `~/Library/Application Support/late/mcp_config.json`
-* **Global (Windows):** `%APPDATA%\late\mcp_config.json`
-* **Project-local:** `.late/mcp_config.json`
-
-```json
-{
-  "mcpServers": {
-    "my-server": {
-      "command": "npx",
-      "args": ["-y", "my-mcp-server"]
-    }
-  }
-}
-```
-
-## Agent Skills
-
-[Skills](https://agentskills.io/) are reusable sets of instructions. They are discovered automatically from:
-* **Global (Linux):** `~/.config/late/skills/`
-* **Global (macOS):** `~/Library/Application Support/late/skills/`
-* **Global (Windows):** `%APPDATA%\late\skills\`
-* **Project:** `.late/skills/`
-
-There is no further setup required. Just add your skills to the directories and they will be discovered automatically. Late also supports automatic skill reference discovery.
-
-## Plugins
-
-Plugins bundle any combination of **skills**, **slash commands**, **MCP servers**, **hooks**, **themes**, and **inline tools** into one installable unit. They are discovered automatically from:
-
-* **Global (Linux):** `~/.config/late/plugins/`
-* **Global (macOS):** `~/Library/Application Support/late/plugins/`
-* **Global (Windows):** `%APPDATA%\late\plugins\`
-* **Project:** `.late/plugins/` (overrides global plugins with the same name)
-
-### Install
-
-```bash
-# From npm
-late plugin install @late/git-helper
-
-# From a Git repo
-late plugin install https://github.com/you/late-plugin-git.git
-# shorthand: github:you/late-plugin-git
-
-# From a local path (development)
-late plugin install ./my-plugin
-
-# Project-local (per-repo)
-late plugin install --project ./my-plugin
-
-# From the marketplace (bare name → registry lookup → npm/git fallback)
-late plugin install git-helper
-```
-
-If the marketplace is unreachable, install falls back to treating the bare name as an npm package. Override the registry with `LATE_PLUGIN_REGISTRY=https://registry.example.com/v1`.
-
-### Manage
-
-```bash
-late plugin list                # show installed + their source/enabled state
-late plugin enable  <name>      # activate without removing
-late plugin disable <name>      # deactivate without removing
-late plugin remove  <name>      # uninstall
-
-# Re-fetch every npm/git plugin in place (atomic git swap, npm @latest)
-late plugin update [<name>]
-```
-
-### What a plugin can ship
-
-A `package.json` with a `"late"` field declares its surfaces:
-
-| Surface     | Example field                       | Appears as                |
-| ----------- | ----------------------------------- | ------------------------- |
-| Skills      | `"skills": ["skills/"]`             | Auto-loaded instructions  |
-| MCP servers | `"mcp": { "servers": {...} }`       | Available tools           |
-| Commands    | `"commands": ["/weather"]`          | `/weather` in the chat    |
-| Themes      | `"themes": ["themes/dark.json"]`    | Switchable from `/themes` |
-| Hooks       | `"hooks": { "onMessageSend": [...] }` | Middleware on tool/LLM    |
-| Tools       | `"tools": [{ "name": "...", ... }]` | Custom in-agent tools     |
-
-For the full manifest schema (including the older `"commands"` string array, env-var expansion in MCP configs, hook veto/mutate semantics, and a copy-pasteable reference plugin), see [`docs/plugin-sdk.md`](./plugin-sdk.md) and [`docs/plugin-example.md`](./plugin-example.md).
-
-## File Exclusions
-
-Late's native search tool respects your project's `.gitignore` automatically, saving LLM context by excluding vendor and build directories. 
-
-You can also create an `.llmignore` file alongside your `.gitignore` to specifically hide files from the agent (e.g., secrets, large binaries, test fixtures, or generated code) without affecting your git tracking.
-
-## Common Flags
-
-| Flag | Description |
-| --- | --- |
-| `--help` | Show all flags and commands |
-| `--version` | Show version information |
-| `--continue` | Resume the previous session |
-| `--prompt "..."` | Start the agent immediately with the given prompt |
-| `--theme "<id>"` | Apply a plugin theme on launch (e.g. `<plugin>:<name>`); also reads `$LATE_THEME` |
-| `--gemma-thinking` | Inject thinking tokens for Gemma 4 models |
-| `--subagent-max-turns <n>` | Set max turns per subagent (default: 500) |
-| `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
-| `--enable-images` | Treat models as supporting images (for none llama.cpp servers) |
-| `--save-subagent-histories` | Persist subagent conversation histories to disk. Off by default (subagent transcripts are large); can also be enabled via `save_subagent_histories` in the config file |
-
-## Native Containerized Execution (`late-podman`)
-
-Let the agent run anything it wants inside an isolated container, fully autonomously—solving tasks from start to finish without having to babysit it.
-
-Runs on any Linux distro with Podman. Works out of the box on Silverblue and Universal Blue, with built-in SELinux support. On other systems, it only requires installing Podman (e.g. `sudo pacman -S podman` or `sudo apt install podman`).
-
-On Linux systems with rootless Podman, `late-podman` runs Late in a glibc-based
-development image and mounts the current directory at `/workspace`:
-
-```bash
-late-podman --image registry.example/my-project-dev
-```
-
-The image must contain Bash and every language or SDK required by the project.
-If no `--image` is supplied, Late automatically searches for configuration in the following order:
-1. `.devcontainer/devcontainer.json` (or `.devcontainer.json`) with `build.dockerfile`
-2. `.late/podman-image`
-3. `.devcontainer/devcontainer.json` with `image`
-4. Interactive terminal prompt
-
-Images built from a `Dockerfile` and `postCreateCommand` setups are cached automatically and only rerun when their definitions change. Use `--rebuild` to force rebuild the image and re-run setup commands.
-
-Developer-specific mounts and environment variables can be defined in untracked local override files (`.devcontainer/devcontainer.local.json` or `.late/devcontainer.json`), which are automatically merged into the container configuration.
-
-Use `-e` or `--env` to set or forward environment variables into the container (e.g. `-e KEY=value` or `-e KEY` to forward from host). Timezone (`TZ` / `/etc/localtime`), host Git identity (`user.name`, `user.email`), `safe.directory`, and running SSH agents (`SSH_AUTH_SOCK`) are forwarded automatically.
-
-Use `--exec` to prepare the container before Late starts. It is a Bash command,
-may be repeated, and Late starts only if every command succeeds:
-
-```bash
-late-podman --image fedora:latest \
-  -e CGO_ENABLED=1 \
-  --exec "dnf install -y golang nodejs npm" \
-  --exec "npm install" \
-  -- --continue
-```
-
-If your project contains a `.devcontainer/devcontainer.json`, any `postCreateCommand` is run on initial container setup, and `postStartCommand` runs on container start before `--exec` commands.
-
-Alpine and other musl-based images are unsupported. The launcher uses rootless
-Podman, does not relabel the host workspace, and does not mount the host home or
-container socket. It uses the host network so model servers listening on
-`localhost`, including loopback-only servers, remain reachable with the same
-Late configuration. Consequently, processes inside the development container
-can also reach other services listening on the host.
-
-## Sessions
-
-Late automatically saves your session history. Resume or manage sessions:
-
-```bash
-late session list          # List all saved sessions
-late session list -v       # Verbose listing with details
-late session load <id>     # Resume a previous session
-late session delete <id>   # Delete a session
-```
-
-## Git Worktrees
-
-Late is designed for parallel development. You can manage Git worktrees directly to run separate agent instances in isolated environments:
-
-```bash
-late worktree list               # List all worktrees
-late worktree active             # Show current worktree
-late worktree create <path> [br] # Create a new worktree at <path>
-late worktree remove <path>      # Remove a worktree
-```
-
-> **Tip:** Use worktrees when you want Late to work on a feature in the background while you continue working on another branch.
+---
