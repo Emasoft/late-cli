@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <b>Getting real world work done on consumer hardware.</b><br><br>
-  A zero-config AI coding agent built on empirical research.<br>
-  Enforced ephemeral subagents prevent context degradation by design.<br>
-  From tiny local models up to any frontier model.<br>
+  <b>64k context. 200k+ tokens of work.</b><br><br>
+  Late lets models work far beyond what fits inside a single context window, and still see the bigger picture.<br>
+  On Senior SWE-Bench, the same DeepSeek model (<code>deepseek-v4.1-flash</code>) completed <b>3/3 objectives with Late vs 1/3 with OpenCode</b> on the same task.<br>
+  In local testing, a 35B-A3B model at 3-bit quantization completed <b>200k+ tokens of agentic work while its orchestrator stayed below 64k. OpenCode on the same task hit context length limits</b>.<br>
 </p>
 
 <p align="center">
@@ -18,28 +18,19 @@
   <a href="https://deepwiki.com/mlhher/late-cli"><img src="https://img.shields.io/badge/DeepWiki-docs-blue.svg?style=flat" alt="DeepWiki"></a>
 </p>
 
-<div align="center">
-  <br/>
-  <img src="assets/late-subagent-handoff.png" alt="Late Orchestrator planning a multi-phase implementation and spawning the first subagent">
-  <br/>
-  <i>Late Orchestrator forming a plan and spawning atomic subagents for surgical edits.</i>
-  <br/><br/>
-</div>
-
 > [Outperforming Claude Code and Codex for Local LLM Workflows](https://agentnativedev.medium.com/outperforming-claude-code-and-codex-for-local-llm-workflows-5de0e2b1add5) — Agent Native
->
-> *"Late-CLI is mindblowing... I'm shocked that the token usage is so minimal, I keep expecting a big bill from DeepSeek's API."* — GitHub Discussions
->
-> *"The same model feels smarter with Late."* — Reddit
 >
 > *"You solved local AI coding for me."* — Reddit
 >
+> *"Late-CLI is mindblowing... it's a true hidden gem."* — GitHub Discussions
+>
+> *"The same model feels smarter with Late."* — Reddit
+>
 > **Built with Late:** Late is primarily developed inside Late itself.
-
 
 ## 10-Second Quickstart
 
-A single, statically compiled binary. Zero dependencies. No Python venvs, no NodeJS.
+A single, statically compiled binary. Zero dependencies. No Python venvs, no Node.js.
 
 ```bash
 # Linux / macOS (Homebrew)
@@ -52,47 +43,158 @@ curl -sfL https://raw.githubusercontent.com/mlhher/late-cli/main/install.sh | ba
 ```
 
 ```bash
-# Run instantly in any project
+# Launch interactively in any project
 cd your-project
 late
 ```
-
 *Manual Binaries: [Linux, macOS, native Windows](https://github.com/mlhher/late-cli/releases)*
+
+One binary. Zero configuration. If `llama-server` is already running, Late finds it automatically.
+
+<div align="center">
+  <br/>
+  <img src="assets/late-subagent-handoff.png" alt="Late Orchestrator planning a multi-phase implementation and spawning the first subagent">
+  <br/>
+    <i>Late autonomously planning, delegating, and executing inside the TUI.</i>
+  <br/><br/>
+</div>
+
+
+## Same DeepSeek Model (`deepseek-v4.1-flash`): OpenCode 1/3. Late 3/3.
+
+A controlled run on [Senior SWE-Bench `turborepo-perf-reuse-input-hashes`](https://senior-swe-bench.snorkel.ai/tasks/turborepo-perf-reuse-input-hashes), using the **same DeepSeek-V4.1-Flash model, same base commit, and same task prompt**:
+
+|  | OpenCode | Late (`late-podman`) |
+| :--- | ---: | ---: |
+| **Benchmark objectives completed** | **1 / 3** | **3 / 3** |
+| **Explicit-input Git OID fast-path** | Missed | **Implemented** |
+| **Targeted regression tests added** | 0 | **3** |
+| **Architecture docs updated** | No | **Yes** |
+| **Wall time** | 5m 16s | ~14m |
+| **API cost** | $0.04 | $0.21 |
+| **Aggregate API tokens** | 3.61M | 16.18M |
+
+Late was slower and deliberately spent **~4.5× more aggregate inference**. That is the point: it can burn cheap, disposable compute without forcing all of that work into one decision-making context. Across two researchers and five implementation workers, the **orchestrator itself finished at only ~97k total trajectory tokens**. 
+
+**Specifically, OpenCode also spawned an exploration subagent, which consumed ~2.3M cached input tokens and ~108k uncached input tokens, yet it still converged on the partial solution and missed the Git OID fast-path.** Late instead kept research and implementation work behind enforced context boundaries, decomposed the task across multiple isolated workers, and found the full cross-component solution.
+
+**The result Late is optimizing for is not minimum total tokens, nor merely "having subagents." It is maximum useful work per unit of central context.**
+
+This is one controlled benchmark run, not a benchmark suite. But the same qualitative pattern has repeatedly shown up in local testing with smaller, heavily quantized models: as tasks get longer, more architectural, and more subtle, monolithic/direct-execution trajectories degrade or converge early while Late keeps the orchestrator focused and continues spending isolated worker compute. In practice, this has let models around **35B at 3-bit quantization** complete multi-file tasks that repeatedly failed in conventional harnesses.
+
+For local inference—or APIs cheap enough that token cost is secondary—the trade becomes especially attractive: **a model can keep working long after the cumulative task has exceeded what could ever fit in its own context window.** Late spends more compute, preserves less execution noise, and keeps the decision-making context usable for longer.
+
+---
 
 ## The Architectural Bottleneck
 
-**The Problem:** Standard coding agents try to do everything inside a single, shared context window. Every codebase analysis, compile error, lint failure, and file read piles up in the KV cache. As the context fills with garbage, the model's intelligence actively degrades. You blame the model, but it's an architecture failure.
+**The Problem:** Standard coding agents still let the primary agent directly absorb codebase scans, compiler errors, file reads, failed diffs, and retries into one growing trajectory. As that execution noise accumulates in the KV cache, model reasoning quality degrades severely. You blame the model, but it's an architectural failure.
 
-> **The 40% Collapse:** Long-context LLMs suffer up to a **~45% collapse in reasoning accuracy** once context utilization crosses 40–50%, even when all tokens are relevant ([Wang et al., 2026: Intelligence Degradation in Long-Context LLMs](https://arxiv.org/abs/2601.15300)).
+> **1. The 40% Collapse:** Long-context LLMs suffer up to a **~45% collapse in reasoning accuracy** once context utilization crosses 40–50%, even when all tokens are technically relevant ([Weiwei Wang et al., arXiv 2026: Intelligence Degradation in Long-Context LLMs](https://arxiv.org/abs/2601.15300)).
+>
+> **2. The Overthinking Tax:** Reasoning models waste **27%–51% of their trajectory** on redundant self-reflection loops ("Wait...", "Hmm") without accuracy gains ([Chenlong Wang et al., EMNLP 2025: Wait, We Don't Need to "Wait"! Removing Thinking Tokens Improves Reasoning Efficiency](https://arxiv.org/abs/2506.08343)).
 
-**The Late Solution:** Late splits the brain. It enforces a strict boundary between planning and execution and actively compartmentalizes agents' identities and objectives.
+<br/>
 
-<img src="assets/workflow.jpg" alt="Late Architecture: Main Orchestrator routing to ephemeral subagents with automatic context destruction">
+**The Late Solution:** Late splits the brain and treats **central context as the scarce resource**:
+1. **Architecturally Enforced Isolation:** The Lead Orchestrator strictly plans and verifies. It spawns ephemeral Coder and Researcher subagents into isolated contexts. Once a subagent finishes its atomic task, its noisy scratchpad is wiped. Only structured, high-signal diagnostics return to the Lead Architect.
+2. **Disposable Test-Time Compute:** Workers can spend far more aggregate inference than would ever fit cleanly into one useful reasoning trajectory. Late trades cheap compute for a bounded, high-signal orchestrator context.
+3. **Empirical Logit Biasing:** Late implements real-time logit biasing for `llama.cpp`/`llama-server`. It suppresses redundant thinking tokens on the fly, reclaiming wasted CoT compute while leaving room for useful reasoning (varies by model).
+4. **Physical Tool Registry Pruning:** The Orchestrator has no file-writing tools, has repo-mutating bash commands blocked, and cannot bypass delegation. Subagents have no orchestration tools and cannot recursively spawn agents.
 
-The orchestrator’s context grows only from what actually matters: your exact instructions and the definitive results. Everything the subagent did to get there is wiped from memory.
+See the [Feature Matrix](#the-feature-matrix) and [FAQ](#faq) for a direct comparison and real world examples.
 
-**The same model feels smarter in Late because it reasons purely from signal, never noise.**
+<div align="center">
+  <br/>
+  <img src="assets/workflow.jpg" alt="Late Architecture: Main Orchestrator routing to ephemeral subagents with automatic context destruction">
+  <br/>
+</div>
+
+The orchestrator’s context grows primarily from what actually matters: your instructions, plans, and verifiable results—not every grep, compiler trace, failed edit, and discarded hypothesis used to get there.
+
+**A model with a 64k context window is no longer limited to a 64k task.** The cumulative job can grow into hundreds of thousands of tokens while the orchestrator stays inside its useful context budget, delegating fresh work instead of carrying the entire execution history forward.
+
+**The same model feels smarter in Late because the architecture protects the context in which its important decisions are made.**
+
+---
 
 ## The Feature Matrix
 
-|  | Late | Everyone Else (OpenCode, Pi, Claude Code, Codex) |
-| --- | --- | -- |
-| **Workflow** | **Autonomous Orchestration** | Manual toggling/Blind execution |
-| **Implementations** | **Strictly enforced ephemeral coder subagents (Wiped)** | Floods main context |
-| **Explorations** | **Strictly enforced ephemeral researcher subagents (Wiped)** | Floods main context |
-| **KV-Cache** | **Ruthless KV-cache management (No prompt-reprocessing)** | Brute-force dumping |
-| **System Prompt** | **~1,000 tokens (Always planning)** | 300 - 10,000+  tokens (from no workflow to over-constrained) |
-| **Dependencies** | **Zero-dependency static binary** | Python / Node.js and others |
-| **Sandboxing** | **Native rootless container (`late-podman`)** | Runs unprotected on bare metal |
-| **Setup Required** | **None (OOTB `llama-server` support)** | Mandatory OAuth / JSON / YAML / TOML |
-| **Telemetry** | **None** | Opt-out phoning home |
-| **Built For** | **10x throughput builders** | Rebuilding the same bottleneck |
+|  | Late | Conventional agent loops |
+| :--- | :--- | :--- |
+| **Workflow** | **Autonomous orchestration: Always Planning** | Manual Build / Plan mode switching |
+| **Implementations** | **Strictly enforced ephemeral coder subagents (Wiped)** | Delegation optional or mixed with primary-context execution |
+| **Explorations** | **Strictly enforced ephemeral researcher subagents (Wiped)** | Exploration may still accumulate in the primary trajectory |
+| **Tool Enforcement** | **Physical tool namespace pruning (Hard boundaries)** | Commonly policy/prompt driven |
+| **KV-Cache** | **Ruthless KV-cache preservation (Deterministic prefixes)** | Brute-force dumping & cache-busting mode switches |
+| **Logit Biasing** | **Native EMNLP 2025 token suppression (Culls CoT bloat)** | None (Full overthinking tax paid on every turn) |
+| **Startup Time** | **Instant (<10ms native Go, feels like `htop`)** | 1s–3s+ (Node.js / Python runtimes) |
+| **System Prompt** | **~1,000 tokens (Lean & focused)** | 3,000–10,000+ tokens (From No-Workflow to Over-Constrained Bloat) |
+| **Sandboxing** | **Native rootless devcontainers (`late-podman`)** | No equivalent built-in workflow |
+| **Setup Required** | **None (Automatic `llama-server` on `:8080`)** | Requires provider/config setup |
+| **Telemetry** | **None** | Telemetry by default |
 
-<p align="center"><b>If Late makes your model feel smarter, <a href="https://github.com/mlhher/late-cli">give it a ⭐</a></b></p>
+<p align="center"><b>If Late makes your model feel smarter, <a href="https://github.com/mlhher/late-cli">give it a ⭐ on GitHub</a></b></p>
+
+---
+
+## FAQ
+
+**Why not conventional agents that can just edit the repository directly?**
+
+Because optional delegation is not the same thing as an architectural boundary. If the primary agent can keep reading files, executing commands, editing code, retrying patches, and absorbing tool output directly, its central trajectory still grows with the work.
+
+Late makes that impossible. The orchestrator plans and verifies; isolated workers execute. The benchmark above is an early example of why that distinction may matter: OpenCode used an exploration subagent, yet still converged on a partial solution while Late kept decomposing the task until all three objectives were closed.
+
+**Don't other tools already have subagents?**
+
+Many modern tools have subagents. The distinction is enforcement: in Late, workers are not an optional side-path that the primary agent may bypass. Late **architecturally enforces** isolation:
+* **Forced Plan-First Decomposition:** Tasks are decomposed into atomic, verifiable steps before code is touched.
+* **Actionable Diagnostic Reporting:** Subagents return structured, high-signal reports rather than lossy summaries, letting the orchestrator do what it's best at: **Planning** (and nothing else).
+* **Tool Registry Pruning:** The Orchestrator literally has no file-writing tools and cannot make hasty edits. Subagents have no orchestration tools and cannot spawn recursive agents.
+
+**Can this workflow not just be rebuilt with plugins?**
+
+The underlying orchestration loop of agents not written with the specific architecture in mind isn't built to enforce isolation, even if you write plugins or extensions to try and add it. Instead of just offering subagents, Late architecturally enforces them. The orchestrator is physically incapable of making file edits (whether through tools or Bash), and workers are architecturally separated from orchestration. You can't replicate that structural discipline with a third-party plugin.
+
+**Can small or quantized local models actually handle complex, real-world tasks?**
+
+Yes. This is specifically what Late was made for.
+
+Repeated local testing with **35B-A3B models at 3-bit quantization** running via `llama-server` has shown the same qualitative pattern as the DeepSeek benchmark above: Late can spend far more aggregate inference than the orchestrator itself ever has to retain.
+
+In one representative run, the agents collectively executed **200,000+ tokens** while the orchestrator stayed below **64k tokens**. The model autonomously resolved an interwoven 6-file merge conflict with cross-file refactors, duplicated logic, and subtle regressions, compiled cleanly, and passed all tests inside a disposable `late-podman` container. The same model repeatedly failed on the same task in OpenCode as its working trajectory grew.
+
+This is the practical reason Late targets local models: **it turns context capacity into a compute problem.** If inference is local or cheap, you can spend more worker compute instead of asking one increasingly polluted context to remember everything. In local testing, that has enabled smaller models to keep working on tasks far larger and longer-lived than their useful single-trajectory context would normally permit.
+
+**Doesn't this create a "telephone game" where information gets lost between agents?**
+
+No. In real-world tests, the exact opposite is true.
+
+The subagents are explicitly instructed to return concise summaries of what they did, what worked, what changed from the original plan, and which architectural assumptions may have been wrong. This lets the orchestrator focus on the important failures and pivot quickly, instead of inheriting every file read, git operation, test result, lint error, and build log produced along the way.
+
+In testing, models like Qwen3.6-35B-A3B and its finetunes return structured summaries that let the orchestrator immediately adjust its trajectory without inheriting the worker's entire reasoning history. This keeps the central context focused on the overall architecture and lets Late spend substantially more disposable worker compute without degrading the context making the important decisions.
+
+The model didn't change. The architecture did.
+
+**What else does Late do besides subagents?**
+
+Late is engineered as an end-to-end harness:
+* **Full Plugin System:** Install plugins from the default registry, npm, Git repositories, or local directories with full support for custom skills, slash commands, themes, and lifecycle hooks, in any language.
+* **Sub-10ms Startup:** Native Go binary with zero runtime dependencies. It launches instantly like `htop` or `nvim`, avoiding the sluggish startup latency and RAM footprint of Node.js or Python.
+* **Active Cognitive Anchoring:** Instead of leaving the model to blindly guess tool semantics, Late injects targeted contextual cues and sentinel feedback when relevant—freeing model compute from tool mechanics so it can focus purely on solving your code.
+* **Zero Prompt-Reprocessing:** Unlike tools that manually toggle between "Plan" and "Build" modes (invalidating prompt caches and driving up latency/costs), Late maintains deterministic, cache-stable prompt prefixes.
+* **Surgical Scoping Over AST Bloat:** Instead of dumping thousands of static AST tokens into the prompt on every turn, Late's orchestrator provides precise line ranges and instructions directly to the subagent.
+
+**Does Late work with local models?**
+
+Zero config. Point `llama-server` at any GGUF and Late connects on `:8080` automatically.
+
+---
 
 ## Model Connectivity
 
-Late is model-agnostic.
+Late is completely model-agnostic.
 
 **Local Models (Zero Config):**
 No configuration required. Late targets `llama.cpp` on port `:8080` (the default for `llama-server`).
@@ -105,30 +207,29 @@ export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="model-name"
 ```
 
+📖 **[Read the Quickstart Guide](./docs/quickstart.md)** for persistence settings, MCP configuration, Agent Skills, Git Worktrees, Keybindings, and more.
 
-📖 **[Read the Quickstart Guide](./docs/quickstart.md)** to find out how to persist these settings and for MCP setup, Agent Skills, Git Worktrees, Keybindings and more.
+---
 
-## More Features
+## Features
 
-* **Native Containerized Execution (`late-podman`):** Run the agent fully autonomously inside an isolated devcontainer—solving tasks from start to finish without having to babysit it.
-* **Hybrid Model Routing:** Let your smartest model work as orchestrator, while having a middle model investigate the repo and your fastest model execute the orchestrator's implementation plan (e.g. Fable/Kimi/GPT orchestrating, Qwen3.8 researching, Gemma4 executing).
-* **Human-in-the-loop:** Safe commands will be auto-approved to maintain agent velocity. Anything deemed suspicious will be stopped by Late and will prompt you for permission. Features session, project, and global trust scopes.
-* **Exact-Match Diffs:** Strict `search`/`replace` blocks with autonomous self-healing on mismatch. Edits fail loud. We never silently corrupt your files.
-* **Agent Skills Support:** Extend Late's capabilities by using third party Agent Skills. No configuration required.
-* **MCP Integration:** Natively map external Model Context Protocol servers directly into Late via standard I/O.
-* **Context-Aware Search:** Native search tool that automatically respects `.gitignore` and `.llmignore` to prevent flooding the context window with irrelevant files.
-* **Stateful Resilience:** The Orchestrator maintains continuous session history on disk. Close your terminal, reboot your machine, and pick up exactly where you left off.
-* **Git Worktree Support:** Run independent, parallel agent instances across multiple branches without context bleeding.
+* **Universal Plugin System:** Extend Late with custom slash commands, MCP servers, themes, and lifecycle hooks (`onSessionStart`, `onMessageSend`, `onToolCall`, `onToolResult`). Install via `late plugin install <package>` directly. Subagents automatically inherit active plugins.
+* **Empirical Logit Biasing:** Built on [Chenlong Wang et al., Findings of EMNLP 2025](https://arxiv.org/abs/2506.08343), Late dynamically suppresses repetitive self-reflection tokens ("Wait...", "Hmm") in reasoning models via `llama-server`, reducing CoT token bloat by 27%–51% with zero loss in accuracy (may vary depending on the model).
+* **Overnight Autopilot via Podman (`late-podman`):** Run the agent in an isolated, rootless container sandbox with devcontainer support and `yolo mode`. Turn Late loose on large-scale refactors overnight without risking your host machine.
+* **Interactive Model Switching & Hybrid Routing:** Press `/model` to reconfigure orchestrator and worker models on the fly. Route planning to frontier reasoning models while delegating execution to fast, cost-efficient workers.
+* **Developer Ergonomics:**
+  * `/compose`: Pop open your preferred `$EDITOR` (Neovim, Vim, Helix, VS Code) to draft complex, multi-line instructions.
+  * `/rewind`: Visual history scrubber to roll back turns and branch conversational states.
+  * `late --prompt "..."`: Start a session with a pre-given prompt, useful for running it from other scripts.
+* **Auditable Subagent History:** Full subagent conversation transcripts and metadata are persisted to disk for total transparency and debugging—without poisoning the orchestrator's active context window. Opt-in persistence protects your disk space while ensuring you can debug overnight autopilot runs.
+* **Exact-Match Diffs & Autonomous Healing:** Strict `search`/`replace` editing with automatic self-healing on mismatch. Edits fail loud; files are never silently corrupted.
+* **Pre-emptive Sentinel Feedback:** Built-in tool guards detect common agent failure patterns and inject immediate corrective context before the model stumbles into hallucinatory loops.
+* **True cl100k BPE Offline Tokenizer:** Embedded tokenizer calculates real BPE token counts offline with zero heuristic guesswork.
+* **Native Context-Aware Search:** High-performance codebase search with globster filtering that respects `.gitignore` and `.llmignore`.
+* **Agent Skills & MCP Support:** Natively consume external Model Context Protocol (MCP) servers and third-party Agent Skills with zero configuration overhead.
+* **Git Worktree Support:** Run independent, parallel agent instances across multiple branches simultaneously with zero context bleeding.
 
-## FAQ
-**Why not OpenCode / Pi / Claude Code etc.?**
-
-They run everything in one context window. Every file read, compile error, and retry degrades the model. Late enforces ephemeral subagents. The orchestrator never sees the noise. This allows the model to work with smaller context sizes while also retaining its intelligence for longer.
-
-**Does Late work with local models?**
-
-Zero config. Point `llama-server` at any GGUF and Late connects on `:8080` automatically.
-
+---
 
 ## License
 
