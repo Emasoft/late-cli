@@ -2,7 +2,7 @@
 
 [English](quickstart.md) | [简体中文](quickstart.zh-CN.md)
 
-从安装 Late 到运行第一个自主编码任务，只需几分钟。
+只需几分钟，即可完成从安装到执行你的第一个自主编程任务。
 
 ## 安装
 
@@ -12,42 +12,42 @@
 brew tap mlhher/late && brew install late
 ```
 
-### 通用安装脚本 — Linux / macOS / Windows WSL
+### 通用安装方式 — Linux / macOS / Windows WSL
 
 ```bash
 curl -sfL https://raw.githubusercontent.com/mlhher/late-cli/main/install.sh | bash
 ```
 
-适用于 Linux、macOS 和原生 Windows 的二进制文件可从 [GitHub Releases](https://github.com/mlhher/late-cli/releases) 下载并手动安装。
+[GitHub Releases](https://github.com/mlhher/late-cli/releases) 中提供了 Linux、macOS 和原生 Windows 的手动下载版本。
 
 ---
 
 ## 本地模型：零配置
 
-Late 会自动查找运行在 `localhost:8080` 上、兼容 OpenAI API 的 `llama-server`。
+Late 会自动寻找运行在 `localhost:8080` 上的兼容 OpenAI 的 `llama-server`。
 
-像往常一样使用你的 GGUF 模型启动 `llama-server`，然后在项目目录中启动 Late：
+正常使用 GGUF 模型启动 `llama-server`，然后在你的项目中启动 Late：
 
 ```bash
 cd your-project
 late
 ```
 
-就这么简单。如果 `llama-server` 已经运行在 `:8080`，Late 会自动发现它，无需任何 Late 配置。
+就是这样。如果 `llama-server` 已经在 `:8080`（其默认端口）上运行，Late 会在不需要任何配置的情况下自动连接。
 
 ---
 
-## 云端 / 远程模型
+## 云端模型
 
-Late 可与兼容 OpenAI API 的服务配合使用，包括 DeepSeek、Claude、GPT、Kimi、GLM、OpenRouter 等。
+Late 支持任何兼容 OpenAI 的 API，包括 DeepSeek、Claude、GPT、Kimi、GLM、OpenRouter 等。
 
-设置：
+设置环境变量：
 
 ```bash
-# DeepSeek
-export OPENAI_BASE_URL="https://api.deepseek.com" # your-api-url
-export OPENAI_API_KEY="sk-123" # your-api-key
-export OPENAI_MODEL="deepseek-flash" # your-model-name
+# DeepSeek 示例
+export OPENAI_BASE_URL="https://api.deepseek.com" # 你的 API 地址
+export OPENAI_API_KEY="sk-123" # 你的 API 密钥
+export OPENAI_MODEL="deepseek-flash" # 模型名称
 ```
 
 然后运行：
@@ -57,133 +57,143 @@ cd your-project
 late
 ```
 
-之后也可以将模型设置持久化到 Late 的 `config.json` 中，无需每次都重新导出环境变量。
+稍后你可以将这些模型设置持久化保存在 Late 的 `config.json` 中，而不需要每次都导出环境变量。
 
 ---
 
-## 给 Late 一个任务
+## 配置
 
-你可以像与另一位工程师交流一样向 Late 描述任务。
+持久化配置文件位于：
 
-例如：
+* **Linux:** `~/.config/late/config.json`
+* **macOS:** `~/Library/Application Support/late/config.json`
+* **Windows:** `%APPDATA%\late\config.json`
 
-```text
-为 api/users.go 中的 CreateUser handler 添加输入验证。
+配置的优先级顺序为：
 
-检查 email 和 name 字段是否为空，如果为空则返回带有 JSON 错误信息的 400 响应，
+1. 环境变量
+2. `config.json`
+3. Late 默认值
 
-并添加回归测试。
+对于在 `localhost:8080` 上运行的标准本地 `llama-server`，你不需要创建配置文件。
+
+### 高级模型配置（`models` 和 `agent_models`）
+
+默认情况下，Late 为主编排器和子智能体使用同一个模型。不过，你可以将不同的模型映射到特定的智能体角色（例如，使用庞大的前沿模型进行规划，使用快速的本地模型进行执行）。
+
+你可以在 TUI 中使用 `/model` 交互式地切换模型，或者通过 `models` 注册表将你的混合路由持久化保存在 `config.json` 中：
+
+```json
+{
+  "models": [
+    {
+      "id": "deepseek",
+      "url": "https://api.deepseek.com",
+      "key": "sk-your-key",
+      "model": "deepseek-flash"
+    },
+    {
+      "id": "local-qwen",
+      "url": "http://localhost:8080",
+      "key": "",
+      "model": "qwen3.6-35b-a3b"
+    },
+    {
+      "id": "local-gemma",
+      "url": "http://localhost:8080",
+      "key": "",
+      "model": "gemma-4-e4b"
+    }
+  ],
+  "agent_models": {
+    "orchestrator": "deepseek",
+    "researcher": "local-qwen",
+    "coder": "local-gemma"
+  }
+}
 ```
 
-也可以交给它规模更大的任务：
-
-```text
-重构 database 包以使用连接池。
-
-保持现有行为不变，更新受影响的测试，并验证
-
-完整测试套件仍然能够通过。
-```
-
-Late 的编排器会规划工作，并将实现和研究任务委托给隔离的子智能体，而不是把每次文件读取、命令结果、代码修改和测试日志全部塞进一个不断膨胀的上下文中。
+> 注意：为了保持向后兼容，旧的扁平化格式（如 `openai_base_url`、`late_subagent_model` 等）仍然受支持。
 
 ---
 
-## TUI
+## TUI（终端用户界面）
 
-Late 会在同一个终端界面中显示编排器和当前活动的子智能体。
+Late 将编排器和活动中的子智能体展示在同一个终端界面中。
 
-常用操作：
+基本操作：
 
-| 按键 / 命令             | 操作                   |
-| ------------------- | -------------------- |
-| `Tab`               | 在编排器和活动子智能体之间切换      |
-| `Ctrl+O`            | 附加文件                 |
-| `Esc` / `Ctrl+G`    | 停止当前正在运行的智能体         |
-| `/model`            | 更改编排器或工作智能体所使用的模型    |
-| `/rewind`           | 回退到对话中的较早位置          |
-| `/themes`           | 更改 TUI 主题            |
-| `/compose`          | 在 `$EDITOR` 中编写较长的指令 |
-| `Ctrl+D` / `Ctrl+C` | 退出                   |
+| 快捷键 / 命令       | 动作                                               |
+| ------------------- | ---------------------------------------------------- |
+| `Tab`               | 在编排器和活动中的子智能体之间切换 |
+| `Ctrl+O`            | 附加文件                                        |
+| `Esc` / `Ctrl+G`    | 停止当前正在运行的智能体                     |
+| `/model`            | 更改编排器或 Worker 的模型                 |
+| `/rewind`           | 回溯到对话中更早的状态       |
+| `/themes`           | 更改 TUI 主题                                 |
+| `/compose`          | 在你的 `$EDITOR` 中编写长指令         |
+| `Ctrl+D` / `Ctrl+C` | 退出                                                 |
 
-随时输入 `/` 即可打开命令选择器。
+在任何时候输入 `/` 即可打开命令选择器。
 
-当 Late 创建子智能体时，每个子智能体都会在工作期间显示在独立的标签页中，并在完成任务后消失。
+当 Late 创建子智能体时，它们会在工作期间显示在独立的标签页中，并在完成任务后消失。
 
 ---
 
-## 工具审批
+## 工具执行授权
 
-具有潜在破坏性的命令和文件修改需要获得批准，除非你已经为相应作用域授予了权限。
+除非你已经为该范围授予了权限，否则可能具有破坏性的命令和文件更改都需要你的批准。
 
-出现提示时，可以选择批准：
+当弹出提示时，你可以批准：
 
-* 仅本次；
-* 当前会话；
-* 当前项目；
-* 全局。
+* 仅限这一次；
+* 对于当前会话；
+* 对于当前项目；
+* 全局允许。
 
 只读操作通常会自动处理。
 
-授权会随时间过期，而不会永久保持有效。
+授权会随着时间的推移而衰减，而不会成为永久信任。
 
 ---
 
-## 使用 Podman 完全自主运行
+## 使用 Podman 运行完全自主的工作流
 
-对于无人值守任务、大型重构或过夜运行，可以使用 `late-podman`。
+对于无人值守的任务、大规模重构或过夜运行，请使用 `late-podman`。
 
-它会在隔离的 rootless Podman 容器中运行 Late，而不是让智能体不受限制地访问宿主机。
+它会在一个隔离的、rootless 的 Podman 容器中运行 Late，而不是让智能体对你的主机拥有不受限制的访问权限。
 
-如果项目包含受支持的 devcontainer 配置，直接运行：
+在项目内部运行：
 
 ```bash
 late-podman
 ```
 
-Late 会自动查找项目中的容器配置，包括 `.devcontainer/devcontainer.json`。示例可参考 Late 自己的 [devcontainer.json](../.devcontainer/devcontainer.json)。
+Late 会自动寻找项目中的容器配置，包括 `.devcontainer/devcontainer.json`。如需参考示例，请查看 Late 自带的 [devcontainer.json](../.devcontainer/devcontainer.json)。
 
-也可以显式指定镜像：
+你也可以明确指定一个镜像：
 
 ```bash
 late-podman --image your-development-image
 ```
 
-`--` 之后的参数会直接传递给 Late：
+`--` 之后的参数会被传递给 Late：
 
 ```bash
 late-podman -- --continue
 ```
 
-当前工作区会以读写方式挂载到 `/workspace`。Late 使用独立的会话卷和缓存卷，在可用时转发 SSH agent，并在存在 Late 配置时以只读方式挂载该配置。默认情况下，不会暴露宿主机的 home 目录或容器 socket。
+你当前的工作区会以读写模式挂载到 `/workspace`。Late 维护自己的会话和缓存卷，在可用时转发你的 SSH agent，并以只读模式挂载你的 Late 配置。默认情况下，主机的主目录和容器 socket 不会被暴露。
 
-> **注意：** `late-podman` 需要 Linux 并安装 Podman。Silverblue 和 Universal Blue 开箱即用，包括对 SELinux 的适配处理。
+> **注意：** `late-podman` 需要安装了 Podman 的 Linux。它包含额外的 SELinux 支持，并在 Silverblue 和 Universal Blue 镜像上开箱即用。
 
-> **注意：** Devcontainer 配置可能声明额外的挂载项。Late 在构建沙箱时会遵循这些配置。
-
----
-
-## 混合模型路由
-
-默认情况下，Late 的编排器和工作智能体使用相同的模型。
-
-你也可以让一个模型负责规划，另一个模型负责执行：
-
-```bash
-export LATE_SUBAGENT_MODEL="worker-model"
-export LATE_SUBAGENT_BASE_URL="http://localhost:8080"
-export LATE_SUBAGENT_API_KEY="your-other-key"
-```
-
-也可以在 Late 内使用 `/model` 交互式更改模型。
-
-这样可以将架构设计和规划任务路由给能力更强的模型，同时使用较小或更快的模型处理工作智能体任务。
+> **注意：** Devcontainer 配置可以声明额外的挂载。Late 在构建沙箱时会遵守这些配置。
 
 ---
 
-## 启动时直接提供 Prompt
+## 预设 Prompt 启动
 
-用于脚本或无人值守工作流时：
+适用于脚本或无人值守工作流：
 
 ```bash
 late --prompt "Run the test suite, diagnose the failures, and fix them."
@@ -197,11 +207,11 @@ late-podman -- --prompt "Refactor this package and verify all tests."
 
 ---
 
-## 恢复之前的工作
+## 恢复先前的工作
 
 Late 会自动保存会话。
 
-恢复上一次会话：
+恢复上一个会话：
 
 ```bash
 late --continue
@@ -215,58 +225,82 @@ late session list
 
 ---
 
-## 插件、Skills 与 MCP
+## MCP 集成
 
-Late 支持：
+Late 支持 Model Context Protocol (MCP)，允许你接入自己的外部工具。将你的 MCP 服务器添加到以下位置之一：
 
-* 插件
-* Agent Skills
-* MCP 服务器
-* 自定义 slash 命令
-* 主题
-* 生命周期 hooks
-* 自定义工具
+* **Linux:** `~/.config/late/mcp_config.json`
+* **macOS:** `~/Library/Application Support/late/mcp_config.json`
+* **Windows:** `%APPDATA%\late\mcp_config.json`
+* **项目局部:** `.late/mcp_config.json`
 
-安装插件：
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "my-mcp-server"]
+    }
+  }
+}
+```
+
+---
+
+## Agent Skills
+
+[Skills](https://agentskills.io/) 是可复用的 Markdown 指令集。它们会从以下位置被自动发现：
+
+* **Linux:** `~/.config/late/skills/`
+* **macOS:** `~/Library/Application Support/late/skills/`
+* **Windows:** `%APPDATA%\late\skills\`
+* **项目局部:** `.late/skills/`
+
+无需配置。只需将你的 skills 放入相应的文件夹，Late 就会自动加载它们。
+
+---
+
+## 插件
+
+插件将 **skills**、**slash 命令**、**MCP 服务器**、**hooks**、**主题** 和 **内联工具** 打包成一个可安装的单元。
+
+你可以在 https://github.com/mlhher/late-plugins 找到默认注册表。
 
 ```bash
-late plugin install <package>
+# 从默认注册表或 npm 回退安装
+late plugin install notify-tool-approval
+
+# 从 Git 仓库安装
+late plugin install https://github.com/you/late-plugin.git
+
+# 从本地路径安装以进行开发
+late plugin install ./my-plugin
 ```
 
-插件可以从 npm、Git 仓库、本地目录或已配置的 registry 安装。
-
-有关插件开发和 manifest 格式，请参阅 [Plugin SDK](plugin-sdk.md)。
+关于插件开发和清单格式，请参阅 [Plugin SDK](plugin-sdk.md)。
 
 ---
 
-## 配置
+## 文件排除
 
-持久化配置文件位于：
+Late 的原生搜索工具会自动遵守你项目的 `.gitignore`，通过排除 vendor 和构建目录来节省 LLM 上下文。
 
-**Linux**
-
-```text
-~/.config/late/config.json
-```
-
-**macOS**
-
-```text
-~/Library/Application Support/late/config.json
-```
-
-**Windows**
-
-```text
-%APPDATA%\late\config.json
-```
-
-配置优先级为：
-
-1. 环境变量
-2. `config.json`
-3. Late 默认值
-
-对于运行在 `localhost:8080` 上的标准本地 `llama-server` 配置，无需创建配置文件。
+你也可以在 `.gitignore` 旁边创建一个 `.llmignore` 文件，以专门对智能体隐藏文件（例如，机密信息、大型二进制文件、测试 fixtures 或生成的代码），而不会影响你的 git 追踪。
 
 ---
+
+## 常用标志 (Common Flags)
+
+| 标志 | 描述 |
+| --- | --- |
+| `--help` | 显示所有标志和命令 |
+| `--version` | 显示版本信息 |
+| `--continue` | 恢复上一个会话 |
+| `--prompt "..."` | 使用给定的 prompt 立即启动智能体 |
+| `--suppress-thinking-words` | 应用关于过度思考词汇的默认 Logit 偏置映射（仅限 `llama.cpp`） |
+| `--logit-bias` 和 `--subagent-logit-bias` | 手动设置特定模型的 logit 偏置（仅限 `llama.cpp`） |
+| `--gemma-thinking` | 为 Gemma 4 模型注入思考 token |
+| `--subagent-max-turns <n>` | 设置每个子智能体的最大轮次（默认：500） |
+| `--append-system-prompt "..."` | 在系统 prompt 附加文本（如：额外指令） |
+| `--enable-images` | 将模型视为支持图像（适用于非 llama.cpp 的服务器） |
+| `--save-subagent-histories` | 将子智能体的对话记录持久化到磁盘 |

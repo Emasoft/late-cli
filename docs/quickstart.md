@@ -33,13 +33,13 @@ cd your-project
 late
 ```
 
-That's it. If `llama-server` is already running on `:8080`, Late finds it automatically—no Late configuration required.
+That's it. If `llama-server` is already running on `:8080` (its default port) Late will connect with no configuration required.
 
 ---
 
-## Cloud/Remote Models
+## Cloud Models
 
-Late works with OpenAI-compatible APIs including DeepSeek, Claude, GPT, Kimi, GLM, OpenRouter, and others.
+Late works with any OpenAI-compatible APIs including DeepSeek, Claude, GPT, Kimi, GLM, OpenRouter, and others.
 
 Set:
 
@@ -61,27 +61,59 @@ You can later persist model settings in Late's `config.json` instead of exportin
 
 ---
 
-## Give Late a Task
+## Configuration
 
-Talk to Late like you would another engineer.
+Persistent configuration lives at:
 
-For example:
+* **Linux:** `~/.config/late/config.json`
+* **macOS:** `~/Library/Application Support/late/config.json`
+* **Windows:** `%APPDATA%\late\config.json`
 
-```text
-Add input validation to the CreateUser handler in api/users.go.
-Check for empty email and name fields, return 400 with a JSON error,
-and add regression tests.
+Configuration precedence is:
+
+1. Environment variables
+2. `config.json`
+3. Late defaults
+
+For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
+
+### Advanced Model Configuration (`models` and `agent_models`)
+
+By default, Late uses the same model for the orchestrator and its subagents. However, you can map different models to specific agent roles (e.g., using a massive frontier model for planning, and a faster local model for execution).
+
+You can change models interactively using `/model` inside the TUI, or persist your hybrid routing in `config.json` via the `models` registry:
+
+```json
+{
+  "models": [
+    {
+      "id": "deepseek",
+      "url": "https://api.deepseek.com",
+      "key": "sk-your-key",
+      "model": "deepseek-flash"
+    },
+    {
+      "id": "local-qwen",
+      "url": "http://localhost:8080",
+      "key": "",
+      "model": "qwen3.6-35b-a3b"
+    },
+    {
+      "id": "local-gemma",
+      "url": "http://localhost:8080",
+      "key": "",
+      "model": "gemma-4-e4b"
+    }
+  ],
+  "agent_models": {
+    "orchestrator": "deepseek",
+    "researcher": "local-qwen",
+    "coder": "local-gemma"
+  }
+}
 ```
 
-Or give it something much larger:
-
-```text
-Refactor the database package to use connection pooling.
-Keep existing behavior intact, update affected tests, and verify
-the full test suite still passes.
-```
-
-Late's orchestrator plans the work and delegates implementation and research to isolated subagents rather than carrying every file read, command result, edit, and test log in one growing context.
+> Note: For backward compatibility, the older flat format using `openai_base_url`, `late_subagent_model`, etc., is also still supported.
 
 ---
 
@@ -131,13 +163,13 @@ For unattended work, large refactors, or overnight runs, use `late-podman`.
 
 It runs Late inside an isolated rootless Podman container rather than giving the agent unrestricted access to your host.
 
-From a project with a supported devcontainer:
+From inside your project run:
 
 ```bash
 late-podman
 ```
 
-Late automatically looks for container configuration in the project, including `.devcontainer/devcontainer.json`. For an example check Late's own [devocontainer.json](../.devcontainer/devcontainer.json).
+Late automatically looks for container configuration in the project, including `.devcontainer/devcontainer.json`. For an example check Late's own [devcontainer.json](../.devcontainer/devcontainer.json).
 
 You can also specify an image explicitly:
 
@@ -153,27 +185,9 @@ late-podman -- --continue
 
 Your current workspace is mounted read-write at `/workspace`. Late keeps its own session and cache volumes, forwards your SSH agent when available, and mounts your Late configuration read-only if present. Your host home directory and container socket are not exposed by default.
 
-> **Note:** `late-podman` requires Linux with Podman installed. Silverblue and Universal Blue are supported out of the box, including SELinux-aware container handling.
+> **Note:** `late-podman` requires Linux with Podman installed. Includes additional SELinux support. Works out of the box with Silverblue and Universal Blue images.
 
 > **Note:** Devcontainer configurations may declare additional mounts. Late respects those when constructing the sandbox.
-
----
-
-## Hybrid Model Routing
-
-By default, Late uses the same model for the orchestrator and its workers.
-
-You can instead use one model for planning and another for execution:
-
-```bash
-export LATE_SUBAGENT_MODEL="worker-model"
-export LATE_SUBAGENT_BASE_URL="http://localhost:8080"
-export LATE_SUBAGENT_API_KEY="your-other-key"
-```
-
-Or use `/model` from inside Late to change models interactively.
-
-This is useful for routing architecture and planning to a stronger model while using smaller or faster models for worker tasks.
 
 ---
 
@@ -211,58 +225,84 @@ late session list
 
 ---
 
-## Plugins, Skills, and MCP
+## MCP Integration
 
-Late supports:
+Late supports the Model Context Protocol (MCP) to let you bring your own external tools. Add your MCP servers to one of the following locations:
 
-* Plugins
-* Agent Skills
-* MCP servers
-* Custom slash commands
-* Themes
-* Lifecycle hooks
-* Custom tools
+* **Linux:** `~/.config/late/mcp_config.json`
+* **macOS:** `~/Library/Application Support/late/mcp_config.json`
+* **Windows:** `%APPDATA%\late\mcp_config.json`
+* **Project-local:** `.late/mcp_config.json`
 
-Install a plugin:
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "my-mcp-server"]
+    }
+  }
+}
+```
+
+---
+
+## Agent Skills
+
+[Skills](https://agentskills.io/) are reusable sets of markdown instructions. They are discovered automatically from:
+
+* **Linux:** `~/.config/late/skills/`
+* **macOS:** `~/Library/Application Support/late/skills/`
+* **Windows:** `%APPDATA%\late\skills\`
+* **Project-local:** `.late/skills/`
+
+No setup required. Just drop your skills into the respective folders, and Late will automatically load them.
+
+---
+
+## Plugins
+
+Plugins bundle **skills**, **slash commands**, **MCP servers**, **hooks**, **themes**, and **inline tools** into one installable unit.
+
+You can find the default registry at https://github.com/mlhher/late-plugins.
 
 ```bash
-late plugin install <package>
+# Install from the default registry or npm fallback
+late plugin install notify-tool-approval
+
+# Install from a Git repo
+late plugin install https://github.com/you/late-plugin.git
+
+# Install from a local path for development
+late plugin install ./my-plugin
 ```
 
-Plugins can be installed from npm, Git repositories, local directories, or a configured registry.
-
-For plugin development and the manifest format, see [Plugin SDK](plugin-sdk.md).
+For plugin development and manifest formatting, see the [Plugin SDK](plugin-sdk.md).
 
 ---
 
-## Configuration
+## File Exclusions
 
-Persistent configuration lives at:
+Late's native search tool respects your project's `.gitignore` automatically, saving LLM context by excluding vendor and build directories. 
 
-**Linux**
-
-```text
-~/.config/late/config.json
-```
-
-**macOS**
-
-```text
-~/Library/Application Support/late/config.json
-```
-
-**Windows**
-
-```text
-%APPDATA%\late\config.json
-```
-
-Configuration precedence is:
-
-1. Environment variables
-2. `config.json`
-3. Late defaults
-
-For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
+You can also create an `.llmignore` file alongside your `.gitignore` to specifically hide files from the agent (e.g., secrets, large binaries, test fixtures, or generated code) without affecting your git tracking.
 
 ---
+
+
+## Common Flags
+
+| Flag | Description |
+| --- | --- |
+| `--help` | Show all flags and commands |
+| `--version` | Show version information |
+| `--continue` | Resume the previous session |
+| `--prompt "..."` | Start the agent immediately with the given prompt |
+| `--suppress-thinking-words` | Apply a default Logit bias map of overthinking words (`llama.cpp` only) |
+| `--logit-bias` and `--subagent-logit-bias` | Manually set the logit biases for specific models (`llama.cpp` only) |
+| `--gemma-thinking` | Inject thinking tokens for Gemma 4 models |
+| `--subagent-max-turns <n>` | Set max turns per subagent (default: 500) |
+| `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
+| `--enable-images` | Treat models as supporting images (for non llama.cpp servers) |
+| `--save-subagent-histories` | Persist subagent conversation histories to disk |
+

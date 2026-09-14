@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <b>64k context. 200k+ tokens of work.</b><br><br>
-  Late lets models work far beyond what fits inside a single context window, and still see the bigger picture.<br>
-  On Senior SWE-Bench, the same DeepSeek model (<code>deepseek-v4.1-flash</code>) completed <b>3/3 objectives with Late vs 1/3 with OpenCode</b> on the same task.<br>
-  In local testing, a 35B-A3B model at 3-bit quantization completed <b>200k+ tokens of agentic work while its orchestrator stayed below 64k. OpenCode on the same task hit context length limits</b>.<br>
+  <b>The AI agent that always stays sharp.</b><br><br>
+  <b>64k context window. 200k+ tokens of work.</b><br>
+  Late isolates execution steps to keep your model's context clean during long workflows.<br>
+  Drop it into any project. Works with any cloud provider or local model.<br>
 </p>
 
 <p align="center">
@@ -27,6 +27,14 @@
 > *"The same model feels smarter with Late."* — Reddit
 >
 > **Built with Late:** Late is primarily developed inside Late itself.
+
+<div align="center">
+  <br/>
+  <img src="assets/late-subagent-handoff.png" alt="Late Orchestrator planning a multi-phase implementation and spawning the first subagent">
+  <br/>
+    <i>Late autonomously planning, delegating, and resolving a complex multi-step merge conflict.</i>
+  <br/><br/>
+</div>
 
 ## 10-Second Quickstart
 
@@ -51,40 +59,6 @@ late
 
 One binary. Zero configuration. If `llama-server` is already running, Late finds it automatically.
 
-<div align="center">
-  <br/>
-  <img src="assets/late-subagent-handoff.png" alt="Late Orchestrator planning a multi-phase implementation and spawning the first subagent">
-  <br/>
-    <i>Late autonomously planning, delegating, and executing inside the TUI.</i>
-  <br/><br/>
-</div>
-
-
-## Same DeepSeek Model (`deepseek-v4.1-flash`): OpenCode 1/3. Late 3/3.
-
-A controlled run on [Senior SWE-Bench `turborepo-perf-reuse-input-hashes`](https://senior-swe-bench.snorkel.ai/tasks/turborepo-perf-reuse-input-hashes), using the **same DeepSeek-V4.1-Flash model, same base commit, and same task prompt**:
-
-|  | OpenCode | Late (`late-podman`) |
-| :--- | ---: | ---: |
-| **Benchmark objectives completed** | **1 / 3** | **3 / 3** |
-| **Explicit-input Git OID fast-path** | Missed | **Implemented** |
-| **Targeted regression tests added** | 0 | **3** |
-| **Architecture docs updated** | No | **Yes** |
-| **Wall time** | 5m 16s | ~14m |
-| **API cost** | $0.04 | $0.21 |
-| **Aggregate API tokens** | 3.61M | 16.18M |
-
-Late was slower and deliberately spent **~4.5× more aggregate inference**. That is the point: it can burn cheap, disposable compute without forcing all of that work into one decision-making context. Across two researchers and five implementation workers, the **orchestrator itself finished at only ~97k total trajectory tokens**. 
-
-**Specifically, OpenCode also spawned an exploration subagent, which consumed ~2.3M cached input tokens and ~108k uncached input tokens, yet it still converged on the partial solution and missed the Git OID fast-path.** Late instead kept research and implementation work behind enforced context boundaries, decomposed the task across multiple isolated workers, and found the full cross-component solution.
-
-**The result Late is optimizing for is not minimum total tokens, nor merely "having subagents." It is maximum useful work per unit of central context.**
-
-This is one controlled benchmark run, not a benchmark suite. But the same qualitative pattern has repeatedly shown up in local testing with smaller, heavily quantized models: as tasks get longer, more architectural, and more subtle, monolithic/direct-execution trajectories degrade or converge early while Late keeps the orchestrator focused and continues spending isolated worker compute. In practice, this has let models around **35B at 3-bit quantization** complete multi-file tasks that repeatedly failed in conventional harnesses.
-
-For local inference—or APIs cheap enough that token cost is secondary—the trade becomes especially attractive: **a model can keep working long after the cumulative task has exceeded what could ever fit in its own context window.** Late spends more compute, preserves less execution noise, and keeps the decision-making context usable for longer.
-
----
 
 ## The Architectural Bottleneck
 
@@ -120,7 +94,7 @@ The orchestrator’s context grows primarily from what actually matters: your in
 
 ## The Feature Matrix
 
-|  | Late | Conventional agent loops |
+|  | Late | Standard Monolithic Agents |
 | :--- | :--- | :--- |
 | **Workflow** | **Autonomous orchestration: Always Planning** | Manual Build / Plan mode switching |
 | **Implementations** | **Strictly enforced ephemeral coder subagents (Wiped)** | Delegation optional or mixed with primary-context execution |
@@ -144,7 +118,7 @@ The orchestrator’s context grows primarily from what actually matters: your in
 
 Because optional delegation is not the same thing as an architectural boundary. If the primary agent can keep reading files, executing commands, editing code, retrying patches, and absorbing tool output directly, its central trajectory still grows with the work.
 
-Late makes that impossible. The orchestrator plans and verifies; isolated workers execute. The benchmark above is an early example of why that distinction may matter: OpenCode used an exploration subagent, yet still converged on a partial solution while Late kept decomposing the task until all three objectives were closed.
+Late makes that impossible. The orchestrator plans and verifies; isolated workers execute. This structural discipline ensures the model doesn't get dragged down in execution noise and converge on a partial solution. Late keeps decomposing the task in clean environments until all objectives are closed.
 
 **Don't other tools already have subagents?**
 
@@ -161,9 +135,9 @@ The underlying orchestration loop of agents not written with the specific archit
 
 Yes. This is specifically what Late was made for.
 
-Repeated local testing with **35B-A3B models at 3-bit quantization** running via `llama-server` has shown the same qualitative pattern as the DeepSeek benchmark above: Late can spend far more aggregate inference than the orchestrator itself ever has to retain.
+Repeated local testing with **35B-A3B models at 3-bit quantization** running via `llama-server` has shown a consistent qualitative pattern: Late can spend far more aggregate inference than the orchestrator itself ever has to retain.
 
-In one representative run, the agents collectively executed **200,000+ tokens** while the orchestrator stayed below **64k tokens**. The model autonomously resolved an interwoven 6-file merge conflict with cross-file refactors, duplicated logic, and subtle regressions, compiled cleanly, and passed all tests inside a disposable `late-podman` container. The same model repeatedly failed on the same task in OpenCode as its working trajectory grew.
+In one representative run, the agents collectively executed **200,000+ tokens** while the orchestrator stayed below **64k tokens**. The model autonomously resolved an interwoven 6-file merge conflict with cross-file refactors, duplicated logic, and subtle regressions, compiled cleanly, and passed all tests inside a disposable `late-podman` container. The same model repeatedly failed on the same task in monolithic harnesses as its working trajectory grew.
 
 This is the practical reason Late targets local models: **it turns context capacity into a compute problem.** If inference is local or cheap, you can spend more worker compute instead of asking one increasingly polluted context to remember everything. In local testing, that has enabled smaller models to keep working on tasks far larger and longer-lived than their useful single-trajectory context would normally permit.
 
