@@ -65,3 +65,17 @@ func TestTodoScrollRouting(t *testing.T) {
 		})
 	}
 }
+
+func TestTodoCommandResetsInput(t *testing.T) {
+	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, session.New(nil, "", nil, "", false), nil, 0)
+	m := NewModel(root, nil, nil)
+	m.SetSize(100, 30)
+
+	m.Input.SetValue("/todos")
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	newModel := updated.(Model)
+
+	if got := newModel.Input.Value(); got != "" {
+		t.Fatalf("expected input to be reset to empty string after /todos, got %q", got)
+	}
+}

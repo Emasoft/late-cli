@@ -1070,7 +1070,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			}
 			if cmd == "/todos" {
 				m.Input.Reset()
-				m.Input.SetValue("> ")
+				m.Input.SetValue("")
 				if m.Width < 85 {
 					m.ToastMessage = "Terminal too narrow for side pane (need >= 85 cols)"
 					m.ToastWarning = true
