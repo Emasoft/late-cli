@@ -57,6 +57,9 @@ late
 ```
 *Manual Binaries: [Linux, macOS, native Windows](https://github.com/mlhher/late-cli/releases)*
 
+> **Pre-release Notice:** This README documents features in **[v2.0.0-rc.1](https://github.com/mlhher/late-cli/releases/tag/v2.0.0-rc.1)** (pre-release). The latest stable release is **[v1.5.1](https://github.com/mlhher/late-cli/releases/tag/v1.5.1)**. Binaries for both versions are available on [GitHub Releases](https://github.com/mlhher/late-cli/releases).
+
+
 One binary. Zero configuration. If `llama-server` is already running, Late finds it automatically.
 
 
