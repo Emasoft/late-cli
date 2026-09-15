@@ -59,8 +59,9 @@ late
 
 > **Pre-release Notice:** This README documents features in **[v2.0.0-rc.1](https://github.com/mlhher/late-cli/releases/tag/v2.0.0-rc.1)** (pre-release). The latest stable release is **[v1.5.1](https://github.com/mlhher/late-cli/releases/tag/v1.5.1)**. Binaries for both versions are available on [GitHub Releases](https://github.com/mlhher/late-cli/releases).
 
-
 One binary. Zero configuration. If `llama-server` is already running, Late finds it automatically.
+
+📖 [**Read the Quickstart Guide**](./docs/quickstart.md) for setup details on persistent settings, fully autonomous containerized workflows, MCP and Skills setup, Git worktrees, keybindings, and more.
 
 
 ## The Architectural Bottleneck
@@ -183,8 +184,6 @@ export OPENAI_BASE_URL="your-api-url"
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="model-name"
 ```
-
-📖 **[Read the Quickstart Guide](./docs/quickstart.md)** for persistence settings, MCP configuration, Agent Skills, Git Worktrees, Keybindings, and more.
 
 ---
 
