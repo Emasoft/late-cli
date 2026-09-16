@@ -121,7 +121,7 @@ Unlike systems where subagent delegation is merely prompt-recommended or optiona
 
 ## Persistence
 
-- **Root Session History:** Orchestrator conversation history is persisted to disk under `<sessionsDir>/<sessionID>.json` alongside a `.meta.json` sidecar for state resumption.
+- **Root Session History:** Orchestrator conversation history is persisted to disk under `<sessionsDir>/<sessionID>.json` alongside a `.meta.json` sidecar for state resumption. The sidecar records the project directory where the session was started (`working_dir`), which `--continue` uses to scope resume to the current project folder.
 - **Optional Subagent Histories:** Active subagent contexts are ephemeral in memory during execution. When enabled, subagent transcripts are persisted to `<sessionsDir>/<sessionID>/subagents/<childID>.json` for auditing and debugging.
 - **Ephemeral Context vs. Disk Audit:** Workers do not leak their raw context into the orchestrator; debugging and post-mortem analysis rely on on-disk transcripts rather than an overloaded central KV cache.
 

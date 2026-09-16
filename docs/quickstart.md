@@ -77,6 +77,28 @@ Configuration precedence is:
 
 For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
 
+### Tool Approval Mode (`permission-mode`)
+
+You can choose how much supervision Late applies to dangerous commands by adding a `permission-mode` entry to the `config.json` file for your platform (see the locations above):
+
+```json
+{
+  "permission-mode": "ask-for-user-approval"
+}
+```
+
+The three allowed values are:
+
+* `ask-for-user-approval` — the default. Potentially dangerous commands require your approval.
+* `i-promise-i-have-backups-and-will-not-file-issues` — run every tool without user confirmation.
+* `force-revaluate-dangerous-commands` — unsupervised, but the first attempt at a dangerous command is blocked until the agent re-runs it with a single-use OTP code.
+
+Notes:
+
+* The three CLI flags of the same names (`--ask-for-user-approval`, `--i-promise-i-have-backups-and-will-not-file-issues`, `--force-revaluate-dangerous-commands`) are mutually exclusive and override the `config.json` value.
+* Omitting the entry (and any flag) defaults to `ask-for-user-approval`.
+* An invalid value is ignored with a warning and the safe default applies.
+
 ### Advanced Model Configuration (`models` and `agent_models`)
 
 By default, Late uses the same model for the orchestrator and its subagents. However, you can map different models to specific agent roles (e.g., using a massive frontier model for planning, and a faster local model for execution).
@@ -211,16 +233,17 @@ late-podman -- --prompt "Refactor this package and verify all tests."
 
 Late automatically saves sessions.
 
-Resume the previous session:
+Resume the most recent session started in the current project directory:
 
 ```bash
 late --continue
 ```
 
-Or inspect saved sessions:
+Sessions started in other folders — or before this feature was introduced — can be found with `late session list` (use `-v` to see each session's project folder) and resumed with `late session load <id>`:
 
 ```bash
-late session list
+late session list -v
+late session load <id>
 ```
 
 ---
@@ -296,7 +319,7 @@ You can also create an `.llmignore` file alongside your `.gitignore` to specific
 | --- | --- |
 | `--help` | Show all flags and commands |
 | `--version` | Show version information |
-| `--continue` | Resume the previous session |
+| `--continue` | Resume the latest session created in the current directory |
 | `--prompt "..."` | Start the agent immediately with the given prompt |
 | `--suppress-thinking-words` | Apply a default Logit bias map of overthinking words (`llama.cpp` only) |
 | `--logit-bias` and `--subagent-logit-bias` | Manually set the logit biases for specific models (`llama.cpp` only) |
@@ -305,4 +328,9 @@ You can also create an `.llmignore` file alongside your `.gitignore` to specific
 | `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
 | `--enable-images` | Treat models as supporting images (for non llama.cpp servers) |
 | `--save-subagent-histories` | Persist subagent conversation histories to disk |
+| `--ask-for-user-approval` | Require user approval for dangerous commands (default; overrides `config.json` `permission-mode`) |
+| `--i-promise-i-have-backups-and-will-not-file-issues` | Run every tool without user confirmation (overrides `config.json` `permission-mode`) |
+| `--force-revaluate-dangerous-commands` | Unsupervised, but the first attempt at a dangerous command is blocked until the agent re-runs it with a single-use OTP code (overrides `config.json` `permission-mode`) |
+
+The three permission flags above are mutually exclusive: pass at most one of `--ask-for-user-approval`, `--i-promise-i-have-backups-and-will-not-file-issues`, or `--force-revaluate-dangerous-commands`.
 

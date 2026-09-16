@@ -77,6 +77,28 @@ late
 
 对于在 `localhost:8080` 上运行的标准本地 `llama-server`，你不需要创建配置文件。
 
+### 工具授权模式（`permission-mode`）
+
+你可以通过在所用平台对应的 `config.json`（位置见上文）中添加 `permission-mode` 条目，来选择 Late 对危险命令的监督程度：
+
+```json
+{
+  "permission-mode": "ask-for-user-approval"
+}
+```
+
+有三个可选值：
+
+* `ask-for-user-approval` — 默认值。可能具有破坏性的命令需要你的批准。
+* `i-promise-i-have-backups-and-will-not-file-issues` — 运行所有工具而不需要用户确认。
+* `force-revaluate-dangerous-commands` — 无人监督，但危险命令的首次尝试会被阻止，直到智能体携带一次性 OTP 码重新运行该命令。
+
+注意事项：
+
+* 三个同名的 CLI 标志（`--ask-for-user-approval`、`--i-promise-i-have-backups-and-will-not-file-issues`、`--force-revaluate-dangerous-commands`）互斥，且会覆盖 `config.json` 中的值。
+* 省略该条目（以及任何标志）时，默认为 `ask-for-user-approval`。
+* 无效的值会被忽略并给出警告，同时应用安全的默认值。
+
 ### 高级模型配置（`models` 和 `agent_models`）
 
 默认情况下，Late 为主编排器和子智能体使用同一个模型。不过，你可以将不同的模型映射到特定的智能体角色（例如，使用庞大的前沿模型进行规划，使用快速的本地模型进行执行）。
@@ -211,16 +233,17 @@ late-podman -- --prompt "Refactor this package and verify all tests."
 
 Late 会自动保存会话。
 
-恢复上一个会话：
+恢复在当前项目目录中启动的最近一个会话：
 
 ```bash
 late --continue
 ```
 
-或者查看已保存的会话：
+在其他文件夹中启动的会话——或在此功能引入之前创建的会话——可以使用 `late session list` 查找（使用 `-v` 查看每个会话的项目目录），并使用 `late session load <id>` 恢复：
 
 ```bash
-late session list
+late session list -v
+late session load <id>
 ```
 
 ---
@@ -295,7 +318,7 @@ Late 的原生搜索工具会自动遵守你项目的 `.gitignore`，通过排�
 | --- | --- |
 | `--help` | 显示所有标志和命令 |
 | `--version` | 显示版本信息 |
-| `--continue` | 恢复上一个会话 |
+| `--continue` | 恢复在当前目录中创建的最新会话 |
 | `--prompt "..."` | 使用给定的 prompt 立即启动智能体 |
 | `--suppress-thinking-words` | 应用关于过度思考词汇的默认 Logit 偏置映射（仅限 `llama.cpp`） |
 | `--logit-bias` 和 `--subagent-logit-bias` | 手动设置特定模型的 logit 偏置（仅限 `llama.cpp`） |
@@ -304,3 +327,8 @@ Late 的原生搜索工具会自动遵守你项目的 `.gitignore`，通过排�
 | `--append-system-prompt "..."` | 在系统 prompt 附加文本（如：额外指令） |
 | `--enable-images` | 将模型视为支持图像（适用于非 llama.cpp 的服务器） |
 | `--save-subagent-histories` | 将子智能体的对话记录持久化到磁盘 |
+| `--ask-for-user-approval` | 要求对危险命令进行用户批准（默认值；覆盖 `config.json` 中的 `permission-mode`） |
+| `--i-promise-i-have-backups-and-will-not-file-issues` | 运行所有工具而不需要用户确认（覆盖 `config.json` 中的 `permission-mode`） |
+| `--force-revaluate-dangerous-commands` | 无人监督，但危险命令的首次尝试会被阻止，直到智能体携带一次性 OTP 码重新运行该命令（覆盖 `config.json` 中的 `permission-mode`） |
+
+上面的三个权限标志互斥：`--ask-for-user-approval`、`--i-promise-i-have-backups-and-will-not-file-issues` 和 `--force-revaluate-dangerous-commands` 最多只能传入一个。
