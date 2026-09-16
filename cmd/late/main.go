@@ -46,6 +46,13 @@ import (
 // re-runs the command passing it in the bash tool's otp_code parameter.
 const forceRevaluateUsage = "Unsupervised execution, but the first attempt to run a potentially dangerous command is blocked; late issues the agent a random single-use OTP code, bound to that exact command, which it must pass in the bash tool's otp_code parameter to re-run."
 
+// askForUserApprovalUsage is the -h description of -ask-for-user-approval.
+//
+// Like forceRevaluateUsage, this string must contain no back-quoted word:
+// flag.PrintDefaults renders the first back-quoted word as the flag's value
+// name, which would advertise this boolean flag as taking an argument.
+const askForUserApprovalUsage = "Require explicit user approval before running potentially dangerous commands (default; overrides config.json permission-mode)."
+
 // pluginInlineTool adapts a plugin.InlineTool (defined in internal/plugin/tools.go)
 // into a common.Tool so the CLI's session registry can dispatch invocations to
 // plugin-declared runners. It exists because upstream repurposed
@@ -114,6 +121,7 @@ func main() {
 	versionReq := flag.Bool("version", false, "Print the version and exit.")
 	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "UNSUPPORTED: run every tool without user confirmation.")
 	forceRevaluateReq := flag.Bool("force-revaluate-dangerous-commands", false, forceRevaluateUsage)
+	askForUserApprovalReq := flag.Bool("ask-for-user-approval", false, askForUserApprovalUsage)
 	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support.")
 	continueReq := flag.Bool("continue", false, "Resume the most recent session created in the current directory.")
 	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar.")
@@ -382,6 +390,17 @@ func main() {
 		storedSubagentHistoryPreference = loadedSessionMeta.SaveSubagentHistories
 	}
 	saveSubagentHistories := appconfig.ResolveSaveSubagentHistories(appConfig, saveSubagentHistoriesCLI, *saveSubagentHistoriesReq, storedSubagentHistoryPreference)
+
+	// Resolve the effective permission mode
+	// (explicit CLI flag > config.json permission-mode > ask-for-user-approval).
+	permissionMode, permissionModeWarning, err := appconfig.ResolvePermissionMode(appConfig, *askForUserApprovalReq, *unsupervisedReq, *forceRevaluateReq)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if permissionModeWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", permissionModeWarning)
+	}
 
 	// Initialize Core Components
 	resolvedOpenAIConfig := appconfig.ResolveOpenAISettings(appConfig)
@@ -664,10 +683,11 @@ func main() {
 
 		// Create context with InputProvider
 		ctx := context.WithValue(context.Background(), common.InputProviderKey, tui.NewTUIInputProvider(p))
-		if *unsupervisedReq || *forceRevaluateReq {
+		switch permissionMode {
+		case appconfig.PermissionModeUnsupervised:
 			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
-		}
-		if *forceRevaluateReq {
+		case appconfig.PermissionModeForceRevaluate:
+			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
 			ctx = context.WithValue(ctx, common.ForceRevaluateKey, true)
 		}
 		ctx = context.WithValue(ctx, common.MaxStreamRetriesKey, *maxStreamRetries)

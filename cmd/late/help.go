@@ -7,20 +7,24 @@ import (
 )
 
 // flagGroups defines the display order and scope grouping of the root flags
-// in -h output. Keep it in sync with the registrations in main(): any flag
-// registered but missing here is still rendered, under "Other:", by
-// writeGroupedFlags, so new flags can never silently vanish from the help.
+// in -h output, plus an optional note rendered right after a group's flag
+// block (note lines are pre-indented to align with the flag names). Keep it
+// in sync with the registrations in main(): any flag registered but missing
+// here is still rendered, under "Other:", by writeGroupedFlags, so new flags
+// can never silently vanish from the help.
 var flagGroups = []struct {
 	heading string
 	flags   []string
+	note    string
 }{
-	{"General", []string{"help", "version"}},
-	{"Session & startup", []string{"continue", "prompt", "theme", "show-cwd"}},
-	{"System prompt", []string{"system-prompt", "system-prompt-file", "append-system-prompt", "inject-cwd", "gemma-thinking"}},
-	{"Model & streaming", []string{"logit-bias", "suppress-thinking-words", "max-stream-retries"}},
-	{"Subagents", []string{"enable-subagents", "subagent-max-turns", "subagent-logit-bias", "save-subagent-histories"}},
-	{"Tools", []string{"use-tools", "enable-bash", "enable-images", "enable-sqz"}},
-	{"Supervision & safety", []string{"i-promise-i-have-backups-and-will-not-file-issues", "force-revaluate-dangerous-commands"}},
+	{"General", []string{"help", "version"}, ""},
+	{"Session & startup", []string{"continue", "prompt", "theme", "show-cwd"}, ""},
+	{"System prompt", []string{"system-prompt", "system-prompt-file", "append-system-prompt", "inject-cwd", "gemma-thinking"}, ""},
+	{"Model & streaming", []string{"logit-bias", "suppress-thinking-words", "max-stream-retries"}, ""},
+	{"Subagents", []string{"enable-subagents", "subagent-max-turns", "subagent-logit-bias", "save-subagent-histories"}, ""},
+	{"Tools", []string{"use-tools", "enable-bash", "enable-images", "enable-sqz"}, ""},
+	{"Supervision & safety", []string{"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues", "force-revaluate-dangerous-commands"},
+		"These three flags are mutually exclusive: pass at most one. The default\n  (ask-for-user-approval) can be changed by adding a \"permission-mode\"\n  entry to late's config.json with one of the values above."},
 }
 
 // writeHelp renders the full `late -h` output. src is the FlagSet whose
@@ -59,7 +63,8 @@ func writeHelp(w io.Writer, src *flag.FlagSet) {
 }
 
 // writeGroupedFlags renders src's flags grouped by scope, in flagGroups
-// order, reusing the flag package's PrintDefaults formatting per group.
+// order, reusing the flag package's PrintDefaults formatting per group, and
+// appends each group's note (when non-empty) right after its flag block.
 // Each group is rendered through a display-only FlagSet sharing the real
 // registered flag Values, so defaults and value names stay correct and
 // single-sourced with the registrations in main().
@@ -83,6 +88,9 @@ func writeGroupedFlags(w io.Writer, src *flag.FlagSet) {
 		}
 		fmt.Fprintln(w, g.heading+":")
 		gfs.PrintDefaults()
+		if g.note != "" {
+			fmt.Fprintln(w, "  "+g.note)
+		}
 		fmt.Fprintln(w)
 	}
 	var others []string

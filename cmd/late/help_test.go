@@ -16,7 +16,7 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 	bools := []string{
 		"help", "version", "continue", "show-cwd", "inject-cwd", "gemma-thinking",
 		"suppress-thinking-words", "save-subagent-histories", "enable-sqz",
-		"i-promise-i-have-backups-and-will-not-file-issues",
+		"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues",
 		"force-revaluate-dangerous-commands", "enable-images",
 		"use-tools", "enable-bash", "enable-subagents",
 	}
@@ -113,7 +113,27 @@ func TestWriteHelpSections(t *testing.T) {
 		"session list [-v]", "session load <id>", "session delete <id>",
 		"plugin list | ls", "plugin install | i", "plugin remove | rm | uninstall",
 		"plugin update [<name>]", "worktree create <path> [branch]", "worktree active",
-		"force-revaluate-dangerous-commands",
+		"ask-for-user-approval", "force-revaluate-dangerous-commands",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("writeHelp output missing %q", want)
+		}
+	}
+}
+
+// TestWriteHelp_ShowsPermissionModeNote guards the Supervision & safety note:
+// the three mutually exclusive permission flags are grouped together with a
+// note explaining that the default (ask-for-user-approval) can be overridden
+// via the permission-mode entry in late's config.json.
+func TestWriteHelp_ShowsPermissionModeNote(t *testing.T) {
+	var buf bytes.Buffer
+	writeHelp(&buf, newHelpTestFlagSet(t))
+	out := buf.String()
+	for _, want := range []string{
+		"-ask-for-user-approval",
+		"mutually exclusive",
+		"permission-mode",
+		"config.json",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("writeHelp output missing %q", want)
