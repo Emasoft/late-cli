@@ -287,7 +287,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status: %d", resp.StatusCode)
+		return &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	return nil
 }
@@ -548,7 +548,6 @@ func parsePropsBodyData(body []byte) (int, bool) {
 	return nCtx, vis
 }
 
-
 func (c *Client) getBackend() BackendType {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -610,12 +609,34 @@ func (c *Client) marshalFlattened(req ChatCompletionRequest) ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// StatusError is a non-2xx HTTP response returned by the LLM server.
+// It is errors.As-able so callers can classify retryability by status code.
+type StatusError struct {
+	StatusCode int
+	Status     string // e.g. "500 Internal Server Error"
+	Body       string // truncated response body for diagnostics
+}
+
+// Error renders the same messages the previous fmt.Errorf calls produced,
+// so logs and tests that match on the text keep working:
+// "API error (%d): %s" when a body/message is available, "status: %d" otherwise.
+func (e *StatusError) Error() string {
+	if e.Body != "" {
+		return fmt.Sprintf("API error (%d): %s", e.StatusCode, e.Body)
+	}
+	return fmt.Sprintf("status: %d", e.StatusCode)
+}
+
 func (c *Client) formatError(resp *http.Response) error {
+	se := &StatusError{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+	}
 	var apiErr APIErrorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err == nil && apiErr.Error.Message != "" {
-		return fmt.Errorf("API error (%d): %s", resp.StatusCode, apiErr.Error.Message)
+		se.Body = apiErr.Error.Message
 	}
-	return fmt.Errorf("status: %d", resp.StatusCode)
+	return se
 }
 
 func (c *Client) APIKey() string {
@@ -661,5 +682,3 @@ func (c *Client) mergeLogitBias(reqBias map[string]int) map[string]int {
 	defer c.mu.RUnlock()
 	return MergeLogitBiases(c.cfg.LogitBias, reqBias)
 }
-
-

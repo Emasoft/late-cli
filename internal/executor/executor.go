@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"late/internal/client"
 	"late/internal/common"
@@ -241,19 +242,72 @@ func RunLoop(
 	onStartTurn func(),
 	onEndTurn func(),
 	onStreamChunk func(common.StreamResult),
+	onRetry func(event common.RetryEvent),
 	middlewares []common.ToolMiddleware,
 ) (string, error) {
 	var lastContent string
+
+	// Retry budget for failing LLM stream calls, resolved once per run.
+	maxRetries := maxStreamRetriesFromContext(ctx)
 
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
 		if onStartTurn != nil {
 			onStartTurn()
 		}
 
-		streamCh, errCh := sess.StartStream(ctx, extraBody)
-		acc, err := ConsumeStream(ctx, streamCh, errCh, onStreamChunk)
-		if err != nil {
-			return "", err
+		// Inner attempt loop around the stream call only: retries never
+		// consume a turn (the turn counter above is untouched). Each attempt
+		// starts a fresh stream and ConsumeStream builds a fresh accumulator;
+		// a failed attempt commits nothing to history.
+		var acc *StreamAccumulator
+		var err error
+		for attempt := 0; ; attempt++ {
+			// Pre-attempt guard (retries only): if the context died while we
+			// were waiting in a previous backoff (both select cases below can
+			// be ready and the timer may win), do not call StartStream with a
+			// dead ctx. Handle it as a cancel, not a new attempt.
+			if attempt > 0 && ctx.Err() != nil {
+				return "", err
+			}
+
+			streamCh, errCh := sess.StartStream(ctx, extraBody)
+			acc, err = ConsumeStream(ctx, streamCh, errCh, onStreamChunk)
+			if err == nil {
+				break
+			}
+
+			// Terminal: retry budget exhausted or non-retryable failure.
+			// Propagates byte-identically to the pre-retry behavior.
+			if attempt >= maxRetries || !isRetryableStreamError(err) {
+				return "", err
+			}
+
+			delay := streamRetryDelay(attempt + 1)
+			if onRetry != nil {
+				onRetry(common.RetryEvent{
+					ID:          common.GetOrchestratorID(ctx),
+					Attempt:     attempt + 1,
+					MaxAttempts: maxRetries,
+					Delay:       delay,
+					Err:         err,
+				})
+			}
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				// Backoff elapsed: loop around for a fresh StartStream and a
+				// fresh accumulator via ConsumeStream.
+			case <-ctx.Done():
+				timer.Stop()
+				// CANCEL SEMANTICS: a stop during the backoff sleep must land
+				// on the same path as a mid-stream cancel (TUI "Stopped", no
+				// error box). Returning the underlying stream error is safe
+				// because BaseOrchestrator's error branch checks ctx.Err()
+				// and routes canceled runs to the stop path instead of
+				// emitting StatusEvent{error}.
+				return "", err
+			}
 		}
 
 		if acc.FinishReason == "length" {

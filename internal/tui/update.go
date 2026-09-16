@@ -1488,6 +1488,10 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 
 	case OrchestratorEventMsg:
 		s := m.GetAgentState(msg.Event.OrchestratorID())
+		// restoredToast delivers the "connection restored" toast through the
+		// existing ToastMsg handler when a retrying agent becomes productive
+		// again; it is returned after the event switch below.
+		var restoredToast tea.Cmd
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
@@ -1530,6 +1534,18 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				if s.State != StateConfirmTool {
 					s.State = StateThinking
 				}
+				// The agent is productive again: clear any error box pinned
+				// by a previous failure. If we had been retrying, toast the
+				// recovery via the existing ToastMsg handler (3s expiry).
+				if s.Error != nil {
+					s.Error = nil
+				}
+				if s.WasRetrying {
+					s.WasRetrying = false
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "connection restored"}
+					}
+				}
 				s.StatusText = "Working..."
 				s.StreamingState = common.ContentEvent{ID: event.ID}
 				// Clear streaming render cache for new turn
@@ -1567,6 +1583,25 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}
+		case common.RetryEvent:
+			// A stream attempt failed and the executor is retrying after
+			// event.Delay. The agent stays busy (the spinner keeps running)
+			// and the failed attempt's partial output is dropped so it does
+			// not linger in the transcript. The pinned error box is left
+			// alone: it clears when the next successful turn starts
+			// (the "thinking" branch above).
+			s.Transcript.generation++
+			s.Transcript.busy = false
+			s.State = StateThinking
+			s.StatusText = fmt.Sprintf("connection lost — retrying in %s (attempt %d/%d)", event.Delay.Truncate(100*time.Millisecond), event.Attempt, event.MaxAttempts)
+			s.StreamingState = common.ContentEvent{ID: event.ID}
+			// Clear streaming render cache for the failed attempt
+			s.StreamingStyledCache = ""
+			s.StreamingChunkCount = 0
+			s.WasRetrying = true
+			if event.ID == m.Focused.ID() {
+				m.updateViewport()
+			}
 		case common.ChildAddedEvent:
 			s.StatusText = "Subagent spawned"
 			m.updateViewport()
@@ -1586,6 +1621,10 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}
+		}
+
+		if restoredToast != nil {
+			return m, restoredToast
 		}
 
 	case ConfirmRequestMsg:

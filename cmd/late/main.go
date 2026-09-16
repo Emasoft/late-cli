@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,17 @@ import (
 	"charm.land/glamour/v2"
 	"golang.org/x/term"
 )
+
+// forceRevaluateUsage is the -h description of
+// -force-revaluate-dangerous-commands.
+//
+// IMPORTANT: this string must contain no back-quoted word. flag.PrintDefaults
+// renders the first back-quoted word of a usage string as the flag's value
+// name, which would advertise the flag as taking an argument. The OTP code is
+// never passed on the CLI: late generates a random single-use code at runtime
+// and hands it to the agent in the tool-result block message; the agent
+// re-runs the command passing it in the bash tool's otp_code parameter.
+const forceRevaluateUsage = "Unsupervised execution, but the first attempt to run a potentially dangerous command is blocked; late issues the agent a random single-use OTP code, bound to that exact command, which it must pass in the bash tool's otp_code parameter to re-run."
 
 // pluginInlineTool adapts a plugin.InlineTool (defined in internal/plugin/tools.go)
 // into a common.Tool so the CLI's session registry can dispatch invocations to
@@ -76,52 +88,43 @@ func (p pluginInlineTool) CallString(args json.RawMessage) string {
 
 func main() {
 	// Parse flags
-	helpReq := flag.Bool("help", false, "Show help")
-	systemPromptReq := flag.String("system-prompt", "", "Set the system prompt (literal string)")
-	systemPromptFileReq := flag.String("system-prompt-file", "", "Set the system prompt from a file")
-	useToolsReq := flag.Bool("use-tools", true, "Enable tool usage (allows LLM to call tools)")
-	enableBashReq := flag.Bool("enable-bash", true, "Enable bash tool execution")
-	injectCWDReq := flag.Bool("inject-cwd", true, "Replace ${{CWD}} in system prompt with current working directory")
-	enableSubagentsReq := flag.Bool("enable-subagents", true, "Enable subagent usage")
-	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend <|think|> token to system prompt for Gemma 4 models")
-	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum number of turns for subagents (default: 500)")
-	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent conversation histories to disk (default: off)")
-	enableSqzReq := flag.Bool("enable-sqz", false, "Enable sqz context compression (if available)")
-	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append text to the system prompt after processing")
-	versionReq := flag.Bool("version", false, "Show version")
-	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "Unsupported: Execute all tools without supervision. Do not use this, bad things will happen. You have been warned.")
-	enableImagesReq := flag.Bool("enable-images", false, "Force enable support for image attachments for unsupported servers.")
-	continueReq := flag.Bool("continue", false, "Load and start the latest session")
-	showCWDReq := flag.Bool("show-cwd", true, "Show current working directory in status bar")
-	themeReq := flag.String("theme", "", "Plugin theme id ('<plugin>:<name>'); falls back to $LATE_THEME")
-	promptReq := flag.String("prompt", "", "Start the agent immediately with the given prompt")
-	logitBiasReq := flag.String("logit-bias", "", "Token-bias mappings as raw JSON or key-value pairs (e.g., TOKEN_ID:BIAS,TOKEN_ID:BIAS)")
-	suppressThinkingWordsReq := flag.Bool("suppress-thinking-words", false, "Apply standard anti-overthinking bias map (dynamically resolved via /tokenize)")
-	subagentLogitBiasReq := flag.String("subagent-logit-bias", "", "Token-bias mappings for subagents as raw JSON or key-value pairs (e.g., TOKEN_ID:BIAS,TOKEN_ID:BIAS)")
+	helpReq := flag.Bool("help", false, "Show this help and exit.")
+	systemPromptReq := flag.String("system-prompt", "", "Replace the built-in system prompt with this text.")
+	systemPromptFileReq := flag.String("system-prompt-file", "", "Replace the built-in system prompt with a file's contents (highest priority).")
+	useToolsReq := flag.Bool("use-tools", true, "Offer tools to the main agent at all.")
+	enableBashReq := flag.Bool("enable-bash", true, "Enable the bash tool.")
+	injectCWDReq := flag.Bool("inject-cwd", true, "Replace ${{CWD}} in the system prompt with the working directory.")
+	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents.")
+	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt.")
+	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum turns per subagent.")
+	// LATE_MAX_STREAM_RETRIES optionally overrides the default retry budget
+	// for LLM stream errors; an explicit -max-stream-retries flag wins over it.
+	maxStreamRetriesDefault := executor.DefaultMaxStreamRetries
+	if v := os.Getenv("LATE_MAX_STREAM_RETRIES"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			maxStreamRetriesDefault = parsed
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: ignoring invalid LATE_MAX_STREAM_RETRIES %q: %v\n", v, err)
+		}
+	}
+	maxStreamRetries := flag.Int("max-stream-retries", maxStreamRetriesDefault, "Retries for LLM stream errors with backoff; 0 disables. Env: LATE_MAX_STREAM_RETRIES")
+	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent histories to disk (overrides session and config).")
+	enableSqzReq := flag.Bool("enable-sqz", false, "Compress bash tool output with the external 'sqz' binary if available.")
+	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append this text to the final system prompt.")
+	versionReq := flag.Bool("version", false, "Print the version and exit.")
+	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "UNSUPPORTED: run every tool without user confirmation.")
+	forceRevaluateReq := flag.Bool("force-revaluate-dangerous-commands", false, forceRevaluateUsage)
+	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support.")
+	continueReq := flag.Bool("continue", false, "Resume the most recent session.")
+	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar.")
+	themeReq := flag.String("theme", "", "Plugin theme id ('plugin:name' or bare name); env: LATE_THEME.")
+	promptReq := flag.String("prompt", "", "Start the agent immediately with this prompt.")
+	logitBiasReq := flag.String("logit-bias", "", "Main-agent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
+	suppressThinkingWordsReq := flag.Bool("suppress-thinking-words", false, "Bias anti-overthinking tokens (requires the same model for main agent and subagents).")
+	subagentLogitBiasReq := flag.String("subagent-logit-bias", "", "Subagent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of late:\n")
-		fmt.Fprintf(os.Stderr, "  late [flags]\n")
-		fmt.Fprintf(os.Stderr, "  late session <command> [args]\n")
-		fmt.Fprintf(os.Stderr, "  late plugin <command> [args]\n")
-		fmt.Fprintf(os.Stderr, "  late worktree <command> [args]\n\n")
-		fmt.Fprintf(os.Stderr, "Commands:\n")
-		fmt.Fprintf(os.Stderr, "  session list [-v]      List all saved sessions (use -v for verbose/detailed view)\n")
-		fmt.Fprintf(os.Stderr, "  session load <id>      Load a session by ID\n")
-		fmt.Fprintf(os.Stderr, "  session delete <id>    Delete a session by ID\n")
-		fmt.Fprintf(os.Stderr, "  plugin list, ls                      List installed plugins\n")
-		fmt.Fprintf(os.Stderr, "  plugin install [--project] <src>     Install a plugin from npm/git/local\n")
-		fmt.Fprintf(os.Stderr, "  plugin remove [--project] <name>     Remove a plugin\n")
-		fmt.Fprintf(os.Stderr, "  plugin link [--project] <path>       Link a local plugin directory\n")
-		fmt.Fprintf(os.Stderr, "  plugin update [<name>]               Update all or a specific plugin\n")
-		fmt.Fprintf(os.Stderr, "  plugin enable <name>                 Enable a plugin\n")
-		fmt.Fprintf(os.Stderr, "  plugin disable <name>                Disable a plugin\n")
-		fmt.Fprintf(os.Stderr, "  worktree list          List all worktrees\n")
-		fmt.Fprintf(os.Stderr, "  worktree create <path> [branch]  Create a new worktree\n")
-		fmt.Fprintf(os.Stderr, "  worktree remove <path>           Remove a worktree\n")
-		fmt.Fprintf(os.Stderr, "  worktree active        Show current worktree\n\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\n🌟 Enjoying Late? Consider leaving a star on GitHub: https://github.com/mlhher/late-cli\n")
+		writeHelp(os.Stderr, flag.CommandLine)
 	}
 	flag.Parse()
 
@@ -653,9 +656,13 @@ func main() {
 
 		// Create context with InputProvider
 		ctx := context.WithValue(context.Background(), common.InputProviderKey, tui.NewTUIInputProvider(p))
-		if *unsupervisedReq {
+		if *unsupervisedReq || *forceRevaluateReq {
 			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
 		}
+		if *forceRevaluateReq {
+			ctx = context.WithValue(ctx, common.ForceRevaluateKey, true)
+		}
+		ctx = context.WithValue(ctx, common.MaxStreamRetriesKey, *maxStreamRetries)
 		rootAgent.SetContext(ctx)
 
 		// Set middlewares (see buildMiddlewares for ordering rationale).

@@ -134,6 +134,11 @@ type AppState struct {
 
 	ContextWarningShown bool // Whether the preflight context warning has been shown for the current input
 	Error               error
+
+	// WasRetrying marks an agent whose last stream attempt failed and is
+	// being retried (set by common.RetryEvent, cleared by the next
+	// "thinking" status, which also raises the "connection restored" toast).
+	WasRetrying bool
 }
 
 type Model struct {

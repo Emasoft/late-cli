@@ -1,0 +1,262 @@
+package executor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"testing"
+	"time"
+
+	"late/internal/client"
+	"late/internal/common"
+)
+
+// timeoutError is a minimal net.Error implementation that always reports a
+// timeout, mirroring what net/http surfaces for stalled connections.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+func TestStreamRetryDelay(t *testing.T) {
+	t.Run("attempt 1 is positive and within base delay", func(t *testing.T) {
+		for i := 0; i < 500; i++ {
+			d := streamRetryDelay(1)
+			if d <= 0 {
+				t.Fatalf("streamRetryDelay(1) = %v, want > 0", d)
+			}
+			if d > streamRetryBaseDelay {
+				t.Fatalf("streamRetryDelay(1) = %v, want <= %v", d, streamRetryBaseDelay)
+			}
+		}
+	})
+
+	t.Run("large attempts are capped", func(t *testing.T) {
+		for _, attempt := range []int{40, 100000} {
+			for i := 0; i < 100; i++ {
+				d := streamRetryDelay(attempt)
+				if d < 0 {
+					t.Fatalf("streamRetryDelay(%d) = %v, want >= 0", attempt, d)
+				}
+				if d > streamRetryMaxDelay {
+					t.Fatalf("streamRetryDelay(%d) = %v, want <= %v", attempt, d, streamRetryMaxDelay)
+				}
+			}
+		}
+	})
+
+	t.Run("backoff grows with attempt number", func(t *testing.T) {
+		const draws = 500
+
+		// attempt 1 draws uniformly from [0, 500ms], attempt 5 from
+		// [0, 8s]; the observed maxima must reflect that growth.
+		maxFirst := time.Duration(0)
+		for i := 0; i < draws; i++ {
+			if d := streamRetryDelay(1); d > maxFirst {
+				maxFirst = d
+			}
+		}
+		maxFifth := time.Duration(0)
+		for i := 0; i < draws; i++ {
+			if d := streamRetryDelay(5); d > maxFifth {
+				maxFifth = d
+			}
+		}
+		if maxFifth <= maxFirst {
+			t.Fatalf("expected growth between attempts: max over %d draws was %v for attempt 1, %v for attempt 5", draws, maxFirst, maxFifth)
+		}
+	})
+}
+
+func TestIsRetryableStreamError(t *testing.T) {
+	urlTimeoutErr := &url.Error{
+		Op:  "Post",
+		URL: "https://api/v1/chat/completions",
+		Err: errors.New("read tcp 1.2.3.4:5->6:7: operation timed out"),
+	}
+	urlResetErr := &url.Error{
+		Op:  "Post",
+		URL: "https://api/v1/chat/completions",
+		Err: errors.New("read tcp 1.2.3.4:5->6:7: connection reset by peer"),
+	}
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Retryable: network-level failures.
+		{
+			name: "raw url.Error is retryable",
+			err:  urlTimeoutErr,
+			want: true,
+		},
+		{
+			name: "executor-wrapped url.Error is retryable",
+			err:  fmt.Errorf("stream error: %w", urlTimeoutErr),
+			want: true,
+		},
+		{
+			name: "double-wrapped url.Error is retryable",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", urlResetErr)),
+			want: true,
+		},
+		{
+			name: "net.Error timeout wrapped is retryable",
+			err:  fmt.Errorf("stream interrupted: %w", timeoutError{}),
+			want: true,
+		},
+		{
+			name: "double-wrapped net.Error timeout is retryable",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", timeoutError{})),
+			want: true,
+		},
+		{
+			name: "real DNS timeout wrapped is retryable",
+			err:  fmt.Errorf("stream error: %w", &net.DNSError{Err: "i/o timeout", Name: "api.example.com", IsTimeout: true}),
+			want: true,
+		},
+		{
+			name: "io.EOF wrapped is retryable",
+			err:  fmt.Errorf("stream interrupted: %w", io.EOF),
+			want: true,
+		},
+		{
+			name: "io.ErrUnexpectedEOF double-wrapped is retryable",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", io.ErrUnexpectedEOF)),
+			want: true,
+		},
+
+		// Retryable: transient server responses.
+		{
+			name: "raw 500 is retryable",
+			err:  &client.StatusError{StatusCode: 500, Status: "500 Internal Server Error", Body: "boom"},
+			want: true,
+		},
+		{
+			name: "wrapped 500 is retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 500, Status: "500 Internal Server Error", Body: "boom"}),
+			want: true,
+		},
+		{
+			name: "double-wrapped 502 is retryable",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", &client.StatusError{StatusCode: 502, Status: "502 Bad Gateway", Body: ""})),
+			want: true,
+		},
+		{
+			name: "wrapped 429 is retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 429, Status: "429 Too Many Requests"}),
+			want: true,
+		},
+		{
+			name: "wrapped 408 is retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 408, Status: "408 Request Timeout"}),
+			want: true,
+		},
+
+		// Not retryable: cancellation fails fast even inside the wraps.
+		{
+			name: "context.Canceled wrapped is not retryable",
+			err:  fmt.Errorf("stream error: %w", context.Canceled),
+			want: false,
+		},
+		{
+			name: "context.DeadlineExceeded wrapped is not retryable",
+			err:  fmt.Errorf("stream error: %w", context.DeadlineExceeded),
+			want: false,
+		},
+		{
+			name: "context.Canceled double-wrapped is not retryable",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", context.Canceled)),
+			want: false,
+		},
+		{
+			name: "url.Error carrying a canceled context is not retryable",
+			err:  fmt.Errorf("stream error: %w", &url.Error{Op: "Post", URL: "https://api/v1/chat/completions", Err: context.Canceled}),
+			want: false,
+		},
+
+		// Not retryable: permanent server responses.
+		{
+			name: "wrapped 400 is not retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 400, Status: "400 Bad Request", Body: "invalid model"}),
+			want: false,
+		},
+		{
+			name: "wrapped 401 is not retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 401, Status: "401 Unauthorized"}),
+			want: false,
+		},
+		{
+			name: "wrapped 403 is not retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 403, Status: "403 Forbidden"}),
+			want: false,
+		},
+		{
+			name: "wrapped 404 is not retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 404, Status: "404 Not Found"}),
+			want: false,
+		},
+
+		// Not retryable: anything unknown fails fast, like pre-retry behavior.
+		{
+			name: "plain parser error is not retryable",
+			err:  errors.New("some parser error"),
+			want: false,
+		},
+		{
+			name: "nil is not retryable",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableStreamError(tt.err); got != tt.want {
+				t.Errorf("isRetryableStreamError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaxStreamRetriesFromContext(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want int
+	}{
+		{
+			name: "absent key falls back to default",
+			ctx:  context.Background(),
+			want: DefaultMaxStreamRetries,
+		},
+		{
+			name: "positive override is honored",
+			ctx:  context.WithValue(context.Background(), common.MaxStreamRetriesKey, 7),
+			want: 7,
+		},
+		{
+			name: "zero disables retries",
+			ctx:  context.WithValue(context.Background(), common.MaxStreamRetriesKey, 0),
+			want: 0,
+		},
+		{
+			name: "negative value means disabled",
+			ctx:  context.WithValue(context.Background(), common.MaxStreamRetriesKey, -3),
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maxStreamRetriesFromContext(tt.ctx); got != tt.want {
+				t.Errorf("maxStreamRetriesFromContext() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
