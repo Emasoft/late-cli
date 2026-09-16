@@ -7,6 +7,7 @@ import (
 	"late/internal/client"
 	"late/internal/common"
 	"late/internal/tool"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,14 +22,15 @@ type Session struct {
 	History               []client.ChatMessage
 	systemPrompt          string
 	useTools              bool
-	skipMetadata          bool // when true, no top-level .meta.json sidecar is written (subagents)
+	skipMetadata          bool   // when true, no top-level .meta.json sidecar is written (subagents)
+	workingDir            string // absolute path of the directory where the session was started (project folder)
 	subagentSeq           int
 	saveSubagentHistories *bool
 	Registry              *tool.Registry
 }
 
 func New(c *client.Client, historyPath string, history []client.ChatMessage, systemPrompt string, useTools bool) *Session {
-	return &Session{
+	s := &Session{
 		client:       c,
 		HistoryPath:  historyPath,
 		History:      history,
@@ -36,6 +38,11 @@ func New(c *client.Client, historyPath string, history []client.ChatMessage, sys
 		useTools:     useTools,
 		Registry:     tool.NewRegistry(),
 	}
+	// Best-effort capture of the project folder; never fail construction.
+	if wd, err := os.Getwd(); err == nil {
+		s.workingDir = wd
+	}
+	return s
 }
 
 // NewSubagentSession creates a session for a subagent. History is persisted
@@ -57,6 +64,13 @@ func (s *Session) SetSubagentMetadata(seq int, saveHistories *bool) {
 	}
 	value := *saveHistories
 	s.saveSubagentHistories = &value
+}
+
+// SetWorkingDir overrides the project directory recorded in session
+// metadata. Used on resume so a session keeps the directory where it
+// was originally started.
+func (s *Session) SetWorkingDir(dir string) {
+	s.workingDir = dir
 }
 
 // SubagentSeq returns the next sequence number reserved for a child session.
@@ -325,6 +339,7 @@ func (s *Session) GenerateSessionMeta() SessionMeta {
 		MessageCount:          len(s.History),
 		SubagentSeq:           s.subagentSeq,
 		SaveSubagentHistories: s.saveSubagentHistories,
+		WorkingDir:            s.workingDir,
 	}
 }
 

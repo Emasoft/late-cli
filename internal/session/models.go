@@ -22,6 +22,7 @@ type SessionMeta struct {
 	MessageCount          int       `json:"message_count"`
 	SubagentSeq           int       `json:"subagent_seq"`
 	SaveSubagentHistories *bool     `json:"save_subagent_histories,omitempty"`
+	WorkingDir            string    `json:"working_dir,omitempty"` // Absolute path of the project directory where the session was started
 }
 
 // SessionDir returns the directory where session metadata and histories are stored
@@ -193,4 +194,46 @@ func GetLatestSession() (*SessionMeta, error) {
 
 	id := strings.TrimSuffix(latestEntry.Name(), ".meta.json")
 	return LoadSessionMeta(id)
+}
+
+// GetLatestSessionForDir returns the metadata of the most recently updated
+// session that was started in dir, matched against the working_dir recorded
+// in each session's metadata. Sessions created before working_dir was
+// recorded (empty WorkingDir) are ignored. If no matching session exists,
+// it returns nil, nil.
+func GetLatestSessionForDir(dir string) (*SessionMeta, error) {
+	sessionsDir, err := SessionDir()
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read sessions directory: %w", err)
+	}
+
+	want := filepath.Clean(dir)
+	var latest *SessionMeta
+	var latestModTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		meta, err := LoadSessionMeta(strings.TrimSuffix(entry.Name(), ".meta.json"))
+		if err != nil || meta.WorkingDir == "" || filepath.Clean(meta.WorkingDir) != want {
+			continue
+		}
+		if latest == nil || info.ModTime().After(latestModTime) {
+			latest = meta
+			latestModTime = info.ModTime()
+		}
+	}
+	return latest, nil
 }

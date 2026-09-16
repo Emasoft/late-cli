@@ -72,7 +72,8 @@ func TestToolEnabled_BareNameFallback(t *testing.T) {
 
 // writeTestSession creates a flat session in the injected sessions directory:
 // <dir>/<id>.json (history) and <dir>/<id>.meta.json. It returns both paths.
-func writeTestSession(t *testing.T, sessionsDir, id string) (metaPath, historyPath string) {
+// An optional workingDir argument records the session's working directory.
+func writeTestSession(t *testing.T, sessionsDir, id string, workingDir ...string) (metaPath, historyPath string) {
 	t.Helper()
 
 	historyPath = filepath.Join(sessionsDir, id+".json")
@@ -82,14 +83,18 @@ func writeTestSession(t *testing.T, sessionsDir, id string) (metaPath, historyPa
 		t.Fatalf("SaveHistory(%s): %v", id, err)
 	}
 
-	if err := session.SaveSessionMeta(session.SessionMeta{
+	meta := session.SessionMeta{
 		ID:           id,
 		Title:        "Test session " + id,
 		CreatedAt:    time.Now(),
 		LastUpdated:  time.Now(),
 		HistoryPath:  historyPath,
 		MessageCount: 1,
-	}); err != nil {
+	}
+	if len(workingDir) > 0 {
+		meta.WorkingDir = workingDir[0]
+	}
+	if err := session.SaveSessionMeta(meta); err != nil {
 		t.Fatalf("SaveSessionMeta(%s): %v", id, err)
 	}
 
@@ -159,6 +164,77 @@ func TestHandleSessionDelete_LegacyFlatSession(t *testing.T) {
 
 	assertFileGone(t, metaC)
 	assertFileGone(t, historyC)
+}
+
+// TestResolveContinueSession_ReturnsNewestInCurrentDir guards the --continue
+// resolution rule: pick the most recently updated session started in the
+// current working directory, not the globally newest session.
+func TestResolveContinueSession_ReturnsNewestInCurrentDir(t *testing.T) {
+	tmp := injectSessionDir(t)
+
+	// os.Getwd needs real directories, so the "projects" live inside the temp area.
+	projA := filepath.Join(tmp, "proj-a")
+	projB := filepath.Join(tmp, "proj-b")
+	if err := os.MkdirAll(projA, 0700); err != nil {
+		t.Fatalf("creating proj-a: %v", err)
+	}
+	if err := os.MkdirAll(projB, 0700); err != nil {
+		t.Fatalf("creating proj-b: %v", err)
+	}
+
+	_, metaA1 := writeTestSession(t, tmp, "session-20250101-100000", projA)
+	_, metaA2 := writeTestSession(t, tmp, "session-20250102-100000", projA)
+	_, metaB1 := writeTestSession(t, tmp, "session-20250103-100000", projB)
+
+	// The helper writes all three back-to-back; pin the meta mtimes so the
+	// ordering is deterministic. The /proj-b session is the global newest.
+	base := time.Now().Add(-time.Hour)
+	for i, metaPath := range []string{metaA1, metaA2, metaB1} {
+		at := base.Add(time.Duration(i) * time.Hour)
+		if err := os.Chtimes(metaPath, at, at); err != nil {
+			t.Fatalf("Chtimes(%s): %v", metaPath, err)
+		}
+	}
+
+	t.Chdir(projA)
+
+	meta, err := resolveContinueSession()
+	if err != nil {
+		t.Fatalf("resolveContinueSession(): %v", err)
+	}
+	if meta == nil {
+		t.Fatal("resolveContinueSession() returned nil, want the newest proj-a session")
+	}
+	if meta.ID != "session-20250102-100000" {
+		t.Errorf("resolveContinueSession() = %q, want session-20250102-100000 (newest proj-a session, not the globally newest proj-b one)", meta.ID)
+	}
+}
+
+// TestResolveContinueSession_NoMatchReturnsNil guards the empty case: in a
+// directory with no recorded session, --continue resolves to (nil, nil)
+// rather than an error or an unrelated session.
+func TestResolveContinueSession_NoMatchReturnsNil(t *testing.T) {
+	tmp := injectSessionDir(t)
+
+	someProjDir := filepath.Join(tmp, "some-project")
+	if err := os.MkdirAll(someProjDir, 0700); err != nil {
+		t.Fatalf("creating some-project: %v", err)
+	}
+	writeTestSession(t, tmp, "session-20250101-100000", someProjDir)
+
+	other := filepath.Join(tmp, "other")
+	if err := os.MkdirAll(other, 0700); err != nil {
+		t.Fatalf("creating other dir: %v", err)
+	}
+	t.Chdir(other)
+
+	meta, err := resolveContinueSession()
+	if err != nil {
+		t.Fatalf("resolveContinueSession(): %v", err)
+	}
+	if meta != nil {
+		t.Fatalf("resolveContinueSession() = %+v, want nil in a directory with no recorded session", meta)
+	}
 }
 
 func TestDeriveEffectiveSessionID(t *testing.T) {

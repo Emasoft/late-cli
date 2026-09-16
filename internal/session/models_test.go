@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"late/internal/client"
 	"os"
 	"path/filepath"
@@ -291,5 +292,201 @@ func TestLoadSessionMeta_IgnoresSubagentFolders(t *testing.T) {
 	}
 	if notFound != nil {
 		t.Errorf("Expected nil meta for nonexistent session, got %v", notFound)
+	}
+}
+
+// newWorkingDirMeta builds a session meta recording dir as its project folder,
+// with the surrounding fields modeled on the metas saved by the other tests.
+func newWorkingDirMeta(sessionsDir, id, dir string) SessionMeta {
+	return SessionMeta{
+		ID:             id,
+		Title:          "Session " + id,
+		CreatedAt:      time.Now().Add(-24 * time.Hour),
+		LastUpdated:    time.Now().Add(-24 * time.Hour),
+		HistoryPath:    filepath.Join(sessionsDir, id+".json"),
+		LastUserPrompt: "Hello",
+		MessageCount:   1,
+		WorkingDir:     dir,
+	}
+}
+
+// setMetaModTimes pins each session's .meta.json file to the given mod time so
+// the newest-wins selection in GetLatestSessionForDir is deterministic.
+func setMetaModTimes(t *testing.T, sessionsDir string, times map[string]time.Time) {
+	t.Helper()
+	for id, modTime := range times {
+		metaPath := filepath.Join(sessionsDir, id+".meta.json")
+		if err := os.Chtimes(metaPath, modTime, modTime); err != nil {
+			t.Fatalf("os.Chtimes(%s) error = %v", metaPath, err)
+		}
+	}
+}
+
+func TestGetLatestSessionForDir_ReturnsNewestForDirectory(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "late-latest-for-dir-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Mock SessionDir
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) {
+		return tmpDir, nil
+	}
+	defer func() { SessionDir = oldSessionDir }()
+
+	// Three sessions across two project folders; /proj/a has two candidates.
+	for _, meta := range []SessionMeta{
+		newWorkingDirMeta(tmpDir, "session-20250101-100000", "/proj/a"),
+		newWorkingDirMeta(tmpDir, "session-20250102-100000", "/proj/a"),
+		newWorkingDirMeta(tmpDir, "session-20250103-100000", "/proj/b"),
+	} {
+		if err := SaveSessionMeta(meta); err != nil {
+			t.Fatalf("Failed to save meta %s: %v", meta.ID, err)
+		}
+	}
+
+	// Enforce deterministic mtime ordering: the newest session overall is the
+	// /proj/b one, while /proj/a's newest is session-20250102-100000.
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	setMetaModTimes(t, tmpDir, map[string]time.Time{
+		"session-20250101-100000": base,
+		"session-20250102-100000": base.Add(1 * time.Hour),
+		"session-20250103-100000": base.Add(2 * time.Hour),
+	})
+
+	latestA, err := GetLatestSessionForDir("/proj/a")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a): %v", err)
+	}
+	if latestA == nil || latestA.ID != "session-20250102-100000" {
+		t.Fatalf("GetLatestSessionForDir(/proj/a) = %v, want session-20250102-100000 (newest /proj/a session, not the globally newest one)", latestA)
+	}
+
+	latestB, err := GetLatestSessionForDir("/proj/b")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/b): %v", err)
+	}
+	if latestB == nil || latestB.ID != "session-20250103-100000" {
+		t.Fatalf("GetLatestSessionForDir(/proj/b) = %v, want session-20250103-100000", latestB)
+	}
+}
+
+func TestGetLatestSessionForDir_NoMatchReturnsNil(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "late-latest-for-dir-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Mock SessionDir
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) {
+		return tmpDir, nil
+	}
+	defer func() { SessionDir = oldSessionDir }()
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-100000", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+
+	latest, err := GetLatestSessionForDir("/proj/other")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/other): %v", err)
+	}
+	if latest != nil {
+		t.Errorf("Expected nil latest session for a directory with no sessions, got %v", latest)
+	}
+}
+
+func TestGetLatestSessionForDir_IgnoresSessionsWithoutWorkingDir(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "late-latest-for-dir-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Mock SessionDir
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) {
+		return tmpDir, nil
+	}
+	defer func() { SessionDir = oldSessionDir }()
+
+	// Legacy meta with no working_dir key, hand-crafted like a
+	// pre-working-dir session sidecar.
+	legacyID := "session-20250101-legacy"
+	legacyMetaPath := filepath.Join(tmpDir, legacyID+".meta.json")
+	legacyJSON := fmt.Sprintf(`{"id":"%s","history_path":"%s"}`, legacyID, filepath.Join(tmpDir, legacyID+".json"))
+	if err := os.WriteFile(legacyMetaPath, []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250102-100000", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+
+	// Make the legacy session the globally newest one: it must still never be
+	// selected because it records no working_dir.
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	setMetaModTimes(t, tmpDir, map[string]time.Time{
+		legacyID:                  base.Add(2 * time.Hour),
+		"session-20250102-100000": base.Add(1 * time.Hour),
+	})
+
+	latestLegacy, err := GetLatestSessionForDir("/proj/legacy")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/legacy): %v", err)
+	}
+	if latestLegacy != nil {
+		t.Errorf("Expected nil latest session for a directory with no matching sessions, got %v", latestLegacy)
+	}
+
+	latestA, err := GetLatestSessionForDir("/proj/a")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a): %v", err)
+	}
+	if latestA == nil || latestA.ID != "session-20250102-100000" {
+		t.Fatalf("GetLatestSessionForDir(/proj/a) = %v, want session-20250102-100000 (the legacy meta without working_dir must be skipped despite its newer mtime)", latestA)
+	}
+}
+
+func TestSessionMeta_WorkingDirRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	// Constructed like TestSessionMetadataRetainsSubagentState: New captures
+	// the current working directory as the session's project folder.
+	s := New(nil, filepath.Join(tmpDir, "session-test.json"), nil, "", false)
+	if err := s.AddUserMessage("Hello"); err != nil {
+		t.Fatalf("AddUserMessage() error = %v", err)
+	}
+
+	loaded, err := LoadSessionMeta("session-test")
+	if err != nil || loaded == nil {
+		t.Fatalf("LoadSessionMeta() error = %v", err)
+	}
+	if loaded.WorkingDir != tmpDir {
+		t.Errorf("WorkingDir = %q, want %q", loaded.WorkingDir, tmpDir)
+	}
+
+	// Resume path: the working dir is restored explicitly and must survive the
+	// next metadata save.
+	s.SetWorkingDir("/restored/path")
+	if err := s.AddUserMessage("Hello again"); err != nil {
+		t.Fatalf("AddUserMessage() after SetWorkingDir error = %v", err)
+	}
+
+	loaded, err = LoadSessionMeta("session-test")
+	if err != nil || loaded == nil {
+		t.Fatalf("LoadSessionMeta() after SetWorkingDir error = %v", err)
+	}
+	if loaded.WorkingDir != "/restored/path" {
+		t.Errorf("WorkingDir after SetWorkingDir = %q, want %q", loaded.WorkingDir, "/restored/path")
 	}
 }

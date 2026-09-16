@@ -115,7 +115,7 @@ func main() {
 	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "UNSUPPORTED: run every tool without user confirmation.")
 	forceRevaluateReq := flag.Bool("force-revaluate-dangerous-commands", false, forceRevaluateUsage)
 	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support.")
-	continueReq := flag.Bool("continue", false, "Resume the most recent session.")
+	continueReq := flag.Bool("continue", false, "Resume the most recent session created in the current directory.")
 	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar.")
 	themeReq := flag.String("theme", "", "Plugin theme id ('plugin:name' or bare name); env: LATE_THEME.")
 	promptReq := flag.String("prompt", "", "Start the agent immediately with this prompt.")
@@ -145,13 +145,18 @@ func main() {
 	var loadedSessionMeta *session.SessionMeta
 
 	if *continueReq {
-		meta, err := session.GetLatestSession()
+		meta, err := resolveContinueSession()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting latest session: %v\n", err)
 			os.Exit(1)
 		}
 		if meta == nil {
-			fmt.Fprintln(os.Stderr, "No sessions found to continue.")
+			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+				fmt.Fprintf(os.Stderr, "No sessions found to continue in %s.\n", cwd)
+			} else {
+				fmt.Fprintln(os.Stderr, "No sessions found to continue in the current directory.")
+			}
+			fmt.Fprintln(os.Stderr, "Use `late session list` to see sessions started in other projects, or `late session load <id>` to resume one directly.")
 			os.Exit(1)
 		}
 		loadedHistoryPath = meta.HistoryPath
@@ -441,6 +446,9 @@ func main() {
 	sess := session.New(c, historyPath, history, systemPrompt, *useToolsReq)
 	if loadedSessionMeta != nil {
 		sess.SetSubagentMetadata(loadedSessionMeta.SubagentSeq, loadedSessionMeta.SaveSubagentHistories)
+		if loadedSessionMeta.WorkingDir != "" {
+			sess.SetWorkingDir(loadedSessionMeta.WorkingDir)
+		}
 	} else {
 		sess.SetSubagentMetadata(0, &saveSubagentHistories)
 	}
@@ -912,6 +920,18 @@ type sessionCommandResult struct {
 	HistoryPath string
 	Meta        *session.SessionMeta
 	ShouldExit  bool
+}
+
+// resolveContinueSession returns the session to resume for --continue:
+// the most recently updated session that was started in the current
+// working directory. It returns (nil, nil) when no matching session
+// exists.
+func resolveContinueSession() (*session.SessionMeta, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("determining current directory: %w", err)
+	}
+	return session.GetLatestSessionForDir(cwd)
 }
 
 // handleSessionCommand processes session subcommands.
