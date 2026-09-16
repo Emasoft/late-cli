@@ -420,6 +420,7 @@ func TestHandleForceRevaluate_HardRefusalsPreserved(t *testing.T) {
 		{"bash search gate (grep)", bashArgs{Command: "grep -r foo ."}},
 		{"AST hard block (cd)", bashArgs{Command: "cd " + tmp}},
 		{"AST hard block (redirect)", bashArgs{Command: "echo hi > " + filepath.Join(tmp, "f")}},
+		{"malformed command with redirect (parse error)", bashArgs{Command: "echo hi > " + filepath.Join(tmp, "f") + " &&"}},
 		{"dangerous command with unsafe cwd", bashArgs{Command: dangerousCommand(tmp), Cwd: unsafeCwd}},
 	}
 
@@ -430,6 +431,69 @@ func TestHandleForceRevaluate_HardRefusalsPreserved(t *testing.T) {
 				t.Fatalf("expected hard refusal to keep flowing to the normal path untouched, got handled=true blockMsg=%q", blockMsg)
 			}
 		})
+	}
+}
+
+// TestHandleForceRevaluate_UnparseableRedirectNeverGetsOTP pins the regression
+// fixed by hard-blocking unparseable commands that carry a hard-block
+// signature. A trailing "&&" makes the command a shell syntax error, which
+// used to downgrade it to plain "needs confirmation" and let the
+// force-revaluate gate issue an OTP for it — so after OTP approval the command
+// would fail open into the shell. The agent must NEVER see the OTP message for
+// a hard-blocked command, in any form, even when it sends an otp_code: the
+// parse-error hard block in ValidateBashCommand makes the gate's preservation
+// check reject the command before any OTP logic, so the call keeps flowing to
+// the normal path, where Execute fails closed with the plain block message.
+func TestHandleForceRevaluate_UnparseableRedirectNeverGetsOTP(t *testing.T) {
+	tmp := isolateTestEnv(t)
+	reg := newBashRegistry(t)
+	ctx := forceRevaluateCtx()
+
+	// Genuinely unparseable: the trailing "&&" is a shell syntax error, yet
+	// the raw text still carries an output redirect to a plain path.
+	command := "echo hi > " + filepath.Join(tmp, "f") + " &&"
+
+	// First attempt: the hard refusal must be preserved — the gate does not
+	// handle the call, so no OTP is issued and no message is produced.
+	_, _, blockMsg, handled := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: command}))
+	if handled {
+		t.Fatalf("expected unparseable redirect command to keep its hard refusal, got handled=true blockMsg=%q", blockMsg)
+	}
+	if blockMsg != "" {
+		t.Fatalf("expected empty block message when the gate does not handle the call, got %q", blockMsg)
+	}
+
+	// Second attempt WITH an otp_code: still no OTP flow — the code must be
+	// ignored entirely, never consumed, and the call must stay unhandled.
+	_, _, blockMsg2, handled2 := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: command, OTPCode: "1234567"}))
+	if handled2 {
+		t.Fatalf("expected unparseable redirect command to stay unhandled even with an otp_code, got handled=true blockMsg2=%q", blockMsg2)
+	}
+	if blockMsg2 != "" {
+		t.Fatalf("expected empty block message when an otp_code is offered to a hard-blocked command, got %q", blockMsg2)
+	}
+
+	// Executor-boundary guarantee: the same command fails closed at the
+	// executor with the plain redirect block message (mirroring Execute's
+	// first check), so the re-run on the normal path can never execute it.
+	bashTool, ok := reg.Get("bash").(*tool.ShellTool)
+	if !ok {
+		t.Fatalf("expected the registry to hold a *tool.ShellTool under \"bash\"")
+	}
+	if err := bashTool.ValidateBashCommand(command, ""); err == nil {
+		t.Fatalf("ValidateBashCommand(%q) error = nil, want output redirection hard block", command)
+	} else if !strings.Contains(err.Error(), "Output redirection (>) is blocked") {
+		t.Errorf("ValidateBashCommand(%q) error = %q, want it to contain %q", command, err.Error(), "Output redirection (>) is blocked")
+	}
+	// When blocked, the returned error is the block reason (the same one
+	// Execute surfaces via WrapError), and it must be the plain redirect
+	// message — never the OTP re-evaluate text.
+	blocked, blockReason := bashTool.IsCommandBlocked(command, "")
+	if !blocked {
+		t.Fatalf("IsCommandBlocked(%q) = false, want true", command)
+	}
+	if blockReason == nil || !strings.Contains(blockReason.Error(), "Output redirection (>) is blocked") {
+		t.Errorf("IsCommandBlocked(%q) block reason = %v, want the output redirection block message", command, blockReason)
 	}
 }
 
