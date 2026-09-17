@@ -415,6 +415,17 @@ func (o *BaseOrchestrator) run() {
 					o.sess.History = o.sess.History[:len(o.sess.History)-1]
 				}
 				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("image_unsupported")}
+			} else if isBadRequestStatusError(err) {
+				// The API rejected the request body even after the executor's bad-body
+				// retries. Roll the turn back so the session returns to its pre-submit
+				// state: the user can edit and resend instead of every retry rebuilding
+				// the same rejected request. Persisted via PopLastUserMessage (unlike
+				// the image rollback above, this must survive a restart).
+				var se *client.StatusError
+				if errors.As(err, &se) {
+					_ = o.sess.PopLastUserMessage()
+					o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("API rejected the request (400) after retries: %s — your last message was rolled back; edit it and resend", se.Body)}
+				}
 			} else {
 				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
 			}
@@ -431,6 +442,13 @@ func (o *BaseOrchestrator) run() {
 	if o.IsStopRequested() {
 		o.eventCh <- common.StopRequestedEvent{ID: o.id}
 	}
+}
+
+// isBadRequestStatusError reports whether err carries an HTTP 400 from the
+// LLM API, even through the executor's "stream error: ..." wrapping.
+func isBadRequestStatusError(err error) bool {
+	var se *client.StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusBadRequest
 }
 
 func (o *BaseOrchestrator) Events() <-chan common.Event {

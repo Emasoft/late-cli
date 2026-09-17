@@ -163,6 +163,17 @@ func (s *Session) AddAssistantMessage(content, reasoning string) error {
 	return s.saveAndNotify()
 }
 
+// PopLastUserMessage removes the trailing user message from history and
+// persists the change atomically. It is a no-op (returns nil) when history is
+// empty or does not end with a user message.
+func (s *Session) PopLastUserMessage() error {
+	if len(s.History) == 0 || s.History[len(s.History)-1].Role != "user" {
+		return nil
+	}
+	s.History = s.History[:len(s.History)-1]
+	return s.saveAndNotify()
+}
+
 // AppendToLastMessage appends content to the last message (continuation).
 func (s *Session) AppendToLastMessage(content, reasoning string) error {
 	if len(s.History) == 0 {
@@ -211,7 +222,12 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any) (<-
 	if s.systemPrompt != "" {
 		messages = append(messages, client.ChatMessage{Role: "system", Content: client.TextContent(s.systemPrompt)})
 	}
-	messages = append(messages, s.History...)
+	// Sanitize per request: a history interrupted mid-tool-run (crash, fatal
+	// stream error) can end with assistant tool_calls that never got results,
+	// which strict OpenAI-compatible endpoints reject with HTTP 400. The
+	// sanitizer repairs the copy sent to the API; the saved history is
+	// intentionally left untouched.
+	messages = append(messages, SanitizeForRequest(s.History)...)
 
 	req := client.ChatCompletionRequest{
 		Messages:  messages,
