@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -338,6 +339,50 @@ func TestChatCompletionStream_InvalidJSON(t *testing.T) {
 	// Should have 1 valid chunk (the invalid JSON was skipped).
 	if got := len(chunks); got != 1 {
 		t.Errorf("got %d chunks, want 1 (invalid JSON should be skipped)", got)
+	}
+}
+
+func TestChatCompletionStream_OversizedSSELine(t *testing.T) {
+	st := newStreamTest(t)
+	defer st.Close()
+
+	// Build a single SSE data line whose JSON payload is ~600 KB: a chunk
+	// with a delta.content string of 600,000 chars. Marshal a
+	// ChatCompletionChunk so the JSON is guaranteed to be valid.
+	const bigLen = 600000
+	bigContent := strings.Repeat("a", bigLen)
+	bigChunk := ChatCompletionChunk{
+		ID: "c1",
+		Choices: []ChatCompletionChunkChoice{
+			{Delta: ChatMessage{Content: TextContent(bigContent)}},
+		},
+	}
+	payload, err := json.Marshal(bigChunk)
+	if err != nil {
+		t.Fatalf("failed to marshal oversized chunk: %v", err)
+	}
+
+	st.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: %s\n", payload)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+
+	chunks, err := collectStream(t, context.Background(), st.client, defaultRequest())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Exactly one chunk should be delivered — the oversized line must not
+	// trip bufio.ErrTooLong and abort the stream.
+	if got := len(chunks); got != 1 {
+		t.Fatalf("got %d chunks, want 1", got)
+	}
+	if len(chunks[0].Choices) == 0 {
+		t.Fatal("chunk has no choices")
+	}
+	if got := chunks[0].Choices[0].Delta.Content.String(); len(got) != bigLen {
+		t.Errorf("chunk content length = %d, want %d", len(got), bigLen)
 	}
 }
 

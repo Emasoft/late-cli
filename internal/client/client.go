@@ -192,6 +192,11 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
+		// Some providers emit very long SSE lines (e.g. huge tool-call argument
+		// deltas or inline base64 parts). The default 64 KB scanner limit would
+		// abort the stream with bufio.ErrTooLong, which callers cannot recover
+		// from, so raise the cap.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -611,10 +616,15 @@ func (c *Client) marshalFlattened(req ChatCompletionRequest) ([]byte, error) {
 
 // StatusError is a non-2xx HTTP response returned by the LLM server.
 // It is errors.As-able so callers can classify retryability by status code.
+// When the provider's JSON error body includes error.type / error.code, they
+// are preserved in Type and Code (the code may be a string or a number) for
+// retry classification and incident diagnosis.
 type StatusError struct {
 	StatusCode int
 	Status     string // e.g. "500 Internal Server Error"
 	Body       string // truncated response body for diagnostics
+	Code       any    // provider error code (JSON error.code), if provided
+	Type       string // provider error type (JSON error.type), if provided
 }
 
 // Error renders the same messages the previous fmt.Errorf calls produced,
@@ -633,8 +643,17 @@ func (c *Client) formatError(resp *http.Response) error {
 		Status:     resp.Status,
 	}
 	var apiErr APIErrorResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err == nil && apiErr.Error.Message != "" {
-		se.Body = apiErr.Error.Message
+	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err == nil {
+		if apiErr.Error.Message != "" {
+			se.Body = apiErr.Error.Message
+		}
+		// Preserve provider error type/code when present; zero values stay unset.
+		if apiErr.Error.Type != "" {
+			se.Type = apiErr.Error.Type
+		}
+		if apiErr.Error.Code != nil {
+			se.Code = apiErr.Error.Code
+		}
 	}
 	return se
 }

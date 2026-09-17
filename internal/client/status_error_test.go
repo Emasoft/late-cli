@@ -70,7 +70,7 @@ func TestFormatError_ReturnsTypedStatusError(t *testing.T) {
 	t.Run("API error body", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprint(w, `{"error":{"message":"boom"}}`)
+			fmt.Fprint(w, `{"error":{"message":"boom","type":"invalid_request_error","code":"invalid_api_key"}}`)
 		}))
 		defer server.Close()
 
@@ -91,6 +91,49 @@ func TestFormatError_ReturnsTypedStatusError(t *testing.T) {
 			t.Errorf("StatusCode = %d, want %d", se.StatusCode, http.StatusInternalServerError)
 		}
 		if want := "API error (500): boom"; se.Error() != want {
+			t.Errorf("Error() = %q, want %q", se.Error(), want)
+		}
+		if se.Type != "invalid_request_error" {
+			t.Errorf("Type = %q, want %q", se.Type, "invalid_request_error")
+		}
+		if se.Code != "invalid_api_key" {
+			t.Errorf("Code = %v, want %q", se.Code, "invalid_api_key")
+		}
+	})
+
+	t.Run("body without type or code fields", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+		}))
+		defer server.Close()
+
+		c := NewClient(Config{BaseURL: server.URL})
+		_, err := c.ChatCompletion(context.Background(), ChatCompletionRequest{
+			Model:    "test-model",
+			Messages: []ChatMessage{{Role: "user", Content: TextContent("hi")}},
+		})
+		if err == nil {
+			t.Fatal("expected error for 429 response, got nil")
+		}
+
+		var se *StatusError
+		if !errors.As(err, &se) {
+			t.Fatalf("error %T (%v) is not a *StatusError", err, err)
+		}
+		if se.StatusCode != http.StatusTooManyRequests {
+			t.Errorf("StatusCode = %d, want %d", se.StatusCode, http.StatusTooManyRequests)
+		}
+		if se.Type != "" {
+			t.Errorf("Type = %q, want empty", se.Type)
+		}
+		if se.Code != nil {
+			t.Errorf("Code = %v, want nil", se.Code)
+		}
+		if want := "rate limited"; se.Body != want {
+			t.Errorf("Body = %q, want %q", se.Body, want)
+		}
+		if want := "API error (429): rate limited"; se.Error() != want {
 			t.Errorf("Error() = %q, want %q", se.Error(), want)
 		}
 	})
