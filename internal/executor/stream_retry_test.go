@@ -260,3 +260,169 @@ func TestMaxStreamRetriesFromContext(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyStreamError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want streamRetryClass
+	}{
+		// Bad body: 400 gets its own tier.
+		{
+			name: "wrapped 400 is bad body",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 400, Status: "400 Bad Request", Body: "invalid model"}),
+			want: retryClassBadBody,
+		},
+
+		// Infrastructure: transient server responses.
+		{
+			name: "wrapped 408 is infra",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 408, Status: "408 Request Timeout"}),
+			want: retryClassInfra,
+		},
+		{
+			name: "wrapped 429 is infra",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 429, Status: "429 Too Many Requests"}),
+			want: retryClassInfra,
+		},
+		{
+			name: "wrapped 500 is infra",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 500, Status: "500 Internal Server Error", Body: "boom"}),
+			want: retryClassInfra,
+		},
+		{
+			name: "wrapped 503 is infra",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 503, Status: "503 Service Unavailable"}),
+			want: retryClassInfra,
+		},
+
+		// None: permanent client responses.
+		{
+			name: "wrapped 401 is none",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 401, Status: "401 Unauthorized"}),
+			want: retryClassNone,
+		},
+		{
+			name: "wrapped 403 is none",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 403, Status: "403 Forbidden"}),
+			want: retryClassNone,
+		},
+		{
+			name: "wrapped 404 is none",
+			err:  fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 404, Status: "404 Not Found"}),
+			want: retryClassNone,
+		},
+
+		// None: cancellation fails fast even inside the wraps.
+		{
+			name: "plain context.Canceled is none",
+			err:  context.Canceled,
+			want: retryClassNone,
+		},
+		{
+			name: "wrapped context.Canceled is none",
+			err:  fmt.Errorf("stream error: %w", context.Canceled),
+			want: retryClassNone,
+		},
+		{
+			name: "double-wrapped context.Canceled is none",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", context.Canceled)),
+			want: retryClassNone,
+		},
+		{
+			name: "plain context.DeadlineExceeded is none",
+			err:  context.DeadlineExceeded,
+			want: retryClassNone,
+		},
+		{
+			name: "double-wrapped context.DeadlineExceeded is none",
+			err:  fmt.Errorf("stream error: %w", fmt.Errorf("stream interrupted: %w", context.DeadlineExceeded)),
+			want: retryClassNone,
+		},
+		{
+			name: "url.Error carrying a canceled context is none",
+			err:  fmt.Errorf("stream error: %w", &url.Error{Op: "Post", URL: "https://api/v1/chat/completions", Err: context.Canceled}),
+			want: retryClassNone,
+		},
+
+		// Infrastructure: network-level failures.
+		{
+			name: "plain url.Error is infra",
+			err:  &url.Error{Op: "Post", URL: "https://api/v1/chat/completions", Err: errors.New("boom")},
+			want: retryClassInfra,
+		},
+		{
+			name: "wrapped io.EOF is infra",
+			err:  fmt.Errorf("stream error: %w", io.EOF),
+			want: retryClassInfra,
+		},
+		{
+			name: "wrapped io.ErrUnexpectedEOF is infra",
+			err:  fmt.Errorf("stream error: %w", io.ErrUnexpectedEOF),
+			want: retryClassInfra,
+		},
+
+		// None: anything unknown fails fast, like pre-retry behavior.
+		{
+			name: "nil is none",
+			err:  nil,
+			want: retryClassNone,
+		},
+		{
+			name: "generic error is none",
+			err:  fmt.Errorf("stream error: %w", errors.New("x")),
+			want: retryClassNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyStreamError(tt.err); got != tt.want {
+				t.Errorf("classifyStreamError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+			// isRetryableStreamError is the infrastructure-budget view: it
+			// must be true exactly for retryClassInfra rows, i.e. false for
+			// both retryClassNone and retryClassBadBody rows.
+			if got := isRetryableStreamError(tt.err); got != (tt.want == retryClassInfra) {
+				t.Errorf("isRetryableStreamError(%v) = %v, want %v (class %v)", tt.err, got, tt.want == retryClassInfra, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaxBadBodyRetriesFromContext(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want int
+	}{
+		{
+			name: "absent key falls back to default",
+			ctx:  context.Background(),
+			want: DefaultMaxBadBodyRetries,
+		},
+		{
+			name: "positive override is honored",
+			ctx:  context.WithValue(context.Background(), common.MaxBadBodyRetriesKey, 7),
+			want: 7,
+		},
+		{
+			name: "zero disables retries",
+			ctx:  context.WithValue(context.Background(), common.MaxBadBodyRetriesKey, 0),
+			want: 0,
+		},
+		{
+			name: "negative value means disabled",
+			ctx:  context.WithValue(context.Background(), common.MaxBadBodyRetriesKey, -3),
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maxBadBodyRetriesFromContext(tt.ctx); got != tt.want {
+				t.Errorf("maxBadBodyRetriesFromContext() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

@@ -247,8 +247,12 @@ func RunLoop(
 ) (string, error) {
 	var lastContent string
 
-	// Retry budget for failing LLM stream calls, resolved once per run.
+	// Retry budgets for failing LLM stream calls, resolved once per run.
+	// Two independent tiers: infrastructure failures (transport errors,
+	// 408/429/5xx) draw from the classic maxRetries budget, while HTTP 400
+	// bad-body rejections draw from the much smaller, dedicated badBodyBudget.
 	maxRetries := maxStreamRetriesFromContext(ctx)
+	badBodyBudget := maxBadBodyRetriesFromContext(ctx)
 
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
 		if onStartTurn != nil {
@@ -258,15 +262,23 @@ func RunLoop(
 		// Inner attempt loop around the stream call only: retries never
 		// consume a turn (the turn counter above is untouched). Each attempt
 		// starts a fresh stream and ConsumeStream builds a fresh accumulator;
-		// a failed attempt commits nothing to history.
+		// a failed attempt commits nothing to history. Failures tier into two
+		// independent retry budgets: infrastructure failures (transport
+		// errors, 408/429/5xx) share the classic maxRetries budget, while
+		// HTTP 400 body-parse rejections get their own small dedicated
+		// badBodyBudget, because strict OpenAI-compatible gateways often fail
+		// transiently while reading the request body. The two budgets use
+		// independent counters, so 400 retries never consume infrastructure
+		// retry budget and vice versa.
 		var acc *StreamAccumulator
 		var err error
-		for attempt := 0; ; attempt++ {
+		infraAttempts, badBodyAttempts := 0, 0
+		for {
 			// Pre-attempt guard (retries only): if the context died while we
 			// were waiting in a previous backoff (both select cases below can
 			// be ready and the timer may win), do not call StartStream with a
 			// dead ctx. Handle it as a cancel, not a new attempt.
-			if attempt > 0 && ctx.Err() != nil {
+			if infraAttempts+badBodyAttempts > 0 && ctx.Err() != nil {
 				return "", err
 			}
 
@@ -276,21 +288,44 @@ func RunLoop(
 				break
 			}
 
-			// Terminal: retry budget exhausted or non-retryable failure.
-			// Propagates byte-identically to the pre-retry behavior.
-			if attempt >= maxRetries || !isRetryableStreamError(err) {
+			// Terminal per tier: budget exhausted for this failure's class or
+			// a non-retryable failure. Propagates byte-identically to the
+			// pre-retry behavior.
+			var delay time.Duration
+			switch classifyStreamError(err) {
+			case retryClassNone:
+				// Non-retryable failure, same as before.
 				return "", err
-			}
-
-			delay := streamRetryDelay(attempt + 1)
-			if onRetry != nil {
-				onRetry(common.RetryEvent{
-					ID:          common.GetOrchestratorID(ctx),
-					Attempt:     attempt + 1,
-					MaxAttempts: maxRetries,
-					Delay:       delay,
-					Err:         err,
-				})
+			case retryClassInfra:
+				if infraAttempts >= maxRetries {
+					return "", err
+				}
+				infraAttempts++
+				delay = streamRetryDelay(infraAttempts)
+				if onRetry != nil {
+					onRetry(common.RetryEvent{
+						ID:          common.GetOrchestratorID(ctx),
+						Attempt:     infraAttempts,
+						MaxAttempts: maxRetries,
+						Delay:       delay,
+						Err:         err,
+					})
+				}
+			case retryClassBadBody:
+				if badBodyAttempts >= badBodyBudget {
+					return "", err
+				}
+				badBodyAttempts++
+				delay = streamRetryDelay(badBodyAttempts)
+				if onRetry != nil {
+					onRetry(common.RetryEvent{
+						ID:          common.GetOrchestratorID(ctx),
+						Attempt:     badBodyAttempts,
+						MaxAttempts: badBodyBudget,
+						Delay:       delay,
+						Err:         err,
+					})
+				}
 			}
 
 			timer := time.NewTimer(delay)

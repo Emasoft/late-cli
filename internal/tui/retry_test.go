@@ -2,11 +2,13 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"late/internal/client"
 	"late/internal/common"
 )
 
@@ -57,6 +59,34 @@ func TestRetryEventKeepsAgentThinking(t *testing.T) {
 	}
 	if s.Error == nil || s.Error != sentinel {
 		t.Fatalf("Error = %v, want the sentinel %v to survive the retry", s.Error, sentinel)
+	}
+}
+
+// TestRetryEventHTTP400NamesTheRejection covers failure-class honesty: when the
+// underlying stream error is an HTTP 400 from the API (the request body was
+// rejected, not the connection lost), the status bar says so instead of
+// claiming the connection dropped.
+func TestRetryEventHTTP400NamesTheRejection(t *testing.T) {
+	m, _ := newViewportBenchmarkModel(nil)
+
+	updated, _ := m.Update(OrchestratorEventMsg{Event: common.RetryEvent{
+		ID:          m.Focused.ID(),
+		Attempt:     1,
+		MaxAttempts: 3,
+		Delay:       750 * time.Millisecond,
+		Err:         fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 400, Body: "read body failed"}),
+	}})
+	*m = updated.(Model)
+	s := m.GetAgentState(m.Focused.ID())
+
+	if !strings.Contains(s.StatusText, "request rejected by the API") {
+		t.Fatalf("StatusText = %q, want it to name the API rejection", s.StatusText)
+	}
+	if strings.Contains(s.StatusText, "connection lost") {
+		t.Fatalf("StatusText = %q, must not claim a lost connection for an HTTP 400", s.StatusText)
+	}
+	if !strings.Contains(s.StatusText, "attempt 1/3") {
+		t.Fatalf("StatusText = %q, want it to contain attempt 1/3", s.StatusText)
 	}
 }
 

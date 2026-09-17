@@ -2,8 +2,10 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"late/internal/assets"
+	"late/internal/client"
 	"late/internal/common"
 	"late/internal/config"
 	"late/internal/git"
@@ -1593,7 +1595,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.Transcript.generation++
 			s.Transcript.busy = false
 			s.State = StateThinking
-			s.StatusText = fmt.Sprintf("connection lost — retrying in %s (attempt %d/%d)", event.Delay.Truncate(100*time.Millisecond), event.Attempt, event.MaxAttempts)
+			// The failure class decides the verb: an HTTP 400 is the API
+			// rejecting the request body, not a lost connection.
+			retryVerb := "connection lost"
+			var retryStatusErr *client.StatusError
+			if errors.As(event.Err, &retryStatusErr) && retryStatusErr.StatusCode == http.StatusBadRequest {
+				retryVerb = "request rejected by the API"
+			}
+			s.StatusText = fmt.Sprintf("%s — retrying in %s (attempt %d/%d)", retryVerb, event.Delay.Truncate(100*time.Millisecond), event.Attempt, event.MaxAttempts)
 			s.StreamingState = common.ContentEvent{ID: event.ID}
 			// Clear streaming render cache for the failed attempt
 			s.StreamingStyledCache = ""

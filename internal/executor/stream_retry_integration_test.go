@@ -467,3 +467,199 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 		t.Errorf("last history content = %q, want %q", last.Content.String(), "Hello world")
 	}
 }
+
+// --- HTTP 400 bad-body retry tier ---
+//
+// RunLoop tiers inner-loop failures into two independent retry budgets:
+// infrastructure failures draw from the ctx MaxStreamRetries budget, while
+// HTTP 400 body-parse rejections draw from the dedicated, much smaller
+// bad-body budget (DefaultMaxBadBodyRetries). The tests below pin that
+// tiering end-to-end: a 400 fires exactly badBodyBudget RetryEvents whose
+// MaxAttempts is the bad-body budget (never the infra budget), and the whole
+// run stays bounded at 1 + DefaultMaxBadBodyRetries requests.
+
+// badBodyErrorMessage is the error text strict OpenAI-compatible gateways
+// (e.g. z.ai/GLM) return while failing to read the request body — the
+// transient HTTP 400 the bad-body retry tier exists for.
+const badBodyErrorMessage = "The request is invalid: read body failed. Please check the request body, required fields, and request format."
+
+// retryChunkOK is a minimal success payload: a single delta carrying both the
+// content and the terminal finish_reason "stop".
+const retryChunkOK = `{"id":"1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`
+
+// okSSEBody renders a minimal, well-formed SSE stream: one "ok" content delta
+// followed by the [DONE] sentinel.
+func okSSEBody() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "data: %s\n", retryChunkOK)
+	b.WriteString("data: [DONE]\n")
+	return b.String()
+}
+
+// serveOK writes okSSEBody as a complete SSE stream.
+func serveOK(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	fmt.Fprint(w, okSSEBody())
+}
+
+func TestRunLoopRetries400ThenSucceeds(t *testing.T) {
+	// Declared before newRetryServer so the handler can branch on the
+	// 1-based POST count (the closure only runs once the server is up).
+	var rs *retryServer
+	rs = newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// The wrapper counts the POST before handlePost runs, so
+		// posts.Load() here is the 1-based number of the current request.
+		if rs.posts.Load() > 2 {
+			// Third attempt onward: complete SSE stream.
+			serveOK(w)
+			return
+		}
+		// First two attempts: transient 400 body-parse rejection.
+		serveStatus(w, http.StatusBadRequest, badBodyErrorMessage)
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRetry, retryEvents := retryCollector(t)
+
+	// The infra budget must stay untouched by a 400 (those draw from the
+	// bad-body tier); it is kept small so a tier-wiring regression fails
+	// fast here instead of grinding through the default 100-retry budget.
+	ctx, cancel := runLoopCtx(3, 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("RunLoop returned error after retryable 400s: %v", err)
+	}
+	if !strings.Contains(res, "ok") {
+		t.Errorf("RunLoop result = %q, want it to contain %q", res, "ok")
+	}
+	// Worst-case jitter for two backoffs is 500ms + 1s; a generous bound
+	// like the sibling tests (counts are pinned, never exact timings).
+	if elapsed > 10*time.Second {
+		t.Errorf("RunLoop took %v with two bad-body retries, want well under that", elapsed)
+	}
+
+	// One retry event per failed attempt: exactly 2 for the two 400s. Each
+	// carries the bad-body budget as MaxAttempts — the marker that
+	// distinguishes this tier from the infrastructure tier.
+	events := retryEvents()
+	if len(events) != 2 {
+		t.Fatalf("got %d RetryEvents, want exactly 2 (one per failed 400): %+v", len(events), events)
+	}
+	for i, ev := range events {
+		if want := i + 1; ev.Attempt != want {
+			t.Errorf("events[%d].Attempt = %d, want %d", i, ev.Attempt, want)
+		}
+		if ev.MaxAttempts != DefaultMaxBadBodyRetries {
+			t.Errorf("events[%d].MaxAttempts = %d, want %d (bad-body tier, not the ctx infra budget)", i, ev.MaxAttempts, DefaultMaxBadBodyRetries)
+		}
+		if ev.Delay <= 0 {
+			t.Errorf("events[%d].Delay = %v, want > 0", i, ev.Delay)
+		}
+		if ev.Err == nil {
+			t.Errorf("events[%d].Err is nil, want the underlying stream error", i)
+			continue
+		}
+		if !strings.Contains(ev.Err.Error(), "API error (400)") {
+			t.Errorf("events[%d].Err = %v, want it to contain %q", i, ev.Err, "API error (400)")
+		}
+		var statusErr *client.StatusError
+		if !errors.As(ev.Err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+			t.Errorf("events[%d].Err = %v, want it to wrap *client.StatusError with 400", i, ev.Err)
+		}
+	}
+
+	// Two failed 400 attempts + one successful retry.
+	if got := rs.postCount(); got != 3 {
+		t.Errorf("server got %d POSTs, want 3 (2 failed 400s + successful retry)", got)
+	}
+
+	// Failed attempts commit nothing; only the successful turn appends its
+	// assistant message to the seeded history.
+	if len(sess.History) != 2 {
+		t.Fatalf("history length = %d, want 2 (seeded user msg + committed assistant msg)", len(sess.History))
+	}
+	last := sess.History[len(sess.History)-1]
+	if last.Role != "assistant" {
+		t.Errorf("last history role = %q, want assistant", last.Role)
+	}
+	if last.Content.String() != "ok" {
+		t.Errorf("last history content = %q, want %q", last.Content.String(), "ok")
+	}
+}
+
+func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
+	rs := newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		serveStatus(w, http.StatusBadRequest, badBodyErrorMessage)
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRetry, retryEvents := retryCollector(t)
+
+	// A small infra budget that must never be touched by a 400. If the tier
+	// wiring were wrong and 400s drew from the infra budget instead, the
+	// request-count assertion below would fail (or, against the default
+	// budget of 100, the run would take minutes and hit the 15s deadline).
+	ctx, cancel := runLoopCtx(2, 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("RunLoop returned nil error, want failure after the bad-body budget exhausted")
+	}
+	// The executor wraps the client's StatusError in "stream error: ..." and
+	// the gateway's message must propagate for diagnostics.
+	if !strings.Contains(err.Error(), "API error (400)") {
+		t.Fatalf("RunLoop error = %v, want it to contain %q", err, "API error (400)")
+	}
+	if !strings.Contains(err.Error(), "read body failed") {
+		t.Errorf("RunLoop error = %v, want the provider's message to propagate", err)
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("RunLoop error = %v, want it to wrap *client.StatusError with 400", err)
+	}
+	// Worst-case jitter for three backoffs is 500ms + 1s + 2s; 10s is a
+	// generous sanity bound.
+	if elapsed > 10*time.Second {
+		t.Errorf("RunLoop took %v to exhaust the bad-body budget, want well under that", elapsed)
+	}
+
+	events := retryEvents()
+	if len(events) != DefaultMaxBadBodyRetries {
+		t.Fatalf("got %d RetryEvents, want exactly %d: %+v", len(events), DefaultMaxBadBodyRetries, events)
+	}
+	for i, ev := range events {
+		if want := i + 1; ev.Attempt != want {
+			t.Errorf("events[%d].Attempt = %d, want %d", i, ev.Attempt, want)
+		}
+		if ev.MaxAttempts != DefaultMaxBadBodyRetries {
+			t.Errorf("events[%d].MaxAttempts = %d, want %d (bad-body tier, not the infra budget)", i, ev.MaxAttempts, DefaultMaxBadBodyRetries)
+		}
+		if ev.Delay <= 0 {
+			t.Errorf("events[%d].Delay = %v, want > 0", i, ev.Delay)
+		}
+		if ev.Err == nil {
+			t.Errorf("events[%d].Err is nil, want the underlying stream error", i)
+		}
+	}
+
+	// Initial attempt + exactly DefaultMaxBadBodyRetries retries: pins the
+	// bad-body tier at 3 and proves it does NOT consume the default
+	// 100-retry infrastructure budget.
+	want := 1 + DefaultMaxBadBodyRetries
+	if got := rs.postCount(); got != want {
+		t.Errorf("server got %d POSTs, want exactly %d (initial attempt + bad-body retries)", got, want)
+	}
+
+	if len(sess.History) != 1 {
+		t.Errorf("history length = %d, want 1 (nothing committed)", len(sess.History))
+	}
+}
