@@ -119,6 +119,22 @@ Unlike systems where subagent delegation is merely prompt-recommended or optiona
 
 ---
 
+## Stream Retry Policy
+
+Late wraps each LLM stream call in two independent retry tiers, each with its own budget and counter:
+
+- **Infrastructure tier:** Covers transport errors (connection refused/reset, timeouts, mid-body disconnects) and HTTP 408/429/5xx. Budgeted via `-max-stream-retries` / `LATE_MAX_STREAM_RETRIES` (default: 100).
+- **Bad-body tier:** Covers HTTP 400 only, with a dedicated small budget (3 attempts, `DefaultMaxBadBodyRetries`; not yet flag-configurable). Strict OpenAI-compatible gateways (e.g. z.ai/GLM) frequently fail transiently while reading the request body ("read body failed"), which a few quick retries resolve; genuinely malformed requests still terminate after this small bounded budget.
+- **Backoff:** Exponential — 500 ms base doubling per attempt, capped at 30 s, with full jitter (uniform over `[0, cap]`).
+- **Independent counters:** 400 retries never consume the infrastructure budget, and vice versa.
+
+When retries are exhausted, two guarantees keep the session usable:
+
+- **History sanitization:** Per request, histories interrupted mid-tool-run are repaired — dangling assistant `tool_calls` receive synthesized tool results. Only the outgoing request copy is repaired; the saved history is untouched.
+- **Terminal 400 rollback:** If the API still rejects the request body after bad-body retries, the last user message is rolled back (with the rollback persisted), returning the session to its pre-submit state instead of leaving it blocked.
+
+---
+
 ## Persistence
 
 - **Root Session History:** Orchestrator conversation history is persisted to disk under `<sessionsDir>/<sessionID>.json` alongside a `.meta.json` sidecar for state resumption. The sidecar records the project directory where the session was started (`working_dir`), which `--continue` uses to scope resume to the current project folder.
