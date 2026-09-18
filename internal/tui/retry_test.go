@@ -204,6 +204,142 @@ func TestRecoveryToastMatchesFailureClass(t *testing.T) {
 	}
 }
 
+// TestErrorStatusClearsStaleRetryVerb covers the stale-verb bug: a 400 that
+// exhausts the bad-body budget ends the turn in an error box, but RetryVerb
+// used to survive the error, so the resubmitted turn's first "thinking" fired
+// a bogus "request accepted after retry" toast for a request that was never
+// accepted. The error branch must clear the stored verb.
+func TestErrorStatusClearsStaleRetryVerb(t *testing.T) {
+	m, _ := newViewportBenchmarkModel(nil)
+
+	updated, _ := m.Update(OrchestratorEventMsg{Event: common.RetryEvent{
+		ID:          m.Focused.ID(),
+		Attempt:     3,
+		MaxAttempts: 3,
+		Delay:       750 * time.Millisecond,
+		Err:         fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 400, Body: "read body failed"}),
+	}})
+	*m = updated.(Model)
+	s := m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != retryVerbRejectedByAPI {
+		t.Fatalf("RetryVerb = %q, want %q after an HTTP 400", s.RetryVerb, retryVerbRejectedByAPI)
+	}
+
+	updated, _ = m.Update(OrchestratorEventMsg{Event: common.StatusEvent{
+		ID:     m.Focused.ID(),
+		Status: "error",
+		Error:  errors.New("request rejected by the API after retries"),
+	}})
+	*m = updated.(Model)
+	s = m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != "" {
+		t.Fatalf("RetryVerb = %q, want it cleared when the turn ends in error", s.RetryVerb)
+	}
+
+	m.ToastMessage = ""
+	updated, cmd := m.Update(OrchestratorEventMsg{Event: common.StatusEvent{ID: m.Focused.ID(), Status: "thinking"}})
+	*m = updated.(Model)
+	s = m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != "" {
+		t.Fatalf("RetryVerb = %q, want it to stay clear on the next turn", s.RetryVerb)
+	}
+
+	// Run any returned command and feed its messages back through Update,
+	// exactly as Bubble Tea would, so a stale recovery toast cannot hide
+	// behind a deferred command. The frame tick only coalesces presentation.
+	if cmd != nil {
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, child := range batch {
+				childMsg := child()
+				if _, isFrame := childMsg.(transcriptFrameMsg); isFrame {
+					continue
+				}
+				updated, _ := m.Update(childMsg)
+				*m = updated.(Model)
+			}
+		} else {
+			updated, _ := m.Update(msg)
+			*m = updated.(Model)
+		}
+	}
+
+	if m.ToastMessage != "" {
+		t.Fatalf("ToastMessage = %q, want no stale recovery toast after an errored turn", m.ToastMessage)
+	}
+	if strings.Contains(m.ToastMessage, "request accepted after retry") {
+		t.Fatalf("ToastMessage = %q, must not claim the request was accepted", m.ToastMessage)
+	}
+}
+
+// TestStopRequestedClearsStaleRetryVerb covers the stop path: a user stop
+// during retry backoff ends the turn, and the stored verb must not survive
+// into the next turn's "thinking" as a recovery toast.
+func TestStopRequestedClearsStaleRetryVerb(t *testing.T) {
+	m, _ := newViewportBenchmarkModel(nil)
+
+	updated, _ := m.Update(OrchestratorEventMsg{Event: common.RetryEvent{
+		ID:          m.Focused.ID(),
+		Attempt:     1,
+		MaxAttempts: 3,
+		Delay:       750 * time.Millisecond,
+		Err:         fmt.Errorf("stream error: %w", &client.StatusError{StatusCode: 400, Body: "read body failed"}),
+	}})
+	*m = updated.(Model)
+	s := m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != retryVerbRejectedByAPI {
+		t.Fatalf("RetryVerb = %q, want %q after an HTTP 400", s.RetryVerb, retryVerbRejectedByAPI)
+	}
+
+	updated, _ = m.Update(OrchestratorEventMsg{Event: common.StopRequestedEvent{ID: m.Focused.ID()}})
+	*m = updated.(Model)
+	s = m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != "" {
+		t.Fatalf("RetryVerb = %q, want it cleared when the user stops the turn", s.RetryVerb)
+	}
+
+	m.ToastMessage = ""
+	updated, cmd := m.Update(OrchestratorEventMsg{Event: common.StatusEvent{ID: m.Focused.ID(), Status: "thinking"}})
+	*m = updated.(Model)
+	s = m.GetAgentState(m.Focused.ID())
+
+	if s.RetryVerb != "" {
+		t.Fatalf("RetryVerb = %q, want it to stay clear on the next turn", s.RetryVerb)
+	}
+
+	// Run any returned command and feed its messages back through Update,
+	// exactly as Bubble Tea would, so a stale recovery toast cannot hide
+	// behind a deferred command. The frame tick only coalesces presentation.
+	if cmd != nil {
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, child := range batch {
+				childMsg := child()
+				if _, isFrame := childMsg.(transcriptFrameMsg); isFrame {
+					continue
+				}
+				updated, _ := m.Update(childMsg)
+				*m = updated.(Model)
+			}
+		} else {
+			updated, _ := m.Update(msg)
+			*m = updated.(Model)
+		}
+	}
+
+	if m.ToastMessage != "" {
+		t.Fatalf("ToastMessage = %q, want no stale recovery toast after a stop", m.ToastMessage)
+	}
+	if strings.Contains(m.ToastMessage, "request accepted after retry") {
+		t.Fatalf("ToastMessage = %q, must not claim the request was accepted", m.ToastMessage)
+	}
+}
+
 // TestThinkingWithoutRetryNoToast: a plain new turn (no retry in flight)
 // still clears a pinned error box but must not fire the restored toast.
 func TestThinkingWithoutRetryNoToast(t *testing.T) {

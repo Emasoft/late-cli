@@ -1563,6 +1563,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				s.State = StateIdle
 				s.StatusText = "Closed"
 				s.Closed = true
+				// A turn that ended closed must not produce a recovery
+				// toast on the next turn.
+				s.RetryVerb = ""
 				// If the focused agent closed, switch back to parent (if any) or root
 				if event.ID == m.Focused.ID() && s.State == StateIdle {
 					if m.Focused.Parent() != nil {
@@ -1581,6 +1584,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					s.StatusText = fmt.Sprintf("Error: %v", event.Error)
 					s.Error = event.Error
 				}
+				// A turn that ended in error must not produce a recovery
+				// toast on the next turn.
+				s.RetryVerb = ""
 				// We don't clear rendered history so user can see what happened
 			default:
 				s.State = StateIdle
@@ -1626,6 +1632,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.PendingStop = false
 			s.State = StateIdle
 			s.StatusText = "Stopped"
+			// A turn that ended in a user stop must not produce a recovery
+			// toast on the next turn.
+			s.RetryVerb = ""
 			s.RenderedHistory = nil
 			s.StreamingStyledCache = ""
 			s.StreamingChunkCount = 0
