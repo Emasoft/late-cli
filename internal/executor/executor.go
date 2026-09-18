@@ -259,6 +259,15 @@ func RunLoop(
 	maxRetries := maxStreamRetriesFromContext(ctx)
 	badBodyBudget := maxBadBodyRetriesFromContext(ctx)
 
+	// A global disable (--max-stream-retries=0 / negative, or the ctx key)
+	// must silence BOTH tiers: the bad-body tier has its own default
+	// budget, which would otherwise keep retrying HTTP 400s despite the
+	// advertised "retries disabled" contract. An explicit bad-body budget
+	// still applies whenever the global budget is positive.
+	if maxRetries <= 0 {
+		badBodyBudget = 0
+	}
+
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
 		if onStartTurn != nil {
 			onStartTurn()

@@ -125,7 +125,7 @@ Late 将每次 LLM 流式调用包裹在两个相互独立的重试层级中，�
 
 - **基础设施层（Infrastructure tier）：** 覆盖传输类错误（连接被拒绝/重置、超时、响应体中途断开）以及 HTTP 408/429/5xx。预算通过 `-max-stream-retries` / `LATE_MAX_STREAM_RETRIES` 控制（默认 10；`0` 或负值会完全禁用流式重试）。优先级为 CLI 标志 > 环境变量 > 内置默认值。
 - **流式中断：** 响应体中途的传输故障发生在服务器已经接受请求（HTTP 200）之后——包括 HTTP/2 RST_STREAM / INTERNAL_ERROR（典型报错文本：`stream error: stream ID N; INTERNAL_ERROR; received from peer`）、GOAWAY、连接重置以及响应体被截断——因此客户端会将其包装为类型化的 `StreamInterruptedError`，并从基础设施层预算中进行重试。唯一的例外是超出 1 MB 扫描器上限（`bufio.ErrTooLong`）的 SSE 行——它会快速失败，因为重试无法缩短该行。
-- **无效请求体层（Bad-body tier）：** 仅覆盖 HTTP 400，使用一个专用的小预算（3 次，常量 `DefaultMaxBadBodyRetries`；暂不支持通过命令行标志配置）。严格的 OpenAI 兼容网关（如 z.ai/GLM）在读取请求体时经常发生瞬时故障（"read body failed"），少量快速重试即可解决；而真正格式错误的请求仍会在这一小额有界预算耗尽后终止。
+- **无效请求体层（Bad-body tier）：** 仅覆盖 HTTP 400，使用一个专用的小预算（3 次，常量 `DefaultMaxBadBodyRetries`；暂不支持通过命令行标志配置）。严格的 OpenAI 兼容网关（如 z.ai/GLM）在读取请求体时经常发生瞬时故障（"read body failed"），少量快速重试即可解决；而真正格式错误的请求仍会在这一小额有界预算耗尽后终止。全局禁用（`-max-stream-retries 0` 或负值）会同时关闭两个层级——包括本层级——因此全局禁用后的运行也不会再重试 HTTP 400。
 - **退避（Backoff）：** 指数退避——以 500 ms 为基数逐次翻倍，上限 30 s，并叠加完全抖动（full jitter，在 `[0, cap]` 区间内均匀取值）。服务器返回的 `Retry-After` 会被作为退避下限遵守——合并后的等待时间绝不短于服务器要求的时长——并设有 5 分钟上限，以防止恶意或有缺陷的服务器挂起交互会话；等待过程始终可以取消。
 - **快速失败（Fail-fast）：** 重试无法解决的错误绝不会重试：TLS 证书/信任故障（不受信任的颁发机构、主机名不匹配、无效或过期的证书链）、TLS 连接上的非 TLS 字节、不支持的 URL scheme、HTTPS 端点上的纯 HTTP、上下文取消，以及永久性的客户端错误（401/403/404）。未知错误同样会快速失败，与引入重试之前的行为完全一致。
 - **计数器相互独立：** 400 的重试不会消耗基础设施层的预算，反之亦然。

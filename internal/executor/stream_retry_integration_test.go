@@ -989,6 +989,71 @@ func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
 	}
 }
 
+// TestRunLoopGlobalDisableAlsoSilencesBadBodyTier pins the global-disable
+// contract end-to-end: a global disable (--max-stream-retries=0, negative,
+// or the ctx key) must silence BOTH retry tiers. Without the budget clamp at
+// the resolution site in RunLoop, the bad-body tier would fall back to its
+// own default budget (DefaultMaxBadBodyRetries) and keep retrying HTTP 400s
+// despite the advertised "retries disabled" contract. With the disable in
+// effect, an always-400 server sees exactly one POST — the initial attempt,
+// zero retries, zero backoff sleeps — and the run fails with the terminal
+// 400. The positive-budget contrast is pinned by
+// TestRunLoopStopsAfterBadBodyBudgetExhausted above: with MaxStreamRetriesKey
+// = 2 the bad-body tier still uses its own budget (4 POSTs).
+func TestRunLoopGlobalDisableAlsoSilencesBadBodyTier(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		budget int
+	}{
+		{name: "zero_budget", budget: 0},
+		{name: "negative_budget", budget: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+				serveStatus(w, http.StatusBadRequest, badBodyErrorMessage)
+			})
+
+			sess := newRetryTestSession(t, rs.server.URL)
+			onRetry, retryEvents := retryCollector(t)
+
+			// runLoopCtx passes the budget through as the MaxStreamRetriesKey
+			// ctx value and adds only a generous deadline; with both tiers
+			// disabled there are no backoff sleeps, so the deadline is inert.
+			// It is kept (rather than a bare context.WithValue) so a bug can
+			// never hang the test until the global -timeout, same rationale
+			// as every sibling test in this file.
+			ctx, cancel := runLoopCtx(tc.budget, 15*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil, nil)
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatal("RunLoop returned nil error, want the terminal 400 despite retries being disabled")
+			}
+			var statusErr *client.StatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+				t.Fatalf("RunLoop error = %v, want it to wrap *client.StatusError with 400", err)
+			}
+
+			// Exactly one POST: the initial attempt. Zero retries from either
+			// tier — the global disable silences the bad-body tier too.
+			if got := rs.postCount(); got != 1 {
+				t.Errorf("server got %d POSTs, want exactly 1 (initial attempt, zero retries)", got)
+			}
+			if events := retryEvents(); len(events) != 0 {
+				t.Errorf("got %d RetryEvents, want 0 (retries disabled): %+v", len(events), events)
+			}
+
+			// No backoff sleeps: the terminal 400 must surface immediately.
+			if elapsed >= 2*time.Second {
+				t.Errorf("RunLoop took %v, want well under 2s (no backoff sleeps when retries are disabled)", elapsed)
+			}
+		})
+	}
+}
+
 // toolCallSSEBody renders a complete SSE stream that ends in a tool call
 // (finish_reason "tool_calls") instead of a final text response: the turn
 // commits an assistant tool-call message and the loop advances to the next
