@@ -17,7 +17,7 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 		"help", "version", "continue", "continue-project", "show-cwd", "inject-cwd", "gemma-thinking",
 		"suppress-thinking-words", "save-subagent-histories", "enable-sqz",
 		"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues",
-		"enable-images",
+		"force-revaluate-dangerous-commands", "enable-images",
 		"use-tools", "enable-bash", "enable-subagents",
 	}
 	for _, name := range bools {
@@ -181,7 +181,7 @@ func TestWriteHelpSections(t *testing.T) {
 		"session list [-v]", "session load <id>", "session delete <id>",
 		"plugin list | ls", "plugin install | i", "plugin remove | rm | uninstall",
 		"plugin update [<name>]", "worktree create <path> [branch]", "worktree active",
-		"ask-for-user-approval",
+		"ask-for-user-approval", "force-revaluate-dangerous-commands",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("writeHelp output missing %q", want)
