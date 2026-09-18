@@ -99,7 +99,7 @@ func TestRetryEventHTTP400NamesTheRejection(t *testing.T) {
 // dropped RecoveryEvent — the "thinking" status must NOT fire any toast
 // (recovery is announced immediately by the RecoveryEvent, if it arrives).
 func TestThinkingClearsRetryVerbSilently(t *testing.T) {
-	m, s := newViewportBenchmarkModel(nil)
+	m, _ := newViewportBenchmarkModel(nil)
 
 	updated, _ := m.Update(OrchestratorEventMsg{Event: common.RetryEvent{
 		ID:          m.Focused.ID(),
@@ -109,7 +109,7 @@ func TestThinkingClearsRetryVerbSilently(t *testing.T) {
 		Err:         errors.New("connection reset by peer"),
 	}})
 	*m = updated.(Model)
-	s = m.GetAgentState(m.Focused.ID())
+	s := m.GetAgentState(m.Focused.ID())
 
 	if s.RetryVerb != retryVerbConnectionLost {
 		t.Fatalf("RetryVerb = %q, want %q after an infra failure", s.RetryVerb, retryVerbConnectionLost)
@@ -162,7 +162,7 @@ func TestThinkingClearsRetryVerbSilently(t *testing.T) {
 // only once: neither the final response's content events nor the next turn's
 // thinking status may repeat it.
 func TestRecoveryEventToastsImmediately(t *testing.T) {
-	m, s := newViewportBenchmarkModel(nil)
+	m, _ := newViewportBenchmarkModel(nil)
 
 	updated, _ := m.Update(OrchestratorEventMsg{Event: common.RetryEvent{
 		ID:          m.Focused.ID(),
@@ -172,7 +172,7 @@ func TestRecoveryEventToastsImmediately(t *testing.T) {
 		Err:         errors.New("connection reset by peer"),
 	}})
 	*m = updated.(Model)
-	s = m.GetAgentState(m.Focused.ID())
+	s := m.GetAgentState(m.Focused.ID())
 
 	if s.RetryVerb != retryVerbConnectionLost {
 		t.Fatalf("RetryVerb = %q, want %q after an infra failure", s.RetryVerb, retryVerbConnectionLost)
