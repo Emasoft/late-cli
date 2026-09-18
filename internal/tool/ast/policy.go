@@ -1,15 +1,9 @@
 package ast
 
 import (
-	"errors"
+	"fmt"
 	"strings"
 )
-
-// BlockReasonCD is the hard-block message returned for `cd` usage.
-const BlockReasonCD = "Do not use `cd` to change directories. Use the `cwd` parameter in the shell tool instead."
-
-// BlockReasonRedirect is the hard-block message returned for unsafe output redirection.
-const BlockReasonRedirect = "Output redirection (>) is blocked. Use `write_file` or `target_edit` to modify files."
 
 // tier2Commands is the set of commands that have mandatory subcommands.
 // The AST adapters should emit compound command keys (e.g. "git log", "go mod")
@@ -70,7 +64,8 @@ func (p *PolicyEngine) Decide(ir ParsedIR) Decision {
 	if hasRisk(ir, ReasonCd) {
 		d.IsBlocked = true
 		d.NeedsConfirmation = true
-		d.BlockReason = errors.New(BlockReasonCD)
+		d.BlockReason = fmt.Errorf(
+			"Do not use `cd` to change directories. Use the `cwd` parameter in the shell tool instead.")
 		return d
 	}
 
@@ -78,7 +73,8 @@ func (p *PolicyEngine) Decide(ir ParsedIR) Decision {
 	if hasRisk(ir, ReasonRedirect) {
 		d.IsBlocked = true
 		d.NeedsConfirmation = true
-		d.BlockReason = errors.New(BlockReasonRedirect)
+		d.BlockReason = fmt.Errorf(
+			"Output redirection (>) is blocked. Use `write_file` or `target_edit` to modify files.")
 		return d
 	}
 

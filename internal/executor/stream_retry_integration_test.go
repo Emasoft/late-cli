@@ -113,6 +113,26 @@ func retryCollector(t *testing.T) (onRetry func(common.RetryEvent), events func(
 		}
 }
 
+// recoveryCollector returns an onRecover callback that counts invocations plus
+// a snapshot accessor, mirroring retryCollector's goroutine-safety notes:
+// RunLoop invokes the callback from its own goroutine and the test reads the
+// count after RunLoop returns; the mutex keeps the race detector happy
+// regardless of interleaving.
+func recoveryCollector(t *testing.T) (onRecover func(), count func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	var calls int
+	return func() {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+		}, func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls
+		}
+}
+
 // runLoopCtx returns a ctx carrying a small retry budget and a generous
 // deadline so a bug can never hang a test until the global -timeout.
 func runLoopCtx(budget int, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -128,6 +148,16 @@ func serveStatus(w http.ResponseWriter, code int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	fmt.Fprint(w, errorJSONBody(message))
+}
+
+// serveStatusWithHeaders is serveStatus with extra response headers (e.g.
+// Retry-After) set before the status is written; the client captures them on
+// the resulting *client.StatusError.
+func serveStatusWithHeaders(w http.ResponseWriter, code int, message string, headers map[string]string) {
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	serveStatus(w, code, message)
 }
 
 // serveSSE writes the success fixture as a complete SSE stream.
@@ -150,12 +180,13 @@ func TestRunLoopRetriesThenSucceeds(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	ctx, cancel := runLoopCtx(3, 15*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -194,8 +225,123 @@ func TestRunLoopRetriesThenSucceeds(t *testing.T) {
 		t.Errorf("RetryEvent.Err status = %d, want 500", statusErr.StatusCode)
 	}
 
+	// The retried attempt actually produced a response: recovery fires
+	// exactly once for this turn — the turn-start callback ran before the
+	// retries, so this is the only signal that the attempt recovered.
+	if got := recoveries(); got != 1 {
+		t.Errorf("onRecover fired %d times, want exactly 1 (once per retried turn)", got)
+	}
+
 	if got := rs.postCount(); got != 2 {
 		t.Errorf("server got %d POSTs, want 2 (failed attempt + successful retry)", got)
+	}
+
+	// The failed attempt must not have committed anything; only the
+	// successful turn appends its assistant message to the seeded history.
+	if len(sess.History) != 2 {
+		t.Fatalf("history length = %d, want 2 (seeded user msg + committed assistant msg)", len(sess.History))
+	}
+	last := sess.History[len(sess.History)-1]
+	if last.Role != "assistant" {
+		t.Errorf("last history role = %q, want assistant", last.Role)
+	}
+	if last.Content.String() != "Hello world" {
+		t.Errorf("last history content = %q, want %q", last.Content.String(), "Hello world")
+	}
+}
+
+// TestRunLoopHonorsRetryAfter proves the executor honors a server-requested
+// Retry-After end-to-end: a 429 carrying Retry-After: 2 must make RunLoop
+// wait at least the requested 2s before retrying — the RetryEvent's Delay is
+// the effective (combined) delay and the wall clock confirms the wait really
+// happened. Bounded assertions only: no upper timing pin beyond sanity.
+func TestRunLoopHonorsRetryAfter(t *testing.T) {
+	var failureServed atomic.Bool
+	rs := newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if !failureServed.CompareAndSwap(false, true) {
+			// Second attempt: complete SSE stream.
+			serveSSE(w)
+			return
+		}
+		// First attempt: transient 429 with a server-requested 2s wait.
+		serveStatusWithHeaders(w, http.StatusTooManyRequests, "slow down", map[string]string{
+			"Retry-After": "2",
+		})
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
+
+	ctx, cancel := runLoopCtx(3, 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("RunLoop returned error after a retryable 429 with Retry-After: %v", err)
+	}
+	if res != "Hello world" {
+		t.Errorf("RunLoop result = %q, want %q", res, "Hello world")
+	}
+
+	events := retryEvents()
+	if len(events) != 1 {
+		t.Fatalf("got %d RetryEvents, want exactly 1: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.Attempt != 1 {
+		t.Errorf("RetryEvent.Attempt = %d, want 1", ev.Attempt)
+	}
+	if ev.MaxAttempts != 3 {
+		t.Errorf("RetryEvent.MaxAttempts = %d, want 3 (ctx budget)", ev.MaxAttempts)
+	}
+	if ev.Err == nil {
+		t.Fatal("RetryEvent.Err is nil, want the underlying stream error")
+	}
+	var statusErr *client.StatusError
+	if !errors.As(ev.Err, &statusErr) {
+		t.Fatalf("RetryEvent.Err = %v (%T), want it to wrap *client.StatusError", ev.Err, ev.Err)
+	}
+	if statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("RetryEvent.Err status = %d, want 429", statusErr.StatusCode)
+	}
+	if statusErr.RetryAfter != 2*time.Second {
+		t.Errorf("StatusError.RetryAfter = %v, want 2s (server-requested delay)", statusErr.RetryAfter)
+	}
+
+	// The retried attempt actually produced a response: recovery fires
+	// exactly once for this turn, independent of the retry tier.
+	if got := recoveries(); got != 1 {
+		t.Errorf("onRecover fired %d times, want exactly 1 (once per retried turn)", got)
+	}
+
+	// CORE assertion: the effective delay reported (and slept) is never
+	// shorter than the server-requested 2s — the executor must not retry
+	// before the requested delay even when the jittered local backoff
+	// (max 500ms on attempt 1) is smaller.
+	if ev.Delay < 2*time.Second {
+		t.Errorf("RetryEvent.Delay = %v, want >= 2s (the server-requested Retry-After)", ev.Delay)
+	}
+	if ev.Delay > retryAfterCeiling {
+		t.Errorf("RetryEvent.Delay = %v, want <= %v (the ceiling)", ev.Delay, retryAfterCeiling)
+	}
+
+	// The wall clock must reflect the honored wait too: the run cannot
+	// finish before the requested delay elapsed. time.NewTimer fires no
+	// earlier than its duration, so this is deterministic, not a flake risk.
+	if elapsed < 2*time.Second {
+		t.Errorf("RunLoop finished in %v, want >= 2s (Retry-After honored)", elapsed)
+	}
+	// Bounded: a single ~2s wait plus network overhead; 10s is generous.
+	if elapsed > 10*time.Second {
+		t.Errorf("RunLoop took %v with a single ~2s wait, want well under that", elapsed)
+	}
+
+	if got := rs.postCount(); got != 2 {
+		t.Errorf("server got %d POSTs, want 2 (429 attempt + successful retry)", got)
 	}
 
 	// The failed attempt must not have committed anything; only the
@@ -219,13 +365,14 @@ func TestRunLoopStopsAfterRetryBudgetExhausted(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	// Budget 2 => initial attempt + 2 retries, then terminal failure.
 	ctx, cancel := runLoopCtx(2, 15*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -267,6 +414,11 @@ func TestRunLoopStopsAfterRetryBudgetExhausted(t *testing.T) {
 	if len(sess.History) != 1 {
 		t.Errorf("history length = %d, want 1 (only the seeded user msg)", len(sess.History))
 	}
+
+	// Exhaustion is not recovery: no attempt ever produced a response.
+	if got := recoveries(); got != 0 {
+		t.Errorf("onRecover fired %d times, want 0 (retry exhaustion is not recovery)", got)
+	}
 }
 
 func TestRunLoopDoesNotRetryNonRetryable(t *testing.T) {
@@ -276,13 +428,14 @@ func TestRunLoopDoesNotRetryNonRetryable(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	// A generous budget that must never be touched by a 401.
 	ctx, cancel := runLoopCtx(5, 15*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -299,6 +452,10 @@ func TestRunLoopDoesNotRetryNonRetryable(t *testing.T) {
 	if events := retryEvents(); len(events) != 0 {
 		t.Errorf("got %d RetryEvents, want 0 for a non-retryable error: %+v", len(events), events)
 	}
+	// No retries, no recovery: the flag must never fire on a clean failure.
+	if got := recoveries(); got != 0 {
+		t.Errorf("onRecover fired %d times, want 0 (no retries happened)", got)
+	}
 	if got := rs.postCount(); got != 1 {
 		t.Errorf("server got %d POSTs, want exactly 1 (no retry after 401)", got)
 	}
@@ -314,6 +471,7 @@ func TestRunLoopCancelDuringBackoffStops(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	collect, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	ctx, cancel := context.WithCancel(
 		context.WithValue(context.Background(), common.MaxStreamRetriesKey, 5),
@@ -340,7 +498,7 @@ func TestRunLoopCancelDuringBackoffStops(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -361,6 +519,11 @@ func TestRunLoopCancelDuringBackoffStops(t *testing.T) {
 	}
 	if len(sess.History) != 1 {
 		t.Errorf("history length = %d, want 1 (a cancelled run commits nothing)", len(sess.History))
+	}
+	// The cancel landed during backoff, so no attempt ever succeeded: no
+	// recovery signal may fire on a cancelled run.
+	if got := recoveries(); got != 0 {
+		t.Errorf("onRecover fired %d times, want 0 (a cancelled run never recovers)", got)
 	}
 }
 
@@ -412,11 +575,12 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	ctx, cancel := runLoopCtx(3, 15*time.Second)
 	defer cancel()
 
-	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 
 	events := retryEvents()
 	posts := rs.postCount()
@@ -430,6 +594,11 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 
 	if res != "Hello world" {
 		t.Errorf("RunLoop result = %q, want %q (retry attempt content, not the partial %q)", res, "Hello world", "par")
+	}
+
+	// The successful retry produced a response: exactly one recovery.
+	if got := recoveries(); got != 1 {
+		t.Errorf("onRecover fired %d times, want exactly 1 (once per retried turn)", got)
 	}
 
 	ev := events[0]
@@ -532,12 +701,13 @@ func TestRunLoopRetriesMidStreamTransportAbort(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	ctx, cancel := runLoopCtx(3, 15*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -550,6 +720,12 @@ func TestRunLoopRetriesMidStreamTransportAbort(t *testing.T) {
 	// the sibling tests (counts are pinned, never exact timings).
 	if elapsed > 10*time.Second {
 		t.Errorf("RunLoop took %v with two mid-stream retries, want well under that", elapsed)
+	}
+
+	// Two retries happened, but both belong to the SAME turn: recovery is a
+	// once-per-recovered-turn signal, not a per-retry one.
+	if got := recoveries(); got != 1 {
+		t.Errorf("onRecover fired %d times, want exactly 1 (once per retried turn, not per retry)", got)
 	}
 
 	// One retry event per aborted attempt: exactly 2, attempts 1 and 2, drawn
@@ -655,15 +831,16 @@ func TestRunLoopRetries400ThenSucceeds(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	// The infra budget must stay untouched by a 400 (those draw from the
 	// bad-body tier); it is kept small so a tier-wiring regression fails
-	// fast here instead of grinding through the default 100-retry budget.
+	// fast here instead of grinding through the default 10-retry budget.
 	ctx, cancel := runLoopCtx(3, 15*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -676,6 +853,13 @@ func TestRunLoopRetries400ThenSucceeds(t *testing.T) {
 	// like the sibling tests (counts are pinned, never exact timings).
 	if elapsed > 10*time.Second {
 		t.Errorf("RunLoop took %v with two bad-body retries, want well under that", elapsed)
+	}
+
+	// The bad-body tier recovers too: the successful retry produced a
+	// response, so exactly one recovery for this turn (two 400 retries,
+	// same turn).
+	if got := recoveries(); got != 1 {
+		t.Errorf("onRecover fired %d times, want exactly 1 (once per retried turn)", got)
 	}
 
 	// One retry event per failed attempt: exactly 2 for the two 400s. Each
@@ -734,6 +918,7 @@ func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
 
 	sess := newRetryTestSession(t, rs.server.URL)
 	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
 
 	// A small infra budget that must never be touched by a 400. If the tier
 	// wiring were wrong and 400s drew from the infra budget instead, the
@@ -743,7 +928,7 @@ func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -788,7 +973,7 @@ func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
 
 	// Initial attempt + exactly DefaultMaxBadBodyRetries retries: pins the
 	// bad-body tier at 3 and proves it does NOT consume the default
-	// 100-retry infrastructure budget.
+	// 10-retry infrastructure budget.
 	want := 1 + DefaultMaxBadBodyRetries
 	if got := rs.postCount(); got != want {
 		t.Errorf("server got %d POSTs, want exactly %d (initial attempt + bad-body retries)", got, want)
@@ -796,5 +981,91 @@ func TestRunLoopStopsAfterBadBodyBudgetExhausted(t *testing.T) {
 
 	if len(sess.History) != 1 {
 		t.Errorf("history length = %d, want 1 (nothing committed)", len(sess.History))
+	}
+
+	// Exhaustion is not recovery: no attempt ever produced a response.
+	if got := recoveries(); got != 0 {
+		t.Errorf("onRecover fired %d times, want 0 (bad-body exhaustion is not recovery)", got)
+	}
+}
+
+// toolCallSSEBody renders a complete SSE stream that ends in a tool call
+// (finish_reason "tool_calls") instead of a final text response: the turn
+// commits an assistant tool-call message and the loop advances to the next
+// turn. The named tool is deliberately unregistered, so ExecuteToolCalls
+// records an error tool result and the run continues.
+func toolCallSSEBody() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "data: %s\n", `{"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"no_such_tool","arguments":"{}"}}]}}]}`)
+	fmt.Fprintf(&b, "data: %s\n", `{"id":"t1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+	b.WriteString("data: [DONE]\n")
+	return b.String()
+}
+
+// serveToolCallSSE writes toolCallSSEBody as a complete SSE stream.
+func serveToolCallSSE(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	fmt.Fprint(w, toolCallSSEBody())
+}
+
+// TestRunLoopRecoveryOncePerTurn proves the recovery signal is scoped to a
+// TURN, not a RUN: two consecutive turns that each retry — the first recovers
+// into a tool call so the loop advances, the second into the final text
+// response — must fire onRecover exactly once per turn, two recoveries total.
+// This pins the sequencing the recovery event exists for: the turn-start
+// callback fires before the retries, so onRecover is the only per-turn
+// "the retry actually produced a response" signal, whether or not the turn
+// also ends the run.
+func TestRunLoopRecoveryOncePerTurn(t *testing.T) {
+	// Declared before newRetryServer so the handler can branch on the
+	// 1-based POST count (the closure only runs once the server is up).
+	var rs *retryServer
+	rs = newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// The wrapper counts the POST before handlePost runs, so
+		// posts.Load() here is the 1-based number of the current request.
+		switch {
+		case rs.posts.Load() == 1 || rs.posts.Load() == 3:
+			// Turns 1 and 2 each start with a transient 500.
+			serveStatus(w, http.StatusInternalServerError, "upstream exploded")
+		case rs.posts.Load() == 2:
+			// Turn 1 retries into a tool call: the run continues.
+			serveToolCallSSE(w)
+		default:
+			// Turn 2 retries into the final text response.
+			serveSSE(w)
+		}
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRetry, retryEvents := retryCollector(t)
+	onRecover, recoveries := recoveryCollector(t)
+
+	ctx, cancel := runLoopCtx(3, 15*time.Second)
+	defer cancel()
+
+	res, err := RunLoop(ctx, sess, 2, nil, nil, nil, nil, onRetry, onRecover, nil)
+	if err != nil {
+		t.Fatalf("RunLoop returned error across two retried turns: %v", err)
+	}
+	if res != "Hello world" {
+		t.Errorf("RunLoop result = %q, want %q", res, "Hello world")
+	}
+
+	if got := rs.postCount(); got != 4 {
+		t.Errorf("server got %d POSTs, want 4 (500+tool-call turn, 500+success turn)", got)
+	}
+	if events := retryEvents(); len(events) != 2 {
+		t.Errorf("got %d RetryEvents, want exactly 2 (one failed attempt per turn): %+v", len(events), events)
+	}
+	// CORE assertion: one recovery PER TURN — turn 1 (retried into a tool
+	// call) and turn 2 (retried into the final response) each recovered.
+	if got := recoveries(); got != 2 {
+		t.Errorf("onRecover fired %d times, want exactly 2 (once per retried turn)", got)
+	}
+
+	// History: seeded user msg + assistant tool call + tool result + the
+	// final assistant reply.
+	if len(sess.History) != 4 {
+		t.Fatalf("history length = %d, want 4 (seeded user, tool call, tool result, final reply)", len(sess.History))
 	}
 }

@@ -18,13 +18,13 @@ var flagGroups = []struct {
 	note    string
 }{
 	{"General", []string{"help", "version"}, ""},
-	{"Session & startup", []string{"continue", "prompt", "theme", "show-cwd"}, ""},
+	{"Session & startup", []string{"continue", "continue-project", "prompt", "theme", "show-cwd"}, ""},
 	{"System prompt", []string{"system-prompt", "system-prompt-file", "append-system-prompt", "inject-cwd", "gemma-thinking"}, ""},
 	{"Model & streaming", []string{"logit-bias", "suppress-thinking-words", "max-stream-retries"}, ""},
 	{"Subagents", []string{"enable-subagents", "subagent-max-turns", "subagent-logit-bias", "save-subagent-histories"}, ""},
 	{"Tools", []string{"use-tools", "enable-bash", "enable-images", "enable-sqz"}, ""},
-	{"Supervision & safety", []string{"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues", "force-revaluate-dangerous-commands"},
-		"These three flags are mutually exclusive: pass at most one. The default\n  (ask-for-user-approval) can be changed by adding a \"permission-mode\"\n  entry to late's config.json with one of the values above."},
+	{"Supervision & safety", []string{"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues"},
+		"These two flags are mutually exclusive: pass at most one. The default\n  (ask-for-user-approval) can be changed by adding a \"permission-mode\"\n  entry to late's config.json with one of the values above."},
 }
 
 // writeHelp renders the full `late -h` output. src is the FlagSet whose

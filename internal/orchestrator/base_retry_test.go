@@ -25,6 +25,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -121,10 +122,10 @@ func newAccumulatorRetryOrchestrator(t *testing.T, baseURL string) *BaseOrchestr
 
 // collectStreamedContents drains the orchestrator's buffered event channel
 // without blocking and returns the streaming (non-Completed) ContentEvent
-// contents in emission order plus the RetryEvent count. Safe to call only
-// after the producing goroutine has finished (Execute) or after the collector
-// below saw a terminal event (run).
-func collectStreamedContents(o *BaseOrchestrator) (contents []string, retries int) {
+// contents in emission order plus the RetryEvent and RecoveryEvent counts.
+// Safe to call only after the producing goroutine has finished (Execute) or
+// after the collector below saw a terminal event (run).
+func collectStreamedContents(o *BaseOrchestrator) (contents []string, retries, recoveries int) {
 	for {
 		select {
 		case ev := <-o.Events():
@@ -135,9 +136,11 @@ func collectStreamedContents(o *BaseOrchestrator) (contents []string, retries in
 				}
 			case common.RetryEvent:
 				retries++
+			case common.RecoveryEvent:
+				recoveries++
 			}
 		default:
-			return contents, retries
+			return contents, retries, recoveries
 		}
 	}
 }
@@ -160,9 +163,15 @@ func TestOnRetryResetsAccumulator(t *testing.T) {
 		t.Errorf("Execute result = %q, want %q", res, "ok")
 	}
 
-	contents, retries := collectStreamedContents(o)
+	contents, retries, recoveries := collectStreamedContents(o)
 	if retries != 1 {
 		t.Fatalf("got %d RetryEvents, want exactly 1", retries)
+	}
+	// The retry produced a response: the dedicated recovery event must be
+	// emitted exactly once, so the UI can toast immediately instead of
+	// guessing on the next turn's thinking event.
+	if recoveries != 1 {
+		t.Errorf("got %d RecoveryEvents, want exactly 1 (retry actually succeeded)", recoveries)
 	}
 	if len(contents) != 2 {
 		t.Fatalf("got %d streaming ContentEvents (%q), want exactly 2: the failed attempt's partial and the retry's output", len(contents), contents)
@@ -185,6 +194,7 @@ func TestOnRetryResetsAccumulatorRunLoop(t *testing.T) {
 	var mu sync.Mutex
 	var contents []string
 	retries := 0
+	recoveries := 0
 	collectorDone := make(chan struct{})
 	go func() {
 		defer close(collectorDone)
@@ -200,6 +210,10 @@ func TestOnRetryResetsAccumulatorRunLoop(t *testing.T) {
 			case common.RetryEvent:
 				mu.Lock()
 				retries++
+				mu.Unlock()
+			case common.RecoveryEvent:
+				mu.Lock()
+				recoveries++
 				mu.Unlock()
 			case common.StatusEvent:
 				// run() always ends the loop with a terminal status event;
@@ -225,6 +239,11 @@ func TestOnRetryResetsAccumulatorRunLoop(t *testing.T) {
 	if retries != 1 {
 		t.Fatalf("got %d RetryEvents, want exactly 1", retries)
 	}
+	// The run path's separate onRecover closure must emit the dedicated
+	// recovery event exactly once when the retried attempt succeeds.
+	if recoveries != 1 {
+		t.Errorf("got %d RecoveryEvents, want exactly 1 (retry actually succeeded)", recoveries)
+	}
 	if len(contents) != 2 {
 		t.Fatalf("got %d streaming ContentEvents (%q), want exactly 2: the failed attempt's partial and the retry's output", len(contents), contents)
 	}
@@ -233,5 +252,86 @@ func TestOnRetryResetsAccumulatorRunLoop(t *testing.T) {
 	}
 	if contents[1] != "ok" {
 		t.Errorf("post-retry streaming ContentEvent = %q, want %q — the retry starts a fresh accumulator, not the spliced %q", contents[1], "ok", "parok")
+	}
+}
+
+// --- Recovery must never fire on retry exhaustion ---
+//
+// There was no orchestrator-level exhaustion fixture, so this small one pins
+// the exhaustion side of the recovery contract end-to-end: with the bad-body
+// budget drained, the run terminates with a terminal error StatusEvent and
+// ZERO RecoveryEvents — exhaustion is not recovery, because no attempt ever
+// produced a response.
+
+// TestBadBodyBudgetExhaustedEmitsNoRecovery drives the Execute path against a
+// server that rejects every request with a transient-looking HTTP 400 (the
+// bad-body tier) and a ctx with a tiny bad-body budget. The budget drains,
+// RunLoop fails, and the orchestrator emits the terminal error StatusEvent —
+// without ever emitting a RecoveryEvent.
+func TestBadBodyBudgetExhaustedEmitsNoRecovery(t *testing.T) {
+	var posts atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		posts.Add(1)
+		// Every attempt: the transient-looking 400 body-parse rejection the
+		// bad-body retry tier exists for.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"The request is invalid: read body failed.","type":"server_error"}}`)
+	}))
+	t.Cleanup(ts.Close)
+
+	c := client.NewClient(client.Config{BaseURL: ts.URL})
+	sess := session.New(c, "", nil, "", false)
+	o := NewBaseOrchestrator("test-orch-exhaust", sess, nil, 5)
+	ctx, cancel := context.WithTimeout(
+		context.WithValue(context.Background(), common.MaxBadBodyRetriesKey, 1),
+		15*time.Second,
+	)
+	t.Cleanup(cancel)
+	o.SetContext(ctx)
+
+	res, err := o.Execute("hello")
+	if err == nil {
+		t.Fatalf("Execute returned %q with nil error, want the bad-body budget exhaustion error", res)
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Execute error = %v, want it to wrap *client.StatusError with 400", err)
+	}
+
+	// The budget drained: initial attempt + exactly one retry.
+	if got := posts.Load(); got != 2 {
+		t.Errorf("server got %d POSTs, want 2 (initial attempt + one bad-body retry)", got)
+	}
+
+	// Drain the buffered events: zero RecoveryEvents, and the terminal error
+	// status must have arrived. All events are emitted synchronously before
+	// Execute returns, so a non-blocking drain cannot race the producer.
+	sawErrorStatus := false
+	recoveries := 0
+	for {
+		select {
+		case ev := <-o.Events():
+			switch e := ev.(type) {
+			case common.RecoveryEvent:
+				recoveries++
+			case common.StatusEvent:
+				if e.Status == "error" {
+					sawErrorStatus = true
+				}
+			}
+		default:
+			if recoveries != 0 {
+				t.Errorf("got %d RecoveryEvents, want 0 (exhaustion is not recovery)", recoveries)
+			}
+			if !sawErrorStatus {
+				t.Error("no terminal error StatusEvent, want one after the bad-body budget drained")
+			}
+			return
+		}
 	}
 }

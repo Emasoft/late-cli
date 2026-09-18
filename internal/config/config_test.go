@@ -706,12 +706,11 @@ func TestSaveConfigAtomicallyReplacesFile(t *testing.T) {
 
 func TestResolvePermissionMode(t *testing.T) {
 	tests := []struct {
-		name               string
-		cfg                *Config
-		askFlag            bool
-		unsupervisedFlag   bool
-		forceRevaluateFlag bool
-		wantMode           string
+		name             string
+		cfg              *Config
+		askFlag          bool
+		unsupervisedFlag bool
+		wantMode         string
 		// wantWarning nil: warning must be empty; non-nil: warning must
 		// contain each substring.
 		wantWarning     []string
@@ -739,21 +738,16 @@ func TestResolvePermissionMode(t *testing.T) {
 			wantMode:         PermissionModeUnsupervised,
 		},
 		{
-			name:               "force-revaluate flag alone",
-			forceRevaluateFlag: true,
-			wantMode:           PermissionModeForceRevaluate,
-		},
-		{
-			name:     "ask flag overrides force-revaluate config",
-			cfg:      &Config{PermissionMode: PermissionModeForceRevaluate},
+			name:     "ask flag overrides unsupervised config",
+			cfg:      &Config{PermissionMode: PermissionModeUnsupervised},
 			askFlag:  true,
 			wantMode: PermissionModeAskForUserApproval,
 		},
 		{
-			name:               "force-revaluate flag overrides ask config",
-			cfg:                &Config{PermissionMode: PermissionModeAskForUserApproval},
-			forceRevaluateFlag: true,
-			wantMode:           PermissionModeForceRevaluate,
+			name:             "unsupervised flag overrides ask config",
+			cfg:              &Config{PermissionMode: PermissionModeAskForUserApproval},
+			unsupervisedFlag: true,
+			wantMode:         PermissionModeUnsupervised,
 		},
 		{
 			name:     "config value: ask-for-user-approval respected",
@@ -764,11 +758,6 @@ func TestResolvePermissionMode(t *testing.T) {
 			name:     "config value: i-promise-i-have-backups-and-will-not-file-issues respected",
 			cfg:      &Config{PermissionMode: PermissionModeUnsupervised},
 			wantMode: PermissionModeUnsupervised,
-		},
-		{
-			name:     "config value: force-revaluate-dangerous-commands respected",
-			cfg:      &Config{PermissionMode: PermissionModeForceRevaluate},
-			wantMode: PermissionModeForceRevaluate,
 		},
 		{
 			name:        "invalid config value falls back to default with warning",
@@ -783,18 +772,11 @@ func TestResolvePermissionMode(t *testing.T) {
 			wantErr:          true,
 			wantErrContains:  "mutually exclusive",
 		},
-		{
-			name:               "all three flags set is an error",
-			askFlag:            true,
-			unsupervisedFlag:   true,
-			forceRevaluateFlag: true,
-			wantErr:            true,
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mode, warning, err := ResolvePermissionMode(tt.cfg, tt.askFlag, tt.unsupervisedFlag, tt.forceRevaluateFlag)
+			mode, warning, err := ResolvePermissionMode(tt.cfg, tt.askFlag, tt.unsupervisedFlag)
 
 			if tt.wantErr {
 				if err == nil {

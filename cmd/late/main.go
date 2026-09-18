@@ -35,22 +35,11 @@ import (
 	"golang.org/x/term"
 )
 
-// forceRevaluateUsage is the -h description of
-// -force-revaluate-dangerous-commands.
-//
-// IMPORTANT: this string must contain no back-quoted word. flag.PrintDefaults
-// renders the first back-quoted word of a usage string as the flag's value
-// name, which would advertise the flag as taking an argument. The OTP code is
-// never passed on the CLI: late generates a random single-use code at runtime
-// and hands it to the agent in the tool-result block message; the agent
-// re-runs the command passing it in the bash tool's otp_code parameter.
-const forceRevaluateUsage = "Unsupervised execution, but the first attempt to run a potentially dangerous command is blocked; late issues the agent a random single-use OTP code, bound to that exact command, which it must pass in the bash tool's otp_code parameter to re-run."
-
 // askForUserApprovalUsage is the -h description of -ask-for-user-approval.
 //
-// Like forceRevaluateUsage, this string must contain no back-quoted word:
-// flag.PrintDefaults renders the first back-quoted word as the flag's value
-// name, which would advertise this boolean flag as taking an argument.
+// This string must contain no back-quoted word: flag.PrintDefaults renders
+// the first back-quoted word as the flag's value name, which would advertise
+// this boolean flag as taking an argument.
 const askForUserApprovalUsage = "Require explicit user approval before running potentially dangerous commands (default; overrides config.json permission-mode)."
 
 // pluginInlineTool adapts a plugin.InlineTool (defined in internal/plugin/tools.go)
@@ -120,10 +109,10 @@ func main() {
 	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append this text to the final system prompt.")
 	versionReq := flag.Bool("version", false, "Print the version and exit.")
 	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "UNSUPPORTED: run every tool without user confirmation.")
-	forceRevaluateReq := flag.Bool("force-revaluate-dangerous-commands", false, forceRevaluateUsage)
 	askForUserApprovalReq := flag.Bool("ask-for-user-approval", false, askForUserApprovalUsage)
 	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support.")
-	continueReq := flag.Bool("continue", false, "Resume the most recent session created in the current directory.")
+	continueReq := flag.Bool("continue", false, "Resume the most recently updated session, regardless of which project directory it was started in.")
+	continueProjectReq := flag.Bool("continue-project", false, "Resume the most recently updated session for the current project (git repo root of the working directory, or the working directory outside a repo); mutually exclusive with -continue.")
 	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar.")
 	themeReq := flag.String("theme", "", "Plugin theme id ('plugin:name' or bare name); env: LATE_THEME.")
 	promptReq := flag.String("prompt", "", "Start the agent immediately with this prompt.")
@@ -148,21 +137,50 @@ func main() {
 		return
 	}
 
+	// --continue and --continue-project are mutually exclusive: both select
+	// the session to resume, so asking for two is ambiguous (same rule and
+	// messaging style as the permission flags).
+	if err := validateContinueFlags(*continueReq, *continueProjectReq); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	var loadedHistoryPath string
 	var resumedSessionTitle string
 	var loadedSessionMeta *session.SessionMeta
 
-	if *continueReq {
+	switch {
+	case *continueReq:
+		// --continue: resume the most recently updated session overall,
+		// regardless of the project directory it was started in.
 		meta, err := resolveContinueSession()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting latest session: %v\n", err)
 			os.Exit(1)
 		}
 		if meta == nil {
-			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
-				fmt.Fprintf(os.Stderr, "No sessions found to continue in %s.\n", cwd)
+			fmt.Fprintln(os.Stderr, "No sessions found to continue.")
+			fmt.Fprintln(os.Stderr, "Use `late session list` to see saved sessions, or `late session load <id>` to resume one directly.")
+			os.Exit(1)
+		}
+		loadedHistoryPath = meta.HistoryPath
+		resumedSessionTitle = fmt.Sprintf("Resumed session: %s (%s)", meta.ID, meta.Title)
+		loadedSessionMeta = meta
+	case *continueProjectReq:
+		// --continue-project: resume the most recently updated session of
+		// the current project (git repo root of the working directory, or
+		// the working directory outside a repo). It works from inside a
+		// subdirectory because the repo root is matched, not the CWD.
+		meta, err := resolveContinueProjectSession()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting latest session: %v\n", err)
+			os.Exit(1)
+		}
+		if meta == nil {
+			if projectDir, dirErr := resolveContinueProjectDir(); dirErr == nil {
+				fmt.Fprintf(os.Stderr, "No sessions found to continue in project %s.\n", projectDir)
 			} else {
-				fmt.Fprintln(os.Stderr, "No sessions found to continue in the current directory.")
+				fmt.Fprintln(os.Stderr, "No sessions found to continue in the current project.")
 			}
 			fmt.Fprintln(os.Stderr, "Use `late session list` to see sessions started in other projects, or `late session load <id>` to resume one directly.")
 			os.Exit(1)
@@ -170,7 +188,7 @@ func main() {
 		loadedHistoryPath = meta.HistoryPath
 		resumedSessionTitle = fmt.Sprintf("Resumed session: %s (%s)", meta.ID, meta.Title)
 		loadedSessionMeta = meta
-	} else if flag.NArg() > 0 && flag.Arg(0) == "session" {
+	case flag.NArg() > 0 && flag.Arg(0) == "session":
 		sessCmdResult := handleSessionCommand(flag.Args()[1:])
 		if sessCmdResult.ShouldExit {
 			return
@@ -393,7 +411,7 @@ func main() {
 
 	// Resolve the effective permission mode
 	// (explicit CLI flag > config.json permission-mode > ask-for-user-approval).
-	permissionMode, permissionModeWarning, err := appconfig.ResolvePermissionMode(appConfig, *askForUserApprovalReq, *unsupervisedReq, *forceRevaluateReq)
+	permissionMode, permissionModeWarning, err := appconfig.ResolvePermissionMode(appConfig, *askForUserApprovalReq, *unsupervisedReq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -686,9 +704,6 @@ func main() {
 		switch permissionMode {
 		case appconfig.PermissionModeUnsupervised:
 			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
-		case appconfig.PermissionModeForceRevaluate:
-			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
-			ctx = context.WithValue(ctx, common.ForceRevaluateKey, true)
 		}
 		ctx = context.WithValue(ctx, common.MaxStreamRetriesKey, *maxStreamRetries)
 		rootAgent.SetContext(ctx)
@@ -942,16 +957,49 @@ type sessionCommandResult struct {
 	ShouldExit  bool
 }
 
-// resolveContinueSession returns the session to resume for --continue:
-// the most recently updated session that was started in the current
-// working directory. It returns (nil, nil) when no matching session
-// exists.
+// validateContinueFlags enforces that at most one of --continue and
+// --continue-project is passed: both select the session to resume, so
+// requesting both is ambiguous. The messaging mirrors the permission-flag
+// exclusivity error.
+func validateContinueFlags(continueFlag, continueProjectFlag bool) error {
+	if continueFlag && continueProjectFlag {
+		return fmt.Errorf("continue flags are mutually exclusive; pass at most one of -continue, -continue-project")
+	}
+	return nil
+}
+
+// resolveContinueSession returns the session to resume for --continue: the
+// most recently updated session overall, regardless of which project
+// directory it was started in. It returns (nil, nil) when no sessions exist.
 func resolveContinueSession() (*session.SessionMeta, error) {
+	return session.GetLatestSession()
+}
+
+// resolveContinueProjectDir returns the project directory that scopes
+// --continue-project: the git repository root containing the current working
+// directory (so the flag also works from inside a subdirectory), or the
+// working directory itself when it is not inside a git repository.
+func resolveContinueProjectDir() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("determining current directory: %w", err)
+		return "", fmt.Errorf("determining current directory: %w", err)
 	}
-	return session.GetLatestSessionForDir(cwd)
+	if root, ok := git.RepoRoot(cwd); ok {
+		return root, nil
+	}
+	return cwd, nil
+}
+
+// resolveContinueProjectSession returns the session to resume for
+// --continue-project: the most recently updated session whose recorded
+// project directory is the current project. It returns (nil, nil) when no
+// matching session exists.
+func resolveContinueProjectSession() (*session.SessionMeta, error) {
+	projectDir, err := resolveContinueProjectDir()
+	if err != nil {
+		return nil, err
+	}
+	return session.GetLatestSessionForDir(projectDir)
 }
 
 // handleSessionCommand processes session subcommands.

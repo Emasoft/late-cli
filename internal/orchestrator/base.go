@@ -291,6 +291,17 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			default:
 			}
 		},
+		func() {
+			// A retried attempt produced a response: emit the dedicated
+			// recovery event so the UI can toast immediately instead of
+			// guessing on the next turn's thinking event. Non-blocking:
+			// a dropped recovery notice is acceptable, blocking the
+			// agent is not.
+			select {
+			case o.eventCh <- common.RecoveryEvent{ID: o.id}:
+			default:
+			}
+		},
 		o.middlewares,
 	)
 
@@ -390,6 +401,17 @@ func (o *BaseOrchestrator) run() {
 				// blocking the agent is not.
 				select {
 				case o.eventCh <- ev:
+				default:
+				}
+			},
+			func() {
+				// A retried attempt produced a response: emit the dedicated
+				// recovery event so the UI can toast immediately instead of
+				// guessing on the next turn's thinking event. Non-blocking:
+				// a dropped recovery notice is acceptable, blocking the
+				// agent is not.
+				select {
+				case o.eventCh <- common.RecoveryEvent{ID: o.id}:
 				default:
 				}
 			},

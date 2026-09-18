@@ -18,7 +18,6 @@ const DefaultOpenAIBaseURL = "http://localhost:8080"
 const (
 	PermissionModeAskForUserApproval = "ask-for-user-approval"
 	PermissionModeUnsupervised       = "i-promise-i-have-backups-and-will-not-file-issues"
-	PermissionModeForceRevaluate     = "force-revaluate-dangerous-commands"
 )
 
 type EnvLookup func(string) (string, bool)
@@ -263,28 +262,26 @@ func ResolveSaveSubagentHistories(cfg *Config, cliExplicit bool, cliValue bool, 
 // are mutually exclusive: setting more than one is an error. An
 // unrecognized config.json value yields a warning and falls back to
 // the safe default.
-func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag, forceRevaluateFlag bool) (mode string, warning string, err error) {
+func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag bool) (mode string, warning string, err error) {
 	set := 0
-	for _, v := range []bool{askFlag, unsupervisedFlag, forceRevaluateFlag} {
+	for _, v := range []bool{askFlag, unsupervisedFlag} {
 		if v {
 			set++
 		}
 	}
 	if set > 1 {
-		return "", "", fmt.Errorf("permission flags are mutually exclusive; pass at most one of -%s, -%s, -%s",
-			PermissionModeAskForUserApproval, PermissionModeUnsupervised, PermissionModeForceRevaluate)
+		return "", "", fmt.Errorf("permission flags are mutually exclusive; pass at most one of -%s, -%s",
+			PermissionModeAskForUserApproval, PermissionModeUnsupervised)
 	}
 	switch {
 	case askFlag:
 		return PermissionModeAskForUserApproval, "", nil
 	case unsupervisedFlag:
 		return PermissionModeUnsupervised, "", nil
-	case forceRevaluateFlag:
-		return PermissionModeForceRevaluate, "", nil
 	}
 	if cfg != nil && cfg.PermissionMode != "" {
 		switch cfg.PermissionMode {
-		case PermissionModeAskForUserApproval, PermissionModeUnsupervised, PermissionModeForceRevaluate:
+		case PermissionModeAskForUserApproval, PermissionModeUnsupervised:
 			return cfg.PermissionMode, "", nil
 		default:
 			return PermissionModeAskForUserApproval,

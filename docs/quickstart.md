@@ -87,15 +87,14 @@ You can choose how much supervision Late applies to dangerous commands by adding
 }
 ```
 
-The three allowed values are:
+The two allowed values are:
 
 * `ask-for-user-approval` — the default. Potentially dangerous commands require your approval.
 * `i-promise-i-have-backups-and-will-not-file-issues` — run every tool without user confirmation.
-* `force-revaluate-dangerous-commands` — unsupervised, but the first attempt at a dangerous command is blocked until the agent re-runs it with a single-use OTP code.
 
 Notes:
 
-* The three CLI flags of the same names (`--ask-for-user-approval`, `--i-promise-i-have-backups-and-will-not-file-issues`, `--force-revaluate-dangerous-commands`) are mutually exclusive and override the `config.json` value.
+* The two CLI flags of the same names (`--ask-for-user-approval`, `--i-promise-i-have-backups-and-will-not-file-issues`) are mutually exclusive and override the `config.json` value.
 * Omitting the entry (and any flag) defaults to `ask-for-user-approval`.
 * An invalid value is ignored with a warning and the safe default applies.
 
@@ -233,13 +232,19 @@ late-podman -- --prompt "Refactor this package and verify all tests."
 
 Late automatically saves sessions.
 
-Resume the most recent session started in the current project directory:
+Resume the most recently updated session, no matter which project it belongs to:
 
 ```bash
 late --continue
 ```
 
-Sessions started in other folders — or before this feature was introduced — can be found with `late session list` (use `-v` to see each session's project folder) and resumed with `late session load <id>`:
+Resume the most recently updated session for the **current project**. The project is resolved as the git repository root containing your working directory (falling back to the working directory itself outside a repository), so this also works from inside a subdirectory:
+
+```bash
+late --continue-project
+```
+
+The two flags are mutually exclusive: pass at most one. Sessions from other projects — or ones created before the project directory was recorded — can be found with `late session list` (use `-v` to see each session's project folder) and resumed with `late session load <id>`:
 
 ```bash
 late session list -v
@@ -313,13 +318,32 @@ You can also create an `.llmignore` file alongside your `.gitignore` to specific
 ---
 
 
+## Stream Retries
+
+Transient LLM API failures are retried automatically, so a flaky gateway rarely interrupts a run:
+
+* Transport errors — connection refused/reset, timeouts, and mid-stream disconnects (the server accepted the request, then the body died) — are retried.
+* HTTP 408, 429, and 5xx responses are retried; HTTP 400 gets a few quick retries.
+* Each retry waits a jittered exponential backoff (500 ms base, capped at 30 s). A server `Retry-After` header is honored as a floor, capped at 5 minutes.
+* Failures that retrying cannot fix fail fast: TLS/certificate errors, unsupported URL schemes, and plain HTTP on an HTTPS endpoint.
+
+The retry budget is resolved as CLI flag > environment variable > built-in default:
+
+* `--max-stream-retries <n>` — maximum retries per stream call (default: 10)
+* `LATE_MAX_STREAM_RETRIES` — environment variable, used when the flag is not passed
+
+Setting `0` (or a negative value) disables stream retrying entirely. Run `late -h` to see all flags.
+
+---
+
 ## Common Flags
 
 | Flag | Description |
 | --- | --- |
 | `--help` | Show all flags and commands |
 | `--version` | Show version information |
-| `--continue` | Resume the latest session created in the current directory |
+| `--continue` | Resume the latest session, regardless of project directory |
+| `--continue-project` | Resume the latest session in the current project (git repo root of the working directory; falls back to the working directory outside a repo) |
 | `--prompt "..."` | Start the agent immediately with the given prompt |
 | `--suppress-thinking-words` | Apply a default Logit bias map of overthinking words (`llama.cpp` only) |
 | `--logit-bias` and `--subagent-logit-bias` | Manually set the logit biases for specific models (`llama.cpp` only) |
@@ -328,9 +352,9 @@ You can also create an `.llmignore` file alongside your `.gitignore` to specific
 | `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
 | `--enable-images` | Treat models as supporting images (for non llama.cpp servers) |
 | `--save-subagent-histories` | Persist subagent conversation histories to disk |
+| `--max-stream-retries <n>` | Max retries per LLM stream call with jittered exponential backoff (default: 10); `0` disables stream retrying. Env: `LATE_MAX_STREAM_RETRIES` |
 | `--ask-for-user-approval` | Require user approval for dangerous commands (default; overrides `config.json` `permission-mode`) |
 | `--i-promise-i-have-backups-and-will-not-file-issues` | Run every tool without user confirmation (overrides `config.json` `permission-mode`) |
-| `--force-revaluate-dangerous-commands` | Unsupervised, but the first attempt at a dangerous command is blocked until the agent re-runs it with a single-use OTP code (overrides `config.json` `permission-mode`) |
 
-The three permission flags above are mutually exclusive: pass at most one of `--ask-for-user-approval`, `--i-promise-i-have-backups-and-will-not-file-issues`, or `--force-revaluate-dangerous-commands`.
+The two permission flags above are mutually exclusive: pass at most one of `--ask-for-user-approval` or `--i-promise-i-have-backups-and-will-not-file-issues`.
 

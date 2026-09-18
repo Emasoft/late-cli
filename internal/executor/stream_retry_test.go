@@ -3,6 +3,7 @@ package executor
 import (
 	"bufio"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -71,6 +72,62 @@ func TestStreamRetryDelay(t *testing.T) {
 			t.Fatalf("expected growth between attempts: max over %d draws was %v for attempt 1, %v for attempt 5", draws, maxFirst, maxFifth)
 		}
 	})
+}
+
+func TestEffectiveRetryDelay(t *testing.T) {
+	tests := []struct {
+		name       string
+		local      time.Duration
+		retryAfter time.Duration
+		want       time.Duration
+	}{
+		{
+			// Absent (or client-rejected-invalid) Retry-After: the local
+			// jittered backoff is used untouched.
+			name:       "Retry-After 0 leaves the local backoff untouched",
+			local:      500 * time.Millisecond,
+			retryAfter: 0,
+			want:       500 * time.Millisecond,
+		},
+		{
+			// Core owner requirement: never retry before the server asked.
+			name:       "server-requested wait longer than local wins",
+			local:      500 * time.Millisecond,
+			retryAfter: 2 * time.Second,
+			want:       2 * time.Second,
+		},
+		{
+			// The local backoff still applies when it is the larger of the two.
+			name:       "local backoff longer than the server request wins",
+			local:      5 * time.Second,
+			retryAfter: 2 * time.Second,
+			want:       5 * time.Second,
+		},
+		{
+			// Hostile/buggy server asking for an absurd wait: capped at the
+			// ceiling instead of hanging the interactive session.
+			name:       "huge Retry-After is capped at the ceiling",
+			local:      500 * time.Millisecond,
+			retryAfter: 10 * time.Minute,
+			want:       retryAfterCeiling,
+		},
+		{
+			// Defensive: the client maps invalid headers to 0; anything
+			// non-positive must degrade to the local backoff.
+			name:       "negative Retry-After is treated as absent",
+			local:      500 * time.Millisecond,
+			retryAfter: -3 * time.Second,
+			want:       500 * time.Millisecond,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveRetryDelay(tt.local, tt.retryAfter); got != tt.want {
+				t.Errorf("effectiveRetryDelay(%v, %v) = %v, want %v", tt.local, tt.retryAfter, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestIsRetryableStreamError(t *testing.T) {
@@ -232,9 +289,12 @@ func TestMaxStreamRetriesFromContext(t *testing.T) {
 		want int
 	}{
 		{
-			name: "absent key falls back to default",
+			// Pins the interactive default (owner item 7): 10 retries carry
+			// about 75.75s of expected total backoff. A deliberate change to
+			// DefaultMaxStreamRetries must update this literal and its docs.
+			name: "absent key falls back to the pinned default (10)",
 			ctx:  context.Background(),
-			want: DefaultMaxStreamRetries,
+			want: 10,
 		},
 		{
 			name: "positive override is honored",
@@ -363,6 +423,38 @@ func TestClassifyStreamError(t *testing.T) {
 			want: retryClassInfra,
 		},
 
+		// url.Error: classified by CAUSE, not by the wrapper. Permanent
+		// causes (TLS trust/hostname, unsupported scheme, HTTP-on-HTTPS)
+		// fail fast; transient causes (refused, DNS, timeouts) stay infra.
+		{
+			// Certificate trust failure is permanent.
+			name: "url.Error carrying x509.UnknownAuthorityError is none",
+			err:  fmt.Errorf("stream error: %w", &url.Error{Op: "Post", URL: "https://host", Err: x509.UnknownAuthorityError{}}),
+			want: retryClassNone,
+		},
+		{
+			name: "url.Error carrying x509.HostnameError is none",
+			err:  &url.Error{Op: "Post", URL: "https://host", Err: x509.HostnameError{Host: "host", Certificate: &x509.Certificate{}}},
+			want: retryClassNone,
+		},
+		{
+			name: "url.Error carrying unsupported protocol scheme is none",
+			err:  &url.Error{Op: "Post", URL: "ftp://host", Err: errors.New(`unsupported protocol scheme "ftp"`)},
+			want: retryClassNone,
+		},
+		{
+			// Still transient — pins the non-overreach of the cause
+			// classification: plain dial failures must stay infra.
+			name: "url.Error carrying dial connection refused is infra",
+			err:  &url.Error{Op: "Post", URL: "https://host", Err: &net.OpError{Op: "dial", Err: errors.New("connect: connection refused")}},
+			want: retryClassInfra,
+		},
+		{
+			name: "url.Error carrying temporary DNS failure is infra",
+			err:  &url.Error{Op: "Post", URL: "https://host", Err: errors.New("dial tcp: lookup host: temporary failure in name resolution")},
+			want: retryClassInfra,
+		},
+
 		// Infrastructure: mid-stream transport failures after a 200 — the
 		// client surfaces these as *client.StreamInterruptedError.
 		{
@@ -384,6 +476,13 @@ func TestClassifyStreamError(t *testing.T) {
 			name: "wrapped oversized SSE line (bufio.ErrTooLong) fails fast",
 			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: bufio.ErrTooLong}),
 			want: retryClassNone,
+		},
+		{
+			// Owner item 2 pin: a non-timeout net.OpError wrapping ECONNRESET
+			// mid-body is infra-retryable, not unknown/non-retryable.
+			name: "mid-body ECONNRESET via net.OpError is infra-retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: &net.OpError{Op: "read", Err: errors.New("read: connection reset by peer")}}),
+			want: retryClassInfra,
 		},
 
 		// None: anything unknown fails fast, like pre-retry behavior.

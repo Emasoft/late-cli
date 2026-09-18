@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -233,6 +234,9 @@ func ConsumeStream(
 // RunLoop handles the core, blocking event loop for autonomous agents.
 // It forces the sequence: inference stream -> verifiable accumulation -> history commit -> safe tool execution.
 // If the deterministic tool extraction yields zero calls, the loop securely collapses and returns execution control.
+// onRetry fires per failed stream attempt that will be retried; onRecover
+// fires exactly once per turn whose retries ended in a successful stream
+// (i.e. the retry actually produced a response).
 
 func RunLoop(
 	ctx context.Context,
@@ -243,6 +247,7 @@ func RunLoop(
 	onEndTurn func(),
 	onStreamChunk func(common.StreamResult),
 	onRetry func(event common.RetryEvent),
+	onRecover func(),
 	middlewares []common.ToolMiddleware,
 ) (string, error) {
 	var lastContent string
@@ -291,6 +296,20 @@ func RunLoop(
 			// Terminal per tier: budget exhausted for this failure's class or
 			// a non-retryable failure. Propagates byte-identically to the
 			// pre-retry behavior.
+			//
+			// Server-requested Retry-After: both retry tiers can carry a
+			// *client.StatusError (429/408/5xx in the infra tier, 400 in the
+			// bad-body tier), so the error chain is inspected once here and
+			// the requested delay — 0 when absent or invalid — is combined
+			// with the local jittered backoff below. effectiveRetryDelay
+			// guarantees the wait is never shorter than the server asked
+			// (capped at retryAfterCeiling) and the existing timer select
+			// keeps it cancelable.
+			var retryAfter time.Duration
+			var se *client.StatusError
+			if errors.As(err, &se) {
+				retryAfter = se.RetryAfter
+			}
 			var delay time.Duration
 			switch classifyStreamError(err) {
 			case retryClassNone:
@@ -301,14 +320,16 @@ func RunLoop(
 					return "", err
 				}
 				infraAttempts++
-				delay = streamRetryDelay(infraAttempts)
+				delay = effectiveRetryDelay(streamRetryDelay(infraAttempts), retryAfter)
 				if onRetry != nil {
 					onRetry(common.RetryEvent{
 						ID:          common.GetOrchestratorID(ctx),
 						Attempt:     infraAttempts,
 						MaxAttempts: maxRetries,
-						Delay:       delay,
-						Err:         err,
+						// Effective delay: max(local jittered backoff,
+						// server-requested Retry-After, capped).
+						Delay: delay,
+						Err:   err,
 					})
 				}
 			case retryClassBadBody:
@@ -316,14 +337,15 @@ func RunLoop(
 					return "", err
 				}
 				badBodyAttempts++
-				delay = streamRetryDelay(badBodyAttempts)
+				delay = effectiveRetryDelay(streamRetryDelay(badBodyAttempts), retryAfter)
 				if onRetry != nil {
 					onRetry(common.RetryEvent{
 						ID:          common.GetOrchestratorID(ctx),
 						Attempt:     badBodyAttempts,
 						MaxAttempts: badBodyBudget,
-						Delay:       delay,
-						Err:         err,
+						// Effective delay, same combination as the infra tier.
+						Delay: delay,
+						Err:   err,
 					})
 				}
 			}
@@ -343,6 +365,18 @@ func RunLoop(
 				// emitting StatusEvent{error}.
 				return "", err
 			}
+		}
+
+		// The attempt loop above exits only via break-on-success or an early
+		// return, so reaching here means an attempt finally produced a
+		// response. If at least one retry happened in this turn, signal
+		// recovery exactly once: the turn-start callback fired before the
+		// retries, so no thinking event will announce it.
+		if (infraAttempts+badBodyAttempts) > 0 && onRecover != nil {
+			// The retried attempt actually produced a response: signal
+			// recovery now (the turn-start callback fired before the
+			// retries, so no thinking event will announce it).
+			onRecover()
 		}
 
 		if acc.FinishReason == "length" {

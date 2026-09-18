@@ -147,8 +147,8 @@ type AppState struct {
 	// retryVerbConnectionLost ("connection lost") for infra failures or
 	// retryVerbRejectedByAPI ("request rejected by the API") for HTTP 400s.
 	// It is set by common.RetryEvent and cleared by the next "thinking"
-	// status, which also raises the failure-class-matched recovery toast.
-	// Empty means the agent is not retrying.
+	// status as a silent safety net; recovery is announced separately by
+	// the dedicated RecoveryEvent. Empty means the agent is not retrying.
 	RetryVerb string
 }
 

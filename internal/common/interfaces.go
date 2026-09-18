@@ -104,6 +104,15 @@ type RetryEvent struct {
 
 func (e RetryEvent) OrchestratorID() string { return e.ID }
 
+// RecoveryEvent is sent when a stream attempt that previously failed and was
+// being retried finally succeeds — i.e. the retry actually produced a
+// response. Emitted by the executor's retry loop exactly once per recovery.
+type RecoveryEvent struct {
+	ID string
+}
+
+func (e RecoveryEvent) OrchestratorID() string { return e.ID }
+
 // PromptRequest defines a generic requirement for user input.
 type PromptRequest struct {
 	ID          string
@@ -125,7 +134,6 @@ const (
 	OrchestratorIDKey    contextKey = "orchestrator_id"
 	SkipConfirmationKey  contextKey = "skip_confirmation"
 	ToolApprovalKey      contextKey = "tool_approval"
-	ForceRevaluateKey    contextKey = "force_revaluate"
 	MaxStreamRetriesKey  contextKey = "max_stream_retries"
 	MaxBadBodyRetriesKey contextKey = "max_bad_body_retries"
 )

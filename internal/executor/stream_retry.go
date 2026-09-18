@@ -3,11 +3,14 @@ package executor
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"math/rand/v2"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"late/internal/client"
@@ -16,8 +19,15 @@ import (
 
 const (
 	// DefaultMaxStreamRetries is the default retry budget for a failing LLM
-	// stream call. Overridable via -max-stream-retries / LATE_MAX_STREAM_RETRIES.
-	DefaultMaxStreamRetries = 100
+	// stream call. The interactive default is deliberately small: with full
+	// jitter over [0, base*2^(n-1)] (base 500ms, capped at 30s) the expected
+	// total backoff across the whole budget is about 75.75s — long enough to
+	// ride out transient gateway hiccups, short enough that a hung provider
+	// does not keep a user waiting for the ~23.8 minutes that 100 retries
+	// would mean. Overridable via -max-stream-retries /
+	// LATE_MAX_STREAM_RETRIES; 0 or a negative value disables stream
+	// retrying entirely.
+	DefaultMaxStreamRetries = 10
 	// DefaultMaxBadBodyRetries is the dedicated retry budget for HTTP 400
 	// responses. A 400 "read body failed" from strict OpenAI-compatible
 	// gateways (e.g. z.ai/GLM) is frequently a transient upstream failure,
@@ -75,6 +85,30 @@ func streamRetryDelay(attempt int) time.Duration {
 	return rand.N(backoff)
 }
 
+// retryAfterCeiling caps a server-requested Retry-After wait. Honoring the
+// header fully could hang an interactive session for hours on a hostile or
+// buggy server; the cap keeps the worst case bounded while still never
+// retrying before the requested delay for sane values. The wait remains
+// cancelable (stop) regardless.
+const retryAfterCeiling = 5 * time.Minute
+
+// effectiveRetryDelay combines the local jittered backoff with a
+// server-requested Retry-After: the result is never shorter than either —
+// in particular never earlier than the server asked. RetryAfter of 0 (absent
+// or invalid) leaves the local backoff untouched.
+func effectiveRetryDelay(local time.Duration, retryAfter time.Duration) time.Duration {
+	if retryAfter <= 0 {
+		return local
+	}
+	if retryAfter > retryAfterCeiling {
+		retryAfter = retryAfterCeiling
+	}
+	if local > retryAfter {
+		return local
+	}
+	return retryAfter
+}
+
 // classifyStreamError buckets a failed LLM stream attempt into a retry tier.
 // retryClassInfra covers infrastructure-style failures that draw from the
 // main retry budget: network-level errors (timeouts, refused/reset
@@ -82,6 +116,10 @@ func streamRetryDelay(attempt int) time.Duration {
 // as *client.StreamInterruptedError (HTTP/2 RST_STREAM, GOAWAY, connection
 // resets, truncated bodies — the request was accepted with 200 and the body
 // then died), and transient server responses (408/429/5xx).
+// A *url.Error is infra-tier UNLESS its underlying cause is permanent —
+// TLS certificate/trust failures, non-TLS bytes on a TLS connection, or an
+// unsupported URL scheme — in which case retrying cannot help and it maps
+// to retryClassNone and fails fast (see isPermanentNetworkError).
 // The one exception inside *client.StreamInterruptedError is
 // bufio.ErrTooLong (the SSE line exceeds the client's scanner cap): that
 // failure is deterministic — retrying cannot shrink the line — so it maps to
@@ -100,6 +138,9 @@ func classifyStreamError(err error) streamRetryClass {
 	}
 	var ue *url.Error
 	if errors.As(err, &ue) {
+		if isPermanentNetworkError(ue) {
+			return retryClassNone
+		}
 		return retryClassInfra
 	}
 	var ne net.Error
@@ -135,6 +176,34 @@ func classifyStreamError(err error) streamRetryClass {
 		return retryClassNone
 	}
 	return retryClassNone
+}
+
+// isPermanentNetworkError reports whether a url.Error wraps a cause that
+// retrying cannot fix: TLS certificate failures (untrusted authority,
+// hostname mismatch, invalid/expired chain), non-TLS bytes on a TLS
+// connection, unsupported URL schemes, and plain-HTTP-on-HTTPS. Everything
+// else a url.Error can carry (connection refused/reset, DNS temporary
+// failures, timeouts) stays transient.
+func isPermanentNetworkError(ue *url.Error) bool {
+	var authErr x509.UnknownAuthorityError
+	if errors.As(ue.Err, &authErr) {
+		return true
+	}
+	var hostErr x509.HostnameError
+	if errors.As(ue.Err, &hostErr) {
+		return true
+	}
+	var certErr x509.CertificateInvalidError
+	if errors.As(ue.Err, &certErr) {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(ue.Err, &recordErr) {
+		return true
+	}
+	msg := ue.Err.Error()
+	return strings.HasPrefix(msg, "unsupported protocol scheme") ||
+		strings.HasPrefix(msg, "http: server gave HTTP response to HTTPS client")
 }
 
 // isRetryableStreamError reports whether a failed LLM stream attempt should

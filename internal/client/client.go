@@ -9,9 +9,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -622,7 +625,14 @@ func (c *Client) marshalFlattened(req ChatCompletionRequest) ([]byte, error) {
 type StatusError struct {
 	StatusCode int
 	Status     string // e.g. "500 Internal Server Error"
-	Body       string // truncated response body for diagnostics
+	// Body is the diagnostic response body: the provider's error.message when
+	// the body is a JSON API error, otherwise a bounded, sanitized text
+	// fallback. It is truncated to at most 1024 bytes (rune-safe).
+	Body string
+	// RetryAfter is the delay requested by the server via the Retry-After
+	// header (delta-seconds or HTTP-date form), 0 when absent or invalid.
+	// The executor honors it as a floor for the retry backoff.
+	RetryAfter time.Duration
 	Code       any    // provider error code (JSON error.code), if provided
 	Type       string // provider error type (JSON error.type), if provided
 }
@@ -651,16 +661,34 @@ func (e *StreamInterruptedError) Error() string {
 
 func (e *StreamInterruptedError) Unwrap() error { return e.Err }
 
+const (
+	// maxErrorBodyBytes bounds how much of an error response body is read
+	// before parsing: a hostile or broken server can send arbitrarily large
+	// bodies, and slurping one whole could exhaust memory.
+	maxErrorBodyBytes = 8192
+	// maxErrorMessageBytes bounds the diagnostic text stored on StatusError,
+	// for both the structured JSON message and the sanitized text fallback.
+	maxErrorMessageBytes = 1024
+)
+
+// formatError converts a non-2xx response into a *StatusError. The error body
+// is read exactly once, bounded by maxErrorBodyBytes: a decoder that consumes
+// bytes before failing would lose them, and an unbounded read could exhaust
+// memory on a hostile server. When the body is a JSON API error, its message,
+// type, and code are preserved; otherwise a bounded, sanitized text fallback
+// keeps plain-text and HTML failures diagnosable. A Retry-After header
+// (delta-seconds or HTTP-date form) is captured so the retry executor can
+// honor the server's requested pacing.
 func (c *Client) formatError(resp *http.Response) error {
 	se := &StatusError{
 		StatusCode: resp.StatusCode,
 		Status:     resp.Status,
 	}
+	// Read the error body once, bounded. Read errors are best-effort: the
+	// body is treated as empty so the status is still reported.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	var apiErr APIErrorResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err == nil {
-		if apiErr.Error.Message != "" {
-			se.Body = apiErr.Error.Message
-		}
+	if err := json.Unmarshal(body, &apiErr); err == nil {
 		// Preserve provider error type/code when present; zero values stay unset.
 		if apiErr.Error.Type != "" {
 			se.Type = apiErr.Error.Type
@@ -668,8 +696,100 @@ func (c *Client) formatError(resp *http.Response) error {
 		if apiErr.Error.Code != nil {
 			se.Code = apiErr.Error.Code
 		}
+		if apiErr.Error.Message != "" {
+			se.Body = truncateErrorText(apiErr.Error.Message, maxErrorMessageBytes)
+		} else {
+			// JSON body without a structured message: fall back to the
+			// sanitized text so something is still diagnosable.
+			se.Body = sanitizeErrorText(string(body), maxErrorMessageBytes)
+		}
+	} else {
+		// Structured message unavailable: bounded, sanitized text fallback
+		// so plain-text/HTML failures are still diagnosable.
+		se.Body = sanitizeErrorText(string(body), maxErrorMessageBytes)
+	}
+	if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+		se.RetryAfter = ra
 	}
 	return se
+}
+
+// parseRetryAfter parses a Retry-After header value in either delta-seconds
+// ("2") or HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT") form. Empty, invalid,
+// and non-positive values yield 0, which callers treat as "no requested
+// delay"; HTTP dates are measured against the current time.
+func parseRetryAfter(v string) time.Duration {
+	return parseRetryAfterAt(v, time.Now())
+}
+
+// parseRetryAfterAt is parseRetryAfter with an injectable clock so the
+// HTTP-date form can be tested deterministically.
+func parseRetryAfterAt(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if date, err := http.ParseTime(v); err == nil {
+		// Delay until the requested instant; 0 when it already passed.
+		if d := date.Sub(now); d > 0 {
+			return d
+		}
+		return 0
+	}
+	return 0
+}
+
+// sanitizeErrorText turns an arbitrary error body (plain text, HTML, binary
+// junk) into a bounded diagnostic string: \r is dropped, control characters
+// other than \n and \t are stripped, and runs of whitespace (including
+// newlines and tabs) collapse to a single space, so the result is effectively
+// single-line. It is trimmed and then truncated to at most limit bytes
+// (rune-safe).
+func sanitizeErrorText(s string, limit int) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	lastSpace := false
+	for _, r := range s {
+		if r == '\r' {
+			continue
+		}
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if !lastSpace {
+				b.WriteRune(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		lastSpace = false
+		b.WriteRune(r)
+	}
+	return truncateErrorText(strings.TrimSpace(b.String()), limit)
+}
+
+// truncateErrorText limits s to at most limit bytes without splitting a
+// multi-byte rune: when limit falls inside a rune, the cut moves back to the
+// start of that rune.
+func truncateErrorText(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func (c *Client) APIKey() string {

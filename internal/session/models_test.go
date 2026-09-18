@@ -6,6 +6,7 @@ import (
 	"late/internal/client"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -488,5 +489,229 @@ func TestSessionMeta_WorkingDirRoundTrip(t *testing.T) {
 	}
 	if loaded.WorkingDir != "/restored/path" {
 		t.Errorf("WorkingDir after SetWorkingDir = %q, want %q", loaded.WorkingDir, "/restored/path")
+	}
+}
+
+// TestGetLatestSessionForDir_SkipsVanishedSidecar makes the enumeration-time
+// race deterministic. A dangling symlink's lstat (entry.Info) succeeds while
+// reading it (loadMetaFile) fails with ENOENT — exactly the "meta file
+// disappeared after entry.Info() but before the load" window that used to
+// yield a (nil, nil) meta and panic on meta.WorkingDir. The scan must skip
+// such a sidecar without panicking and still find the healthy session.
+func TestGetLatestSessionForDir_SkipsVanishedSidecar(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	// Vanished sidecar: lstat succeeds, read fails.
+	vanishedPath := filepath.Join(tmpDir, "session-20250101-vanished.meta.json")
+	if err := os.Symlink(filepath.Join(tmpDir, "gone.target"), vanishedPath); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250102-100000", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+
+	latest, err := GetLatestSessionForDir("/proj/a") // must not panic
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a): %v", err)
+	}
+	if latest == nil || latest.ID != "session-20250102-100000" {
+		t.Fatalf("GetLatestSessionForDir(/proj/a) = %v, want session-20250102-100000 (the vanished sidecar must be skipped, not crash the scan)", latest)
+	}
+}
+
+// TestGetLatestSessionForDir_NilMetaNeverDereferenced injects the historical
+// (nil, nil) loader result through the loadEnumeratedMeta seam and asserts
+// the scan skips it instead of dereferencing meta.WorkingDir — defense in
+// depth beyond loadMetaFile's (meta, error) contract.
+func TestGetLatestSessionForDir_NilMetaNeverDereferenced(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-100000", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+
+	oldLoad := loadEnumeratedMeta
+	loadEnumeratedMeta = func(path string) (*SessionMeta, error) {
+		return nil, nil // simulate the race result: nothing loaded, no error
+	}
+	t.Cleanup(func() { loadEnumeratedMeta = oldLoad })
+
+	latest, err := GetLatestSessionForDir("/proj/a") // must not panic
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a): %v", err)
+	}
+	if latest != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a) = %+v, want nil when every sidecar loads as (nil, nil)", latest)
+	}
+}
+
+// TestGetLatestSessionForDir_LoadsExactEnumeratedFiles pins the exact-file
+// loading rule with prefix-colliding IDs. The vanished
+// "session-20250101.meta.json" sidecar's ID is a prefix of the surviving
+// "session-20250101-abcdef" and carries the newest mtime: with
+// LoadSessionMeta-style prefix fallback the scan would resurrect the abcdef
+// meta under the vanished entry's newer mtime and wrongly beat the genuinely
+// newest session. The loader must also see the enumerated paths verbatim.
+func TestGetLatestSessionForDir_LoadsExactEnumeratedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-abcdef", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250102-x", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+	// Vanished sidecar whose ID prefix-collides with session-20250101-abcdef.
+	vanishedPath := filepath.Join(tmpDir, "session-20250101.meta.json")
+	if err := os.Symlink(filepath.Join(tmpDir, "gone.target"), vanishedPath); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	// Both real sessions are older than the vanished sidecar's (current)
+	// mtime, so a fallback resurrection would win the newest-wins race.
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	setMetaModTimes(t, tmpDir, map[string]time.Time{
+		"session-20250101-abcdef": base.Add(1 * time.Hour),
+		"session-20250102-x":      base.Add(2 * time.Hour),
+	})
+
+	oldLoad := loadEnumeratedMeta
+	t.Cleanup(func() { loadEnumeratedMeta = oldLoad })
+	var loaded []string
+	loadEnumeratedMeta = func(path string) (*SessionMeta, error) {
+		loaded = append(loaded, path)
+		return loadMetaFile(path)
+	}
+
+	latest, err := GetLatestSessionForDir("/proj/a")
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(/proj/a): %v", err)
+	}
+	if latest == nil || latest.ID != "session-20250102-x" {
+		t.Fatalf("GetLatestSessionForDir(/proj/a) = %v, want session-20250102-x (the vanished prefix-colliding sidecar must not resurrect session-20250101-abcdef under its newer mtime)", latest)
+	}
+
+	wantPaths := []string{
+		filepath.Join(tmpDir, "session-20250101-abcdef.meta.json"),
+		filepath.Join(tmpDir, "session-20250101.meta.json"),
+		filepath.Join(tmpDir, "session-20250102-x.meta.json"),
+	}
+	slices.Sort(loaded) // ReadDir order is already sorted; sort defensively
+	slices.Sort(wantPaths)
+	if !slices.Equal(loaded, wantPaths) {
+		t.Errorf("loader saw paths %v, want the exact enumerated files %v", loaded, wantPaths)
+	}
+}
+
+// TestGetLatestSession_SkipsVanishedSidecar mirrors the exact-file rule on
+// the global --continue path: a vanished sidecar must be skipped, never
+// re-resolved through the ID-prefix fallback to a different session.
+func TestGetLatestSession_SkipsVanishedSidecar(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-abcdef", "/proj/a")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250102-x", "/proj/b")); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+	vanishedPath := filepath.Join(tmpDir, "session-20250101.meta.json")
+	if err := os.Symlink(filepath.Join(tmpDir, "gone.target"), vanishedPath); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	// Same mtime setup as the --continue-project variant: the vanished
+	// sidecar is the newest entry, and its ID prefix-collides with
+	// session-20250101-abcdef.
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	setMetaModTimes(t, tmpDir, map[string]time.Time{
+		"session-20250101-abcdef": base.Add(1 * time.Hour),
+		"session-20250102-x":      base.Add(2 * time.Hour),
+	})
+
+	latest, err := GetLatestSession() // must not panic
+	if err != nil {
+		t.Fatalf("GetLatestSession(): %v", err)
+	}
+	if latest == nil || latest.ID != "session-20250102-x" {
+		t.Fatalf("GetLatestSession() = %v, want session-20250102-x (the vanished sidecar must be skipped, not fall back to session-20250101-abcdef)", latest)
+	}
+}
+
+// TestGetLatestSessionForDir_MatchesViaSymlinkIdentity covers directory
+// identity matching: the session records the real directory while the lookup
+// goes through a symlink to it. The lexical fast path misses, but os.SameFile
+// must still match. A lookup directory that exists nowhere must return
+// (nil, nil) without an error, and a recorded directory that has since been
+// deleted must still match through the lexical fast path.
+func TestGetLatestSessionForDir_MatchesViaSymlinkIdentity(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { SessionDir = oldSessionDir })
+
+	realDir := filepath.Join(tmpDir, "real-project")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("creating real-project: %v", err)
+	}
+	linkDir := filepath.Join(tmpDir, "linked-project")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-100000", realDir)); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+
+	latest, err := GetLatestSessionForDir(linkDir)
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(%s): %v", linkDir, err)
+	}
+	if latest == nil || latest.ID != "session-20250101-100000" {
+		t.Fatalf("GetLatestSessionForDir(%s) = %v, want session-20250101-100000 found through the symlink via os.SameFile", linkDir, latest)
+	}
+
+	// A directory that exists nowhere: no error, no match.
+	missing := filepath.Join(tmpDir, "does-not-exist")
+	latest, err = GetLatestSessionForDir(missing)
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(%s): %v", missing, err)
+	}
+	if latest != nil {
+		t.Fatalf("GetLatestSessionForDir(%s) = %+v, want nil for a missing directory", missing, latest)
+	}
+
+	// A recorded project directory that has since been deleted must still be
+	// matched lexically (identity cannot be checked on a missing directory).
+	gone := filepath.Join(tmpDir, "gone-project")
+	if err := os.Mkdir(gone, 0700); err != nil {
+		t.Fatalf("creating gone-project: %v", err)
+	}
+	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250102-100000", gone)); err != nil {
+		t.Fatalf("Failed to save meta: %v", err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatalf("removing gone-project: %v", err)
+	}
+
+	latest, err = GetLatestSessionForDir(gone)
+	if err != nil {
+		t.Fatalf("GetLatestSessionForDir(%s): %v", gone, err)
+	}
+	if latest == nil || latest.ID != "session-20250102-100000" {
+		t.Fatalf("GetLatestSessionForDir(%s) = %v, want session-20250102-100000 matched lexically despite the directory being gone", gone, latest)
 	}
 }
