@@ -323,7 +323,8 @@ func (t ShellTool) Parameters() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"command": { "type": "string", "description": "The full %s command to execute." },
-			"cwd": { "type": "string", "description": "Working directory for execution. Use this instead of 'cd' commands to change directories." }
+			"cwd": { "type": "string", "description": "Working directory for execution. Use this instead of 'cd' commands to change directories." },
+			"otp_code": { "type": "string", "description": "One-time code required to re-run a command that was blocked by the -force-revaluate-dangerous-commands re-evaluation gate. Re-run the exact same command passing the issued OTP code here; codes are single-use and bound to the exact command string." }
 		},
 		"required": ["command"]
 	}`, shellDisplayName()))
@@ -411,7 +412,7 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if orchestratorID := common.GetOrchestratorID(ctx); strings.Contains(strings.ToLower(orchestratorID), "coder") {
 			sandwich = "\n\n=========================================\nSYSTEM DIRECTIVE:\nYou just encountered an error. If fixing this requires modifying components or architecture you were not explicitly instructed to edit, YOU MUST ABORT AND RETURN TO THE MAIN AGENT.\n========================================="
 		}
-		
+
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return fmt.Sprintf("Command failed with exit code %d\n%s%s", exitErr.ExitCode(), finalOutput, sandwich), nil
 		}

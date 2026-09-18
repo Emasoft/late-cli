@@ -112,6 +112,7 @@ const (
 	OrchestratorIDKey   contextKey = "orchestrator_id"
 	SkipConfirmationKey contextKey = "skip_confirmation"
 	ToolApprovalKey     contextKey = "tool_approval"
+	ForceRevaluateKey   contextKey = "force_revaluate"
 )
 
 // MainAgentID is the orchestrator ID of the root/main agent.
