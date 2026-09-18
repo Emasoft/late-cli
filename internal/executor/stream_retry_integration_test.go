@@ -468,6 +468,146 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 	}
 }
 
+// TestRunLoopRetriesMidStreamTransportAbort proves the typed mid-stream
+// transport failure is retried end-to-end: a 200 whose body dies partway
+// surfaces from the client as *client.StreamInterruptedError,
+// classifyStreamError maps it to the infrastructure tier, and RunLoop draws
+// two infra retries before a complete stream succeeds. Unlike
+// TestRunLoopMidBodyDisconnectRetries there is no silent-truncation escape
+// hatch: the truncated body ends with an unterminated partial line (no SSE
+// trailing blank line), so the disconnect can never read as a clean
+// end-of-stream and the retry events are asserted unconditionally.
+func TestRunLoopRetriesMidStreamTransportAbort(t *testing.T) {
+	// Declared before newRetryServer so the handler can branch on the
+	// 1-based POST count (the closure only runs once the server is up).
+	var rs *retryServer
+	rs = newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// The wrapper counts the POST before handlePost runs, so
+		// posts.Load() here is the 1-based number of the current request.
+		if rs.posts.Load() > 2 {
+			// Third attempt onward: complete SSE stream.
+			serveOK(w)
+			return
+		}
+		// Attempts 1 and 2: a valid 200 whose body is truncated mid-stream.
+		// Hijack the connection, declare a Content-Length larger than the
+		// bytes actually sent, write one complete SSE data line, then an
+		// unterminated partial line WITHOUT the trailing blank line, then FIN
+		// without the remaining body. The unterminated tail makes the client's
+		// bufio.Scanner read again (ScanLines would otherwise only emit a
+		// final token at EOF), where net/http surfaces the short body as
+		// io.ErrUnexpectedEOF, which the client wraps into
+		// *client.StreamInterruptedError (verified against this Go version; an
+		// RST-style close would surface *net.OpError instead and is
+		// deliberately avoided).
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("server ResponseWriter does not support Hijack")
+			serveStatus(w, http.StatusInternalServerError, "hijack unsupported")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack failed: %v", err)
+			serveStatus(w, http.StatusInternalServerError, "hijack failed")
+			return
+		}
+		defer conn.Close()
+
+		head := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\n\r\n"
+		complete := "data: " + `{"choices":[{"index":0,"delta":{"content":"par"}}]}` + "\n"
+		partial := "data: " + `{"choices":[{"index":0,"delta":{"content":"ti"}}` // no trailing newline
+		if _, err := conn.Write([]byte(head)); err != nil {
+			t.Errorf("writing truncated response head: %v", err)
+			return
+		}
+		if _, err := conn.Write([]byte(complete)); err != nil {
+			t.Errorf("writing truncated response body: %v", err)
+			return
+		}
+		if _, err := conn.Write([]byte(partial)); err != nil {
+			t.Errorf("writing unterminated partial line: %v", err)
+			return
+		}
+		// FIN: the client sees EOF before the declared Content-Length.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRetry, retryEvents := retryCollector(t)
+
+	ctx, cancel := runLoopCtx(3, 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("RunLoop returned error after two mid-stream aborts: %v", err)
+	}
+	if !strings.Contains(res, "ok") {
+		t.Errorf("RunLoop result = %q, want it to contain %q", res, "ok")
+	}
+	// Worst-case jitter for two backoffs is 500ms + 1s; a generous bound like
+	// the sibling tests (counts are pinned, never exact timings).
+	if elapsed > 10*time.Second {
+		t.Errorf("RunLoop took %v with two mid-stream retries, want well under that", elapsed)
+	}
+
+	// One retry event per aborted attempt: exactly 2, attempts 1 and 2, drawn
+	// from the infrastructure budget (MaxAttempts = the ctx budget of 3).
+	events := retryEvents()
+	if len(events) != 2 {
+		t.Fatalf("got %d RetryEvents, want exactly 2 (one per aborted attempt): %+v", len(events), events)
+	}
+	for i, ev := range events {
+		if want := i + 1; ev.Attempt != want {
+			t.Errorf("events[%d].Attempt = %d, want %d", i, ev.Attempt, want)
+		}
+		if ev.MaxAttempts != 3 {
+			t.Errorf("events[%d].MaxAttempts = %d, want 3 (ctx infra budget)", i, ev.MaxAttempts)
+		}
+		if ev.Delay <= 0 {
+			t.Errorf("events[%d].Delay = %v, want > 0", i, ev.Delay)
+		}
+		if ev.Err == nil {
+			t.Errorf("events[%d].Err is nil, want the mid-stream abort error", i)
+			continue
+		}
+		// Core assertion: the client's typed mid-stream error is produced AND
+		// retried end-to-end through RunLoop.
+		var sie *client.StreamInterruptedError
+		if !errors.As(ev.Err, &sie) {
+			t.Errorf("events[%d].Err = %v (%T), want errors.As to match *client.StreamInterruptedError", i, ev.Err, ev.Err)
+			continue
+		}
+		if !errors.Is(ev.Err, io.ErrUnexpectedEOF) {
+			t.Errorf("events[%d].Err = %v, want it to wrap io.ErrUnexpectedEOF", i, ev.Err)
+		}
+	}
+
+	// Two aborted attempts + one successful retry.
+	if got := rs.postCount(); got != 3 {
+		t.Errorf("server got %d POSTs, want 3 (2 aborted attempts + successful retry)", got)
+	}
+
+	// Failed attempts commit nothing; only the successful turn appends its
+	// assistant message to the seeded history.
+	if len(sess.History) != 2 {
+		t.Fatalf("history length = %d, want 2 (seeded user msg + committed assistant msg)", len(sess.History))
+	}
+	last := sess.History[len(sess.History)-1]
+	if last.Role != "assistant" {
+		t.Errorf("last history role = %q, want assistant", last.Role)
+	}
+	if last.Content.String() != "ok" {
+		t.Errorf("last history content = %q, want %q", last.Content.String(), "ok")
+	}
+}
+
 // --- HTTP 400 bad-body retry tier ---
 //
 // RunLoop tiers inner-loop failures into two independent retry budgets:

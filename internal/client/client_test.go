@@ -3,7 +3,10 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -460,5 +463,136 @@ func TestChatCompletionStream_ContextCancellation(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("error channel not closed after context cancellation")
+	}
+}
+
+func TestStreamInterruptedError(t *testing.T) {
+	sie := &StreamInterruptedError{Err: errors.New("boom")}
+	if got := sie.Error(); got != "stream interrupted: boom" {
+		t.Errorf("Error() = %q, want %q", got, "stream interrupted: boom")
+	}
+
+	// Unwrap keeps errors.Is working through the chain.
+	outer := fmt.Errorf("outer: %w", &StreamInterruptedError{Err: io.ErrUnexpectedEOF})
+	if !errors.Is(outer, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(%v, io.ErrUnexpectedEOF) = false, want true", outer)
+	}
+
+	// errors.As finds the type through a double wrap.
+	double := fmt.Errorf("level1: %w", fmt.Errorf("level2: %w", &StreamInterruptedError{Err: io.ErrUnexpectedEOF}))
+	var found *StreamInterruptedError
+	if !errors.As(double, &found) {
+		t.Fatalf("errors.As(%v, *StreamInterruptedError) = false, want true", double)
+	}
+	if !errors.Is(found.Err, io.ErrUnexpectedEOF) {
+		t.Errorf("found.Err = %v, want io.ErrUnexpectedEOF", found.Err)
+	}
+}
+
+// TestChatCompletionStream_MidBodyDisconnectErrorType proves the typed error
+// is produced end-to-end: a 200 whose body is truncated mid-stream must reach
+// the error channel as a *StreamInterruptedError wrapping the transport cause.
+// It mirrors the hijack pattern of the executor's
+// TestRunLoopMidBodyDisconnectRetries.
+func TestChatCompletionStream_MidBodyDisconnectErrorType(t *testing.T) {
+	st := newStreamTest(t)
+	defer st.Close()
+
+	st.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// DiscoverBackend probes /props and /v1/models before the POST; keep
+		// those on the plain handler so only the stream request is hijacked.
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("server ResponseWriter does not support Hijack")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// A valid 200 whose declared Content-Length exceeds the bytes sent:
+		// one complete SSE data line, then a partial line with no newline
+		// terminator, then FIN. The unterminated line forces the scanner to
+		// read again, where net/http surfaces the short body as
+		// io.ErrUnexpectedEOF (verified against this Go version; an RST-style
+		// close would surface *net.OpError instead and is deliberately
+		// avoided). The trailing empty line of a normal SSE frame is
+		// deliberately omitted: the loop treats an empty data line as a clean
+		// end-of-stream and would miss the transport error entirely.
+		head := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\n\r\n"
+		complete := "data: " + sampleChunkHello + "\n"
+		partial := "data: " + sampleChunkWorld // no trailing newline
+		if _, err := conn.Write([]byte(head)); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte(complete)); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte(partial)); err != nil {
+			return
+		}
+		// FIN: the client hits EOF before the declared Content-Length.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
+	}))
+
+	outCh, errCh := st.client.ChatCompletionStream(context.Background(), defaultRequest())
+
+	// Drain chunks concurrently. ScanLines emits an unterminated tail as a
+	// final token at EOF, so the partial line surfaces as one more chunk and
+	// the stream goroutine would block forever on the unbuffered out channel
+	// if the test read chunks synchronously.
+	var chunks []ChatCompletionChunk
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for chunk := range outCh {
+			chunks = append(chunks, chunk)
+		}
+	}()
+
+	// The mid-body transport failure must surface on errCh.
+	var streamErr error
+	select {
+	case streamErr = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the stream error on errCh")
+	}
+
+	// outCh closes right after the error is sent.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("chunk channel did not close after the stream error")
+	}
+
+	// The complete data line must have been delivered before the disconnect.
+	if len(chunks) == 0 {
+		t.Fatal("no chunks delivered before the disconnect, want at least the complete data line")
+	}
+	if got := chunks[0].Choices[0].Delta.Content.String(); got != "Hello" {
+		t.Errorf("first chunk content = %q, want %q", got, "Hello")
+	}
+
+	var sie *StreamInterruptedError
+	if !errors.As(streamErr, &sie) {
+		t.Fatalf("error = %v (%T), want errors.As to match *StreamInterruptedError", streamErr, streamErr)
+	}
+	if !errors.Is(streamErr, io.ErrUnexpectedEOF) {
+		t.Errorf("error = %v, want it to wrap io.ErrUnexpectedEOF", streamErr)
+	}
+	// The rendered message must stay byte-identical to the previous
+	// fmt.Errorf("stream interrupted: %w", err).
+	if got, want := streamErr.Error(), "stream interrupted: unexpected EOF"; got != want {
+		t.Errorf("error message = %q, want %q", got, want)
 	}
 }

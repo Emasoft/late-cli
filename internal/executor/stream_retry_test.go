@@ -362,6 +362,24 @@ func TestClassifyStreamError(t *testing.T) {
 			want: retryClassInfra,
 		},
 
+		// Infrastructure: mid-stream transport failures after a 200 — the
+		// client surfaces these as *client.StreamInterruptedError.
+		{
+			name: "wrapped mid-stream http2 RST_STREAM is infra-retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")}),
+			want: retryClassInfra,
+		},
+		{
+			name: "mid-stream wrapper carrying cancellation is not retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: context.Canceled}),
+			want: retryClassNone,
+		},
+		{
+			name: "wrapped mid-stream truncated body is infra-retryable",
+			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: io.ErrUnexpectedEOF}),
+			want: retryClassInfra,
+		},
+
 		// None: anything unknown fails fast, like pre-retry behavior.
 		{
 			name: "nil is none",

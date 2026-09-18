@@ -77,10 +77,13 @@ func streamRetryDelay(attempt int) time.Duration {
 // classifyStreamError buckets a failed LLM stream attempt into a retry tier.
 // retryClassInfra covers infrastructure-style failures that draw from the
 // main retry budget: network-level errors (timeouts, refused/reset
-// connections, mid-body disconnects) and transient server responses
-// (408/429/5xx). retryClassBadBody isolates HTTP 400 body-parse rejections,
-// frequently transient on strict OpenAI-compatible gateways, into their own
-// tier. Everything else — context cancellation, permanent client errors
+// connections, mid-body disconnects), mid-stream transport failures surfaced
+// as *client.StreamInterruptedError (HTTP/2 RST_STREAM, GOAWAY, connection
+// resets, truncated bodies — the request was accepted with 200 and the body
+// then died), and transient server responses (408/429/5xx).
+// retryClassBadBody isolates HTTP 400 body-parse rejections, frequently
+// transient on strict OpenAI-compatible gateways, into their own tier.
+// Everything else — context cancellation, permanent client errors
 // (401/403/404), and unknown errors — maps to retryClassNone and fails fast,
 // exactly like the pre-retry behavior.
 func classifyStreamError(err error) streamRetryClass {
@@ -99,6 +102,15 @@ func classifyStreamError(err error) streamRetryClass {
 		return retryClassInfra
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return retryClassInfra
+	}
+	// Mid-stream transport failures: the server accepted the request (200)
+	// and the body died — HTTP/2 RST_STREAM ("stream error: stream ID N;
+	// INTERNAL_ERROR"), GOAWAY, connection resets, truncated bodies. These
+	// are always infrastructure-tier: the attempt commits nothing and a
+	// fresh stream is a clean retry.
+	var sie *client.StreamInterruptedError
+	if errors.As(err, &sie) {
 		return retryClassInfra
 	}
 	var se *client.StatusError

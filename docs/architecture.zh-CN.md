@@ -124,6 +124,7 @@ Late 将规划与执行分离：**主编排器（Lead Orchestrator）**仅保留
 Late 将每次 LLM 流式调用包裹在两个相互独立的重试层级中，各自拥有独立的预算和计数器：
 
 - **基础设施层（Infrastructure tier）：** 覆盖传输类错误（连接被拒绝/重置、超时、响应体中途断开）以及 HTTP 408/429/5xx。预算通过 `-max-stream-retries` / `LATE_MAX_STREAM_RETRIES` 控制（默认 100）。
+- **流式中断：** 响应体中途的传输故障发生在服务器已经接受请求（HTTP 200）之后——包括 HTTP/2 RST_STREAM / INTERNAL_ERROR（典型报错文本：`stream error: stream ID N; INTERNAL_ERROR; received from peer`）、GOAWAY、连接重置以及响应体被截断——因此客户端会将其包装为类型化的 `StreamInterruptedError`，并始终从基础设施层预算中进行重试。
 - **无效请求体层（Bad-body tier）：** 仅覆盖 HTTP 400，使用一个专用的小预算（3 次，常量 `DefaultMaxBadBodyRetries`；暂不支持通过命令行标志配置）。严格的 OpenAI 兼容网关（如 z.ai/GLM）在读取请求体时经常发生瞬时故障（"read body failed"），少量快速重试即可解决；而真正格式错误的请求仍会在这一小额有界预算耗尽后终止。
 - **退避（Backoff）：** 指数退避——以 500 ms 为基数逐次翻倍，上限 30 s，并叠加完全抖动（full jitter，在 `[0, cap]` 区间内均匀取值）。
 - **计数器相互独立：** 400 的重试不会消耗基础设施层的预算，反之亦然。

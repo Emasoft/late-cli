@@ -229,7 +229,7 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 		// or an empty data line, check for read errors and propagate them.
 		if err := scanner.Err(); err != nil {
 			select {
-			case errCh <- fmt.Errorf("stream interrupted: %w", err):
+			case errCh <- &StreamInterruptedError{Err: err}:
 			default:
 			}
 		}
@@ -636,6 +636,20 @@ func (e *StatusError) Error() string {
 	}
 	return fmt.Sprintf("status: %d", e.StatusCode)
 }
+
+// StreamInterruptedError reports a transport failure while reading a
+// 200-OK response body mid-stream: connection reset, HTTP/2 RST_STREAM
+// or GOAWAY, truncated body. The server already accepted the request,
+// so the failure is infrastructure, not the request's content.
+type StreamInterruptedError struct {
+	Err error // underlying transport error (e.g. http2 StreamError)
+}
+
+func (e *StreamInterruptedError) Error() string {
+	return fmt.Sprintf("stream interrupted: %v", e.Err)
+}
+
+func (e *StreamInterruptedError) Unwrap() error { return e.Err }
 
 func (c *Client) formatError(resp *http.Response) error {
 	se := &StatusError{
