@@ -1490,9 +1490,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 
 	case OrchestratorEventMsg:
 		s := m.GetAgentState(msg.Event.OrchestratorID())
-		// restoredToast delivers the "connection restored" toast through the
-		// existing ToastMsg handler when a retrying agent becomes productive
-		// again; it is returned after the event switch below.
+		// restoredToast delivers the recovery toast through the existing
+		// ToastMsg handler when a retrying agent becomes productive again;
+		// it is returned after the event switch below.
 		var restoredToast tea.Cmd
 
 		switch event := msg.Event.(type) {
@@ -1539,13 +1539,19 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				// The agent is productive again: clear any error box pinned
 				// by a previous failure. If we had been retrying, toast the
 				// recovery via the existing ToastMsg handler (3s expiry).
+				// The toast matches the recorded failure class: an HTTP 400
+				// was the API rejecting the request, not a lost connection.
 				if s.Error != nil {
 					s.Error = nil
 				}
-				if s.WasRetrying {
-					s.WasRetrying = false
+				if s.RetryVerb != "" {
+					toastText := "connection restored"
+					if s.RetryVerb == retryVerbRejectedByAPI {
+						toastText = "request accepted after retry"
+					}
+					s.RetryVerb = ""
 					restoredToast = func() tea.Msg {
-						return ToastMsg{Text: "connection restored"}
+						return ToastMsg{Text: toastText}
 					}
 				}
 				s.StatusText = "Working..."
@@ -1597,17 +1603,17 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.State = StateThinking
 			// The failure class decides the verb: an HTTP 400 is the API
 			// rejecting the request body, not a lost connection.
-			retryVerb := "connection lost"
+			retryVerb := retryVerbConnectionLost
 			var retryStatusErr *client.StatusError
 			if errors.As(event.Err, &retryStatusErr) && retryStatusErr.StatusCode == http.StatusBadRequest {
-				retryVerb = "request rejected by the API"
+				retryVerb = retryVerbRejectedByAPI
 			}
 			s.StatusText = fmt.Sprintf("%s — retrying in %s (attempt %d/%d)", retryVerb, event.Delay.Truncate(100*time.Millisecond), event.Attempt, event.MaxAttempts)
 			s.StreamingState = common.ContentEvent{ID: event.ID}
 			// Clear streaming render cache for the failed attempt
 			s.StreamingStyledCache = ""
 			s.StreamingChunkCount = 0
-			s.WasRetrying = true
+			s.RetryVerb = retryVerb
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}

@@ -273,6 +273,14 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			}
 		},
 		func(ev common.RetryEvent) {
+			// The retry starts a fresh stream; reset the shared accumulator so
+			// the failed attempt's partial deltas do not prefix the retry's
+			// output in the TUI (the executor's local accumulator is already
+			// per-attempt; this one is per-turn).
+			o.mu.Lock()
+			o.acc.Reset()
+			o.mu.Unlock()
+
 			ev.ID = o.id // Route to this agent's AppState even if ctx lost the ID
 			// Non-blocking emit: a slow or stalled TUI must never delay the
 			// retry backoff loop. The buffered(100) eventCh may be full if the
@@ -367,6 +375,14 @@ func (o *BaseOrchestrator) run() {
 				}
 			},
 			func(ev common.RetryEvent) {
+				// The retry starts a fresh stream; reset the shared accumulator
+				// so the failed attempt's partial deltas do not prefix the
+				// retry's output in the TUI (the executor's local accumulator
+				// is already per-attempt; this one is per-turn).
+				o.mu.Lock()
+				o.acc.Reset()
+				o.mu.Unlock()
+
 				ev.ID = o.id // Route to this agent's AppState even if ctx lost the ID
 				// Non-blocking emit: a slow or stalled TUI must never delay the
 				// retry backoff loop. The buffered(100) eventCh may be full if
@@ -423,8 +439,17 @@ func (o *BaseOrchestrator) run() {
 				// the image rollback above, this must survive a restart).
 				var se *client.StatusError
 				if errors.As(err, &se) {
-					_ = o.sess.PopLastUserMessage()
-					o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("API rejected the request (400) after retries: %s — your last message was rolled back; edit it and resend", se.Body)}
+					rolled, saveErr := o.sess.PopLastUserMessage()
+					msg := fmt.Sprintf("API rejected the request (400) after retries: %s — ", se.Body)
+					switch {
+					case rolled && saveErr == nil:
+						msg += "your last message was rolled back; edit it and resend"
+					case rolled:
+						msg += "your last message was rolled back in memory, but saving the rollback to disk failed"
+					default:
+						msg += "nothing was rolled back (the turn had no unanswered user message); use /rewind if history needs repair"
+					}
+					o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: errors.New(msg)}
 				}
 			} else {
 				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}

@@ -62,12 +62,28 @@ func writeHelp(w io.Writer, src *flag.FlagSet) {
 	fmt.Fprintln(w, "🌟 Enjoying Late? Consider leaving a star on GitHub: https://github.com/mlhher/late-cli")
 }
 
+// registerDisplayFlag registers src's flag f on the display-only FlagSet dfs
+// used for help rendering. It keeps the display flag sharing f's real
+// registered Value — PrintDefaults derives value names ("string", "int", …)
+// and zero-value checks from the Value's concrete type — but restores
+// DefValue from src: Var snapshots Value.String() at registration time, which
+// would advertise a value the caller mutated before -h (e.g.
+// `late -show-cwd=false -h`) instead of the flag's true default. DefValue is
+// captured once at registration and is never changed by parsing, so src is
+// the single source of truth for what -h must advertise.
+func registerDisplayFlag(dfs *flag.FlagSet, f *flag.Flag) {
+	dfs.Var(f.Value, f.Name, f.Usage)
+	dfs.Lookup(f.Name).DefValue = f.DefValue
+}
+
 // writeGroupedFlags renders src's flags grouped by scope, in flagGroups
 // order, reusing the flag package's PrintDefaults formatting per group, and
 // appends each group's note (when non-empty) right after its flag block.
 // Each group is rendered through a display-only FlagSet sharing the real
-// registered flag Values, so defaults and value names stay correct and
-// single-sourced with the registrations in main().
+// registered flag Values, so value names stay correct and single-sourced with
+// the registrations in main(); defaults are restored from src's DefValue by
+// registerDisplayFlag, so they stay true even when flags were parsed before
+// -h.
 func writeGroupedFlags(w io.Writer, src *flag.FlagSet) {
 	listed := make(map[string]bool)
 	for _, g := range flagGroups {
@@ -79,7 +95,7 @@ func writeGroupedFlags(w io.Writer, src *flag.FlagSet) {
 			if f == nil {
 				continue
 			}
-			gfs.Var(f.Value, f.Name, f.Usage)
+			registerDisplayFlag(gfs, f)
 			listed[name] = true
 			count++
 		}
@@ -104,7 +120,7 @@ func writeGroupedFlags(w io.Writer, src *flag.FlagSet) {
 		ofs.SetOutput(w)
 		for _, name := range others {
 			f := src.Lookup(name)
-			ofs.Var(f.Value, f.Name, f.Usage)
+			registerDisplayFlag(ofs, f)
 		}
 		fmt.Fprintln(w, "Other:")
 		ofs.PrintDefaults()

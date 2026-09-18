@@ -30,8 +30,12 @@ func TestPopLastUserMessage(t *testing.T) {
 			t.Fatalf("AddUserMessage returned error: %v", err)
 		}
 
-		if err := s.PopLastUserMessage(); err != nil {
+		rolled, err := s.PopLastUserMessage()
+		if err != nil {
 			t.Fatalf("PopLastUserMessage returned error: %v", err)
+		}
+		if !rolled {
+			t.Errorf("PopLastUserMessage reported rolled=false, want true")
 		}
 
 		// In-memory rollback: the assistant reply is now the tail.
@@ -75,8 +79,12 @@ func TestPopLastUserMessage(t *testing.T) {
 			t.Fatalf("reading persisted history before pop: %v", err)
 		}
 
-		if err := s.PopLastUserMessage(); err != nil {
+		rolled, err := s.PopLastUserMessage()
+		if err != nil {
 			t.Fatalf("PopLastUserMessage returned error: %v", err)
+		}
+		if rolled {
+			t.Errorf("PopLastUserMessage reported rolled=true, want false (tail is not a user message)")
 		}
 
 		if len(s.History) != 2 {
@@ -100,14 +108,84 @@ func TestPopLastUserMessage(t *testing.T) {
 		historyPath := filepath.Join(tmpDir, "session-pop-empty.json")
 		s := New(nil, historyPath, nil, "sp", true)
 
-		if err := s.PopLastUserMessage(); err != nil {
+		rolled, err := s.PopLastUserMessage()
+		if err != nil {
 			t.Fatalf("PopLastUserMessage returned error: %v", err)
+		}
+		if rolled {
+			t.Errorf("PopLastUserMessage reported rolled=true, want false on empty history")
 		}
 		if len(s.History) != 0 {
 			t.Errorf("len(s.History) = %d, want 0", len(s.History))
 		}
 		if _, err := os.Stat(historyPath); !os.IsNotExist(err) {
 			t.Errorf("expected no history file to be created, stat err=%v", err)
+		}
+	})
+
+	// The PR's motivating scenario: a terminal 400 on the FIRST turn of a
+	// session. saveAndNotify() skips persistence for empty history (its
+	// empty-guard exists so fresh sessions don't create files), so popping
+	// the only message must remove the stale history file instead —
+	// otherwise --continue would resurrect the rejected turn.
+	t.Run("pop to empty with existing file removes stale history and keeps sidecar", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		oldSessionDir := SessionDir
+		SessionDir = func() (string, error) { return tmpDir, nil }
+		t.Cleanup(func() { SessionDir = oldSessionDir })
+
+		historyPath := filepath.Join(tmpDir, "session-pop-empty-file.json")
+		s := New(nil, historyPath, nil, "sp", true)
+		if err := s.AddUserMessage("first and only"); err != nil {
+			t.Fatalf("AddUserMessage returned error: %v", err)
+		}
+
+		// Precondition: the single user message was persisted with its sidecar.
+		if _, err := os.Stat(historyPath); err != nil {
+			t.Fatalf("history file missing before pop: %v", err)
+		}
+		metaPath := filepath.Join(tmpDir, "session-pop-empty-file.meta.json")
+		if _, err := os.Stat(metaPath); err != nil {
+			t.Fatalf("meta sidecar missing before pop: %v", err)
+		}
+
+		rolled, err := s.PopLastUserMessage()
+		if err != nil {
+			t.Fatalf("PopLastUserMessage returned error: %v", err)
+		}
+		if !rolled {
+			t.Errorf("PopLastUserMessage reported rolled=false, want true")
+		}
+
+		// In-memory rollback.
+		if len(s.History) != 0 {
+			t.Errorf("len(s.History) = %d, want 0", len(s.History))
+		}
+
+		// The stale history file must be gone: reloading from disk yields no
+		// messages, so the rejected turn cannot resurrect via --continue.
+		loaded, err := LoadHistory(historyPath)
+		if err != nil {
+			t.Fatalf("LoadHistory returned error: %v", err)
+		}
+		if len(loaded) != 0 {
+			t.Errorf("reloaded history has %d messages, want 0 (rejected message resurrected)", len(loaded))
+		}
+
+		// The sidecar is kept so --continue scoping still finds the session,
+		// with message_count refreshed to the current (empty) count.
+		if _, err := os.Stat(metaPath); err != nil {
+			t.Errorf("meta sidecar missing after pop: %v", err)
+		}
+		meta, err := LoadSessionMeta("session-pop-empty-file")
+		if err != nil {
+			t.Fatalf("LoadSessionMeta returned error: %v", err)
+		}
+		if meta == nil {
+			t.Fatalf("LoadSessionMeta found no sidecar for session-pop-empty-file")
+		}
+		if meta.MessageCount != 0 {
+			t.Errorf("meta.MessageCount = %d, want 0", meta.MessageCount)
 		}
 	})
 }

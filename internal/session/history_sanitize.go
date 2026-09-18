@@ -12,7 +12,10 @@ const interruptedToolResultText = "(tool execution was interrupted; no result wa
 // SanitizeForRequest returns a request-safe copy of msgs for strict
 // OpenAI-compatible endpoints: every assistant message carrying tool_calls is
 // closed by one tool result per tool_call_id, synthesizing an interrupted-
-// result placeholder when history is missing one. It never mutates the input.
+// result placeholder when history is missing one, and tool calls with an
+// empty ID are stripped from the outgoing copy (strict endpoints reject
+// ID-less tool calls, and no result can ever correlate to one). It never
+// mutates the input.
 func SanitizeForRequest(msgs []client.ChatMessage) []client.ChatMessage {
 	if len(msgs) == 0 {
 		return msgs
@@ -46,12 +49,28 @@ func SanitizeForRequest(msgs []client.ChatMessage) []client.ChatMessage {
 			// A new assistant turn implicitly ends the previous tool group
 			// for strict servers: close it before appending this message.
 			closePending()
+			if len(m.ToolCalls) > 0 {
+				// Strict OpenAI-compatible endpoints reject tool calls with an
+				// empty ID, and no tool result can ever correlate to one (tool
+				// results match by ID, and an empty-ID result is already
+				// dropped as an orphan below), so strip them from the outgoing
+				// copy only. The filtered slice is freshly allocated: reusing
+				// m.ToolCalls' backing array would mutate the input. If every
+				// call had an empty ID the message is sent as a plain
+				// assistant turn; its Content and ReasoningContent are kept.
+				filtered := make([]client.ToolCall, 0, len(m.ToolCalls))
+				for _, tc := range m.ToolCalls {
+					if tc.ID != "" {
+						filtered = append(filtered, tc)
+					}
+				}
+				if len(filtered) == 0 {
+					filtered = nil
+				}
+				m.ToolCalls = filtered
+			}
 			sanitized = append(sanitized, m)
 			for _, tc := range m.ToolCalls {
-				if tc.ID == "" {
-					// Empty IDs cannot be matched by a tool result; skip them.
-					continue
-				}
 				if _, ok := pendingSet[tc.ID]; ok {
 					continue
 				}

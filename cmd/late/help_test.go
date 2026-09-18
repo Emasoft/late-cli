@@ -93,6 +93,74 @@ func TestWriteGroupedFlagsCoversAllGroupedFlagsOnce(t *testing.T) {
 	}
 }
 
+// TestWriteGroupedFlagsShowsTrueDefaultsWhenMutated guards the grouped-help
+// default rendering: flag values mutated before -h (e.g. `late
+// -show-cwd=false -h`) must not change what the help advertises. Defaults are
+// rendered from the DefValue captured at registration in the source FlagSet —
+// which parsing never touches — so a render after mutation must be
+// byte-identical to an unmutated render of the same flags.
+func TestWriteGroupedFlagsShowsTrueDefaultsWhenMutated(t *testing.T) {
+	newTestFlagSet := func() *flag.FlagSet {
+		fs := newHelpTestFlagSet(t)
+		// Extra ungrouped flag so the Other: section is exercised too.
+		fs.String("zzz-future-flag", "", "usage of zzz-future-flag")
+		return fs
+	}
+
+	var baseline bytes.Buffer
+	writeGroupedFlags(&baseline, newTestFlagSet())
+
+	// Mirror production order: values are parsed (mutated) before -h renders.
+	fs := newTestFlagSet()
+	for _, m := range []struct{ name, value string }{
+		{"use-tools", "false"},       // test default true
+		{"show-cwd", "true"},         // test default false
+		{"subagent-max-turns", "1"},  // test default 500
+		{"theme", "gruvbox"},         // test default ""
+		{"zzz-future-flag", "later"}, // renders under Other:
+	} {
+		if err := fs.Set(m.name, m.value); err != nil {
+			t.Fatalf("Set(%s, %s): %v", m.name, m.value, err)
+		}
+	}
+
+	var mutated bytes.Buffer
+	writeGroupedFlags(&mutated, fs)
+
+	if got, want := mutated.String(), baseline.String(); got != want {
+		t.Fatalf("help rendered after mutating flag values must equal the unmutated render\n--- mutated ---\n%s\n--- unmutated ---\n%s", got, want)
+	}
+
+	out := mutated.String()
+	// True non-zero defaults must survive the mutation; usage strings are
+	// "usage of <name>", so each pattern matches exactly one flag's line.
+	for _, want := range []string{
+		"\tusage of use-tools (default true)\n",
+		"\tusage of subagent-max-turns (default 500)\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mutated render missing %q:\n%s", want, out)
+		}
+	}
+	// Flags whose true default is the zero value must still render none.
+	for _, want := range []string{
+		"\tusage of show-cwd\n",
+		"\tusage of theme\n",
+		"\tusage of zzz-future-flag\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mutated render missing %q:\n%s", want, out)
+		}
+	}
+	// Parsed values must not leak in as advertised defaults ("(default 1)"
+	// cannot false-match "(default 100)" because of the closing paren).
+	for _, banned := range []string{"(default \"gruvbox\")", "(default \"later\")", "(default 1)"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("mutated render advertises a parsed value as a default (%s):\n%s", banned, out)
+		}
+	}
+}
+
 func TestWriteGroupedFlagsUncategorizedFallToOther(t *testing.T) {
 	fs := newHelpTestFlagSet(t)
 	fs.String("zzz-future-flag", "", "a flag added later and not yet grouped")

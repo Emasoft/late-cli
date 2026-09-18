@@ -133,12 +133,32 @@ func TestSanitizeForRequest(t *testing.T) {
 			want:  nil,
 		},
 		{
-			name: "assistant tool_calls with empty IDs are kept without placeholders",
+			name: "assistant with only empty-ID tool_calls is sent without tool_calls, content preserved",
 			input: []client.ChatMessage{
-				assistantWithCalls(toolCall("", "read_file")),
+				{
+					Role:             "assistant",
+					Content:          client.TextContent("let me look that up"),
+					ReasoningContent: "reasoning about the request",
+					ToolCalls:        []client.ToolCall{toolCall("", "read_file")},
+				},
 			},
 			want: []client.ChatMessage{
-				assistantWithCalls(toolCall("", "read_file")),
+				{
+					Role:             "assistant",
+					Content:          client.TextContent("let me look that up"),
+					ReasoningContent: "reasoning about the request",
+				},
+			},
+		},
+		{
+			name: "assistant with one empty-ID and one real tool_call keeps only the real call and its result",
+			input: []client.ChatMessage{
+				assistantWithCalls(toolCall("", "read_file"), toolCall("call_1", "list_dir")),
+				toolResult("call_1", "main.go\nutils.go"),
+			},
+			want: []client.ChatMessage{
+				assistantWithCalls(toolCall("call_1", "list_dir")),
+				toolResult("call_1", "main.go\nutils.go"),
 			},
 		},
 		{

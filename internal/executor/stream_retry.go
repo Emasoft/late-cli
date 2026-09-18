@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -81,6 +82,10 @@ func streamRetryDelay(attempt int) time.Duration {
 // as *client.StreamInterruptedError (HTTP/2 RST_STREAM, GOAWAY, connection
 // resets, truncated bodies — the request was accepted with 200 and the body
 // then died), and transient server responses (408/429/5xx).
+// The one exception inside *client.StreamInterruptedError is
+// bufio.ErrTooLong (the SSE line exceeds the client's scanner cap): that
+// failure is deterministic — retrying cannot shrink the line — so it maps to
+// retryClassNone and fails fast instead of burning the whole infra budget.
 // retryClassBadBody isolates HTTP 400 body-parse rejections, frequently
 // transient on strict OpenAI-compatible gateways, into their own tier.
 // Everything else — context cancellation, permanent client errors
@@ -111,6 +116,12 @@ func classifyStreamError(err error) streamRetryClass {
 	// fresh stream is a clean retry.
 	var sie *client.StreamInterruptedError
 	if errors.As(err, &sie) {
+		if errors.Is(sie.Err, bufio.ErrTooLong) {
+			// Deterministic: the SSE line exceeds the client's scanner cap.
+			// Retrying cannot shrink the line — fail fast instead of burning
+			// the whole infra budget (~25 min) on a guaranteed failure.
+			return retryClassNone
+		}
 		return retryClassInfra
 	}
 	var se *client.StatusError

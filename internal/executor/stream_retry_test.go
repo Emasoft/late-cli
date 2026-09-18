@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -378,6 +379,11 @@ func TestClassifyStreamError(t *testing.T) {
 			name: "wrapped mid-stream truncated body is infra-retryable",
 			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: io.ErrUnexpectedEOF}),
 			want: retryClassInfra,
+		},
+		{
+			name: "wrapped oversized SSE line (bufio.ErrTooLong) fails fast",
+			err:  fmt.Errorf("stream error: %w", &client.StreamInterruptedError{Err: bufio.ErrTooLong}),
+			want: retryClassNone,
 		},
 
 		// None: anything unknown fails fast, like pre-retry behavior.

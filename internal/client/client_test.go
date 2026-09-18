@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -386,6 +387,66 @@ func TestChatCompletionStream_OversizedSSELine(t *testing.T) {
 	}
 	if got := chunks[0].Choices[0].Delta.Content.String(); len(got) != bigLen {
 		t.Errorf("chunk content length = %d, want %d", len(got), bigLen)
+	}
+}
+
+// TestChatCompletionStream_LineOverScannerCap mirrors
+// TestChatCompletionStream_OversizedSSELine but pushes the single data line
+// past the client's 1 MB scanner cap (~1.5 MB). The scanner must abort with
+// bufio.ErrTooLong and the stream must surface a *StreamInterruptedError on
+// the error channel with no chunks delivered.
+func TestChatCompletionStream_LineOverScannerCap(t *testing.T) {
+	st := newStreamTest(t)
+	defer st.Close()
+
+	// Build a single SSE data line over the 1 MB scanner cap: a chunk with a
+	// delta.content string of 1,500,000 chars. Marshal a ChatCompletionChunk
+	// so the JSON is guaranteed to be valid.
+	const bigLen = 1500000
+	bigContent := strings.Repeat("a", bigLen)
+	bigChunk := ChatCompletionChunk{
+		ID: "c1",
+		Choices: []ChatCompletionChunkChoice{
+			{Delta: ChatMessage{Content: TextContent(bigContent)}},
+		},
+	}
+	payload, err := json.Marshal(bigChunk)
+	if err != nil {
+		t.Fatalf("failed to marshal over-cap chunk: %v", err)
+	}
+	if got := len("data: ") + len(payload); got <= 1<<20 {
+		t.Fatalf("test fixture line length = %d, want > %d (scanner cap)", got, 1<<20)
+	}
+
+	st.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: %s\n", payload)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+
+	chunks, err := collectStream(t, context.Background(), st.client, defaultRequest())
+
+	// The scanner aborts before emitting anything: zero chunks must arrive.
+	if got := len(chunks); got != 0 {
+		t.Errorf("got %d chunks, want 0 (the over-cap line must abort the stream)", got)
+	}
+
+	// The scanner failure must surface as a *StreamInterruptedError wrapping
+	// bufio.ErrTooLong.
+	if err == nil {
+		t.Fatal("expected an error from the error channel, got nil")
+	}
+	var sie *StreamInterruptedError
+	if !errors.As(err, &sie) {
+		t.Fatalf("error = %v (%T), want errors.As to match *StreamInterruptedError", err, err)
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("error = %v, want it to wrap bufio.ErrTooLong", err)
+	}
+	// The rendered message must stay byte-identical to the previous
+	// fmt.Errorf("stream interrupted: %w", err).
+	if got, want := err.Error(), "stream interrupted: bufio.Scanner: token too long"; got != want {
+		t.Errorf("error message = %q, want %q", got, want)
 	}
 }
 

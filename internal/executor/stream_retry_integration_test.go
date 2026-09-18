@@ -424,10 +424,6 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 	switch {
 	case err == nil && posts == 2 && len(events) == 1:
 		// Desired path: the disconnect was retryable and attempt 2 succeeded.
-	case err == nil && posts == 1 && len(events) == 0:
-		// Documented silent-truncation edge case: the client/executor treated
-		// the clean close after a partial body as a complete turn.
-		t.Skipf("clean close after partial body was silently treated as a complete turn (no stream error surfaced); result=%q", res)
 	default:
 		t.Fatalf("unexpected outcome: err=%v, posts=%d, retryEvents=%d, result=%q", err, posts, len(events), res)
 	}
@@ -472,11 +468,10 @@ func TestRunLoopMidBodyDisconnectRetries(t *testing.T) {
 // transport failure is retried end-to-end: a 200 whose body dies partway
 // surfaces from the client as *client.StreamInterruptedError,
 // classifyStreamError maps it to the infrastructure tier, and RunLoop draws
-// two infra retries before a complete stream succeeds. Unlike
-// TestRunLoopMidBodyDisconnectRetries there is no silent-truncation escape
-// hatch: the truncated body ends with an unterminated partial line (no SSE
-// trailing blank line), so the disconnect can never read as a clean
-// end-of-stream and the retry events are asserted unconditionally.
+// two infra retries before a complete stream succeeds. The truncated body
+// deliberately omits the SSE trailing blank line, so the disconnect is never
+// masked as a clean end-of-stream and the retry events are asserted
+// unconditionally.
 func TestRunLoopRetriesMidStreamTransportAbort(t *testing.T) {
 	// Declared before newRetryServer so the handler can branch on the
 	// 1-based POST count (the closure only runs once the server is up).

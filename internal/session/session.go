@@ -164,14 +164,39 @@ func (s *Session) AddAssistantMessage(content, reasoning string) error {
 }
 
 // PopLastUserMessage removes the trailing user message from history and
-// persists the change atomically. It is a no-op (returns nil) when history is
-// empty or does not end with a user message.
-func (s *Session) PopLastUserMessage() error {
+// persists the change atomically. The bool reports whether a message was
+// removed (false = no-op: empty history or non-user tail). The error is a
+// persistence error, returned only when a change was made.
+func (s *Session) PopLastUserMessage() (bool, error) {
 	if len(s.History) == 0 || s.History[len(s.History)-1].Role != "user" {
-		return nil
+		return false, nil
 	}
 	s.History = s.History[:len(s.History)-1]
-	return s.saveAndNotify()
+
+	// Popping the first-and-only message empties the history. saveAndNotify()
+	// treats empty history as "nothing to persist" (its empty-guard exists so
+	// fresh sessions don't create files at startup), which would leave the
+	// just-popped message stale on disk and let --continue resurrect the
+	// rejected turn. So when the history file exists on disk, remove it
+	// instead of saving an empty file. The .meta.json sidecar lives in the
+	// sessions directory (never next to the history file) and is kept — only
+	// refreshed — so --continue scoping still finds this session.
+	if len(s.History) == 0 && s.HistoryPath != "" {
+		if err := os.Remove(s.HistoryPath); err != nil {
+			if !os.IsNotExist(err) {
+				return true, fmt.Errorf("failed to remove emptied history file %s: %w", s.HistoryPath, err)
+			}
+			// Nothing persisted yet (history lived only in memory), so there
+			// is no file or sidecar to update either.
+			return true, nil
+		}
+		if err := s.UpdateSessionMetadata(); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
+	return true, s.saveAndNotify()
 }
 
 // AppendToLastMessage appends content to the last message (continuation).
@@ -248,6 +273,17 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any) (<-
 			select {
 			case chunk, ok := <-streamOut:
 				if !ok {
+					// The client closes errCh before out (LIFO defers). A
+					// random select win here must not swallow a mid-stream
+					// failure: drain the terminal error before returning,
+					// or ConsumeStream would treat the attempt as a clean,
+					// partial success and commit a truncated turn.
+					if err, ok := <-streamErr; ok && err != nil {
+						select {
+						case errCh <- err:
+						case <-ctx.Done():
+						}
+					}
 					return
 				}
 				var content, reasoning, finishReason string
