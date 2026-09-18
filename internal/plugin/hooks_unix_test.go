@@ -53,7 +53,8 @@ func TestRunHook_ProcessGroupKillsChildrenOnCancel(t *testing.T) {
 	const pidFileWaitLimit = 30 * time.Second
 	pidWaitStart := time.Now()
 	for {
-		if _, err := os.Stat(pidFile); err == nil {
+		// echo's `>` opens pidFile before writing it, so break only on non-empty content — an empty read in the open->write gap would break pid parsing.
+		if b, err := os.ReadFile(pidFile); err == nil && strings.TrimSpace(string(b)) != "" {
 			break
 		}
 		if elapsed := time.Since(pidWaitStart); elapsed > pidFileWaitLimit {
