@@ -16,7 +16,11 @@ import (
 // error containing the partial output produced before the kill.
 func TestShellTool_TimeoutKillsHangingCommand(t *testing.T) {
 	old := defaultShellTimeout
-	SetShellTimeout(300 * time.Millisecond)
+	// 2s (not a tight bound like 300ms): under back-to-back -race load, bash
+	// startup + echo can exceed a few-hundred-ms timeout before "start" is
+	// written, making the partial-output assertion below flaky. 2s keeps the
+	// kill proof and the strong assertion deterministic while staying fast.
+	SetShellTimeout(2 * time.Second)
 	t.Cleanup(func() { SetShellTimeout(old) })
 
 	start := time.Now()
