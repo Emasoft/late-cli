@@ -22,7 +22,7 @@ var flagGroups = []struct {
 	{"System prompt", []string{"system-prompt", "system-prompt-file", "append-system-prompt", "inject-cwd", "gemma-thinking"}, ""},
 	{"Model & streaming", []string{"logit-bias", "suppress-thinking-words", "max-stream-retries"}, ""},
 	{"Subagents", []string{"enable-subagents", "subagent-max-turns", "subagent-timeout", "subagent-logit-bias", "save-subagent-histories"}, ""},
-	{"Tools", []string{"use-tools", "enable-bash", "enable-images", "enable-sqz"}, ""},
+	{"Tools", []string{"use-tools", "enable-bash", "bash-timeout", "enable-images", "enable-sqz"}, ""},
 	{"Supervision & safety", []string{"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues", "force-revaluate-dangerous-commands"},
 		"These three flags are mutually exclusive: pass at most one. The default\n  (ask-for-user-approval) can be changed by adding a \"permission-mode\"\n  entry to late's config.json with one of the values above."},
 }

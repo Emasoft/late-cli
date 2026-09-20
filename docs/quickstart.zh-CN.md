@@ -348,6 +348,8 @@ Late 的原生搜索工具会自动遵守你项目的 `.gitignore`，通过排�
 | `--logit-bias` 和 `--subagent-logit-bias` | 手动设置特定模型的 logit 偏置（仅限 `llama.cpp`） |
 | `--gemma-thinking` | 为 Gemma 4 模型注入思考 token |
 | `--subagent-max-turns <n>` | 设置每个子智能体的最大轮次（默认：500） |
+| `--bash-timeout <duration>` | 单次 bash 工具调用的时长上限（默认：10m；`0` 表示不限制） |
+| `--subagent-timeout <duration>` | 单次子智能体运行的时长上限（默认：30m；`0` 表示不限制） |
 | `--append-system-prompt "..."` | 在系统 prompt 附加文本（如：额外指令） |
 | `--enable-images` | 将模型视为支持图像（适用于非 llama.cpp 的服务器） |
 | `--save-subagent-histories` | 将子智能体的对话记录持久化到磁盘 |

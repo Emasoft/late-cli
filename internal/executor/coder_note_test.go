@@ -91,6 +91,40 @@ func TestExecuteToolCalls_CoderShellFailureNoteIsSeparateMessage(t *testing.T) {
 	}
 }
 
+// TestExecuteToolCalls_UserStopDoesNotAttachNote verifies that a user stop
+// (context canceled before the call) does NOT attach the harness note: the
+// shell command is killed ("Error executing command: signal: killed"), which
+// matches IsShellFailureResult and would otherwise produce a noisy
+// "report back" note right after the user explicitly stopped the agent. The
+// tool result itself must still land in history. A timeout
+// (context.DeadlineExceeded) is NOT covered by this guard and still gets the
+// note (see TestIsShellFailureResult in internal/tool for the timeout prefix).
+func TestExecuteToolCalls_UserStopDoesNotAttachNote(t *testing.T) {
+	sess := harnessSession(t)
+	ctx, cancel := context.WithCancel(withOrchestrator(context.Background(), "coder-subagent-1"))
+	cancel() // user pressed stop before the tool call ran
+
+	toolCalls := []client.ToolCall{
+		{ID: "tc_1", Function: client.FunctionCall{Name: "bash", Arguments: `{"command":"false"}`}},
+	}
+
+	if err := ExecuteToolCalls(ctx, sess, toolCalls, []common.ToolMiddleware{approvedMiddleware()}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var toolResult string
+	for _, msg := range sess.History {
+		if text := msg.Content.String(); strings.Contains(text, "[late harness]") {
+			t.Fatalf("user stop must not attach the harness note, got %q", text)
+		} else if msg.Role == "tool" && msg.ToolCallID == "tc_1" {
+			toolResult = text
+		}
+	}
+	if toolResult == "" {
+		t.Fatalf("expected the bash tool result in history, got %d messages", len(sess.History))
+	}
+}
+
 // TestExecuteToolCalls_NonCoderShellFailureHasNoNote verifies the harness note
 // is scoped to coder subagents.
 func TestExecuteToolCalls_NonCoderShellFailureHasNoNote(t *testing.T) {

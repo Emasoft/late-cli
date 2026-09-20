@@ -101,6 +101,7 @@ func main() {
 	systemPromptFileReq := flag.String("system-prompt-file", "", "Replace the built-in system prompt with a file's contents (highest priority).")
 	useToolsReq := flag.Bool("use-tools", true, "Offer tools to the main agent at all.")
 	enableBashReq := flag.Bool("enable-bash", true, "Enable the bash tool.")
+	bashTimeout := flag.Duration("bash-timeout", 10*time.Minute, "Max wall-clock time for one bash tool call (0 = unlimited)")
 	injectCWDReq := flag.Bool("inject-cwd", true, "Replace ${{CWD}} in the system prompt with the working directory.")
 	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents.")
 	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt.")
@@ -140,6 +141,9 @@ func main() {
 	flag.Parse()
 
 	tool.SetSqzEnabled(*enableSqzReq)
+	// Shell tool bound: 0/negative (--bash-timeout=0) disables it —
+	// ShellTool.Execute treats a non-positive timeout as unbounded.
+	tool.SetShellTimeout(*bashTimeout)
 
 	if *versionReq {
 		fmt.Printf("late %s\n", common.Version)

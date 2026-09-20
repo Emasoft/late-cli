@@ -349,6 +349,8 @@ Setting `0` (or a negative value) disables stream retrying entirely. Run `late -
 | `--logit-bias` and `--subagent-logit-bias` | Manually set the logit biases for specific models (`llama.cpp` only) |
 | `--gemma-thinking` | Inject thinking tokens for Gemma 4 models |
 | `--subagent-max-turns <n>` | Set max turns per subagent (default: 500) |
+| `--bash-timeout <duration>` | Bound for one bash tool call (default: 10m; `0` = unlimited) |
+| `--subagent-timeout <duration>` | Bound for one subagent run (default: 30m; `0` = unlimited) |
 | `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
 | `--enable-images` | Treat models as supporting images (for non llama.cpp servers) |
 | `--save-subagent-histories` | Persist subagent conversation histories to disk |

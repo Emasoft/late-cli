@@ -58,7 +58,11 @@ func newShellCommand(ctx context.Context, command string) *exec.Cmd {
 		if cmd.Process == nil {
 			return nil
 		}
-		return exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		// Best-effort: a taskkill failure (e.g. the process already exited)
+		// must not mask the real outcome; WaitDelay still closes the pipes
+		// below so a pipe-holding descendant can never block Wait().
+		_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		return nil
 	}
 	// If a graceful window is needed, Wait closes the pipes anyway after
 	// this delay so a pipe-holding descendant can never block Wait().
