@@ -434,7 +434,7 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err != nil {
 		sandwich := ""
 		if orchestratorID := common.GetOrchestratorID(ctx); strings.Contains(strings.ToLower(orchestratorID), "coder") {
-			sandwich = "\n\n=========================================\nSYSTEM DIRECTIVE:\nYou just encountered an error. If fixing this requires modifying components or architecture you were not explicitly instructed to edit, YOU MUST ABORT AND RETURN TO THE MAIN AGENT.\n========================================="
+			sandwich = "\n\n[late harness] error note: this command failed. If fixing it requires modifying components or architecture beyond the task you were delegated, stop and report back to the main agent instead of proceeding on your own initiative. [late harness]"
 		}
 
 		if exitErr, ok := err.(*exec.ExitError); ok {
