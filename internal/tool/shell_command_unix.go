@@ -41,7 +41,13 @@ func newShellCommand(ctx context.Context, command string) *exec.Cmd {
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// ESRCH (process already exited) is not a cancel failure: a command
+		// finishing exactly at cancellation must not surface "process
+		// already finished" from Wait as the tool error.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return nil
 	}
 	// If a graceful window is needed, Wait closes the pipes anyway after
 	// this delay so a pipe-holding grandchild can never block Wait().
