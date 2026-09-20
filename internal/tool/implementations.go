@@ -304,12 +304,13 @@ const maxReadFileChars = 32768
 // Maximum number of characters for shell output to prevent session poisoning
 const maxBashOutputChars = 32768
 
-// defaultShellTimeout bounds a single bash tool call. Override in tests via
-// SetShellTimeout; wire a CLI flag in a later step.
+// defaultShellTimeout bounds a single bash tool call. Overridable via the
+// --bash-timeout CLI flag (cmd/late) or SetShellTimeout in tests.
 var defaultShellTimeout = 10 * time.Minute
 
-// SetShellTimeout overrides defaultShellTimeout. It is not goroutine-safe and
-// is intended for test use only.
+// SetShellTimeout overrides defaultShellTimeout. It is not goroutine-safe:
+// call it once at startup (the --bash-timeout flag wiring) or from tests
+// before concurrent shell execution begins.
 func SetShellTimeout(d time.Duration) { defaultShellTimeout = d }
 
 // ShellTool executes host-native shell commands with security restrictions.
@@ -442,12 +443,16 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 }
 
 // IsShellFailureResult reports whether a shell tool result describes a failed
-// command (non-zero exit or exec error). ExecuteToolCalls uses it to decide
-// whether to attach a harness note; keep the prefixes in sync with
-// ShellTool.Execute's return statements.
+// command (non-zero exit, exec error, or timeout). ExecuteToolCalls uses it to
+// decide whether to attach a harness note; keep the prefixes in sync with
+// ShellTool.Execute's return statements plus the third prefix below, which is
+// ExecuteToolCalls' own "Error executing tool %s: %v" wrapper around the
+// timeout error ShellTool.Execute returns (the tool name is "bash" on every
+// platform).
 func IsShellFailureResult(result string) bool {
 	return strings.HasPrefix(result, "Command failed with exit code ") ||
-		strings.HasPrefix(result, "Error executing command: ")
+		strings.HasPrefix(result, "Error executing command: ") ||
+		strings.HasPrefix(result, "Error executing tool bash: command timed out after ")
 }
 
 func (t ShellTool) RequiresConfirmation(args json.RawMessage) bool {

@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -117,8 +118,15 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 		// forge it; a distinct history record is delivered to the LLM next
 		// turn and cannot be shaped by command output. One note per failed
 		// shell call: this is the single call site.
+		//
+		// A user stop (ctx.Canceled) suppresses the note: killing the shell
+		// surfaces as "Error executing command: signal: killed", which would
+		// otherwise ask the agent to report back right after the user
+		// explicitly stopped the run. A shell timeout (DeadlineExceeded) is
+		// not a user stop and still gets the note.
+		userCanceled := errors.Is(ctx.Err(), context.Canceled)
 		if t := sess.Registry.Get(tc.Function.Name); t != nil {
-			if _, isShell := t.(*tool.ShellTool); isShell &&
+			if _, isShell := t.(*tool.ShellTool); isShell && !userCanceled &&
 				strings.Contains(strings.ToLower(common.GetOrchestratorID(ctx)), "coder") &&
 				tool.IsShellFailureResult(result) {
 				note := "[late harness] error note: the command above failed. If fixing it requires modifying components or architecture beyond the task you were delegated, stop and report back to the main agent instead of proceeding on your own initiative."
