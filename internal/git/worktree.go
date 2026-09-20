@@ -2,7 +2,6 @@ package git
 
 import (
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 )
@@ -18,7 +17,9 @@ type WorktreeInfo struct {
 // ListWorktrees executes `git worktree list` and parses the output
 // to return a slice of WorktreeInfo structures.
 func ListWorktrees() ([]WorktreeInfo, error) {
-	cmd := exec.Command("git", "worktree", "list")
+	// Bounded + fail-fast env via newGitCmd: git must never hang the caller.
+	cmd, cancel := newGitCmd("", "worktree", "list")
+	defer cancel()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -68,7 +69,9 @@ func ListWorktrees() ([]WorktreeInfo, error) {
 
 // CreateWorktree executes `git worktree add <path> <branch>` to create a new worktree.
 func CreateWorktree(path, branch string) error {
-	cmd := exec.Command("git", "worktree", "add", path, branch)
+	// Bounded + fail-fast env via newGitCmd: git must never hang the caller.
+	cmd, cancel := newGitCmd("", "worktree", "add", path, branch)
+	defer cancel()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
@@ -79,7 +82,9 @@ func CreateWorktree(path, branch string) error {
 
 // RemoveWorktree executes `git worktree remove <path>` to remove a worktree.
 func RemoveWorktree(path string) error {
-	cmd := exec.Command("git", "worktree", "remove", path)
+	// Bounded + fail-fast env via newGitCmd: git must never hang the caller.
+	cmd, cancel := newGitCmd("", "worktree", "remove", path)
+	defer cancel()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
@@ -112,7 +117,9 @@ func GetActiveWorktree() (string, error) {
 	}
 
 	// If no match found, return the main repository path
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	// Bounded + fail-fast env via newGitCmd: git must never hang the caller.
+	cmd, cancel := newGitCmd("", "rev-parse", "--show-toplevel")
+	defer cancel()
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -122,10 +129,9 @@ func GetActiveWorktree() (string, error) {
 
 // CurrentBranch returns the current git branch name at cwd, or "" if not in a git repo.
 func CurrentBranch(cwd string) string {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
+	// Bounded + fail-fast env via newGitCmd: git must never hang the TUI.
+	cmd, cancel := newGitCmd(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+	defer cancel()
 	output, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -133,10 +139,8 @@ func CurrentBranch(cwd string) string {
 	branch := strings.TrimSpace(string(output))
 	if branch == "HEAD" {
 		// Detached HEAD: get short SHA
-		shortCmd := exec.Command("git", "rev-parse", "--short", "HEAD")
-		if cwd != "" {
-			shortCmd.Dir = cwd
-		}
+		shortCmd, cancelShort := newGitCmd(cwd, "rev-parse", "--short", "HEAD")
+		defer cancelShort()
 		if shortOut, errShort := shortCmd.Output(); errShort == nil {
 			return strings.TrimSpace(string(shortOut))
 		}
