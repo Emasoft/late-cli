@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"late/internal/client"
@@ -107,6 +108,24 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 		}
 		if err := sess.AddToolResultMessage(tc.ID, result); err != nil {
 			return err
+		}
+
+		// Harness note for coder subagents: a failing shell command gets a
+		// delegation-boundary reminder as a SEPARATE user-role history message
+		// attributed to the late harness. It must not live inside the tool
+		// result string, where attacker-controlled stdout could splice or
+		// forge it; a distinct history record is delivered to the LLM next
+		// turn and cannot be shaped by command output. One note per failed
+		// shell call: this is the single call site.
+		if t := sess.Registry.Get(tc.Function.Name); t != nil {
+			if _, isShell := t.(*tool.ShellTool); isShell &&
+				strings.Contains(strings.ToLower(common.GetOrchestratorID(ctx)), "coder") &&
+				tool.IsShellFailureResult(result) {
+				note := "[late harness] error note: the command above failed. If fixing it requires modifying components or architecture beyond the task you were delegated, stop and report back to the main agent instead of proceeding on your own initiative."
+				if err := sess.AddMessage(client.ChatMessage{Role: "user", Content: client.TextContent(note)}); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil

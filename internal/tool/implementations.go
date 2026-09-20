@@ -432,19 +432,24 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	if err != nil {
-		sandwich := ""
-		if orchestratorID := common.GetOrchestratorID(ctx); strings.Contains(strings.ToLower(orchestratorID), "coder") {
-			sandwich = "\n\n[late harness] error note: this command failed. If fixing it requires modifying components or architecture beyond the task you were delegated, stop and report back to the main agent instead of proceeding on your own initiative. [late harness]"
-		}
-
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("Command failed with exit code %d\n%s%s", exitErr.ExitCode(), finalOutput, sandwich), nil
+			return fmt.Sprintf("Command failed with exit code %d\n%s", exitErr.ExitCode(), finalOutput), nil
 		}
-		return fmt.Sprintf("Error executing command: %v\n%s%s", err, finalOutput, sandwich), nil
+		return fmt.Sprintf("Error executing command: %v\n%s", err, finalOutput), nil
 	}
 
 	return finalOutput, nil
 }
+
+// IsShellFailureResult reports whether a shell tool result describes a failed
+// command (non-zero exit or exec error). ExecuteToolCalls uses it to decide
+// whether to attach a harness note; keep the prefixes in sync with
+// ShellTool.Execute's return statements.
+func IsShellFailureResult(result string) bool {
+	return strings.HasPrefix(result, "Command failed with exit code ") ||
+		strings.HasPrefix(result, "Error executing command: ")
+}
+
 func (t ShellTool) RequiresConfirmation(args json.RawMessage) bool {
 	var params struct {
 		Command string `json:"command"`
