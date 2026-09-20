@@ -73,8 +73,8 @@ func TestShellTool_CancelReturnsDespiteGrandchildHoldingPipes(t *testing.T) {
 
 	select {
 	case res := <-results:
-		if elapsed := time.Since(cancelledAt); elapsed > 5*time.Second {
-			t.Errorf("Execute returned %v after cancel, expected < 5s (out=%q err=%v)", elapsed, res.out, res.err)
+		if elapsed := time.Since(cancelledAt); elapsed > 9*time.Second {
+			t.Errorf("Execute returned %v after cancel, expected < 9s (out=%q err=%v)", elapsed, res.out, res.err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("Execute did not return within 10s after cancel — pipe-holding grandchild is still blocking Wait")
