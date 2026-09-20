@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"late/internal/agent"
@@ -104,6 +105,7 @@ func main() {
 	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents.")
 	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt.")
 	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum turns per subagent.")
+	subagentTimeout := flag.Duration("subagent-timeout", 30*time.Minute, "Max wall-clock time for one subagent run (0 = unlimited)")
 	// LATE_MAX_STREAM_RETRIES optionally overrides the default retry budget
 	// for LLM stream errors; an explicit -max-stream-retries flag wins over it.
 	maxStreamRetriesDefault := executor.DefaultMaxStreamRetries
@@ -768,9 +770,47 @@ func main() {
 			}
 			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
 
+			// Per-subagent wall-clock budget layered on top of the parent
+			// context (agent.NewSubagentOrchestrator already wires the child
+			// to the parent's context). 0 disables the budget, so no wrapper
+			// is installed then: context.WithTimeout with a non-positive
+			// duration would expire immediately and kill the run.
+			runCtx := ctx
+			runCancel := func() {}
+			if *subagentTimeout > 0 {
+				runCtx, runCancel = context.WithTimeout(ctx, *subagentTimeout)
+			}
+			defer runCancel()
+			// SetContext is not part of common.Orchestrator; the factory
+			// always returns *orchestrator.BaseOrchestrator. If the concrete
+			// type ever changes, the child simply keeps the parent context
+			// and runs without a budget rather than failing the spawn.
+			if base, ok := child.(*orchestrator.BaseOrchestrator); ok {
+				base.SetContext(runCtx)
+			}
+
 			res, err := child.Execute("")
-			if err != nil {
-				return "", err
+			// Classify the termination BEFORE looking at err: the budget, the
+			// user's kill and crashes all surface differently here.
+			var cause string
+			switch {
+			case *subagentTimeout > 0 && runCtx.Err() == context.DeadlineExceeded:
+				cause = fmt.Sprintf("time budget exhausted (%s)", *subagentTimeout)
+			case errors.Is(err, context.Canceled) || child.IsStopRequested():
+				cause = "cancelled or killed by the user"
+			case err != nil:
+				cause = fmt.Sprintf("crashed: %v", err)
+			}
+			if cause != "" {
+				// Abnormal termination: hand the parent a pruned transcript so it
+				// can understand the cause and resume without redoing the work.
+				transcriptPath, terr := writeSubagentTranscript(child, agentType, goal, cause)
+				summary := lastActionPreview(child.History(), 500)
+				result := fmt.Sprintf("The %s subagent terminated abnormally (%s).\nFull pruned transcript: %s\nLast actions:\n%s", agentType, cause, transcriptPath, summary)
+				if terr != nil {
+					result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
+				}
+				return result, nil
 			}
 
 			if child.IsStopRequested() {

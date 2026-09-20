@@ -5,6 +5,7 @@ import (
 	"flag"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newHelpTestFlagSet mirrors main()'s root flag registrations (names and
@@ -30,6 +31,7 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 	}
 	fs.Int("subagent-max-turns", 500, "usage of subagent-max-turns")
 	fs.Int("max-stream-retries", 100, "usage of max-stream-retries")
+	fs.Duration("subagent-timeout", 30*time.Minute, "usage of subagent-timeout")
 	return fs
 }
 
