@@ -75,6 +75,10 @@ func (p pluginInlineTool) CallString(args json.RawMessage) string {
 	return fmt.Sprintf("Calling plugin tool %q...", p.name)
 }
 
+// subagentTimeoutUsage is single-sourced with the -subagent-timeout flag
+// registration in main() so tests can assert on the rendered help output.
+const subagentTimeoutUsage = "Max wall-clock time for one subagent run (0 = unlimited)"
+
 func main() {
 	// Parse flags
 	helpReq := flag.Bool("help", false, "Show help")
@@ -87,7 +91,7 @@ func main() {
 	enableSubagentsReq := flag.Bool("enable-subagents", true, "Enable subagent usage")
 	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend <|think|> token to system prompt for Gemma 4 models")
 	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum number of turns for subagents (default: 500)")
-	subagentTimeout := flag.Duration("subagent-timeout", 30*time.Minute, "Max wall-clock time for one subagent run (0 = unlimited)")
+	subagentTimeout := flag.Duration("subagent-timeout", appconfig.DefaultSubagentTimeout, subagentTimeoutUsage)
 	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent conversation histories to disk (default: off)")
 	enableSqzReq := flag.Bool("enable-sqz", false, "Enable sqz context compression (if available)")
 	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append text to the system prompt after processing")
@@ -380,6 +384,13 @@ func main() {
 		storedSubagentHistoryPreference = loadedSessionMeta.SaveSubagentHistories
 	}
 	saveSubagentHistories := appconfig.ResolveSaveSubagentHistories(appConfig, saveSubagentHistoriesCLI, *saveSubagentHistoriesReq, storedSubagentHistoryPreference)
+
+	// Resolve the per-subagent wall-clock budget
+	// (explicit CLI flag > config.json subagent-timeout entry > default).
+	resolvedSubagentTimeout, subagentTimeoutWarning := resolveSubagentTimeBudget(flag.CommandLine, appConfig, *subagentTimeout)
+	if subagentTimeoutWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", subagentTimeoutWarning)
+	}
 
 	// Initialize Core Components
 	resolvedOpenAIConfig := appconfig.ResolveOpenAISettings(appConfig)
@@ -716,8 +727,8 @@ func main() {
 			// duration would expire immediately and kill the run.
 			runCtx := ctx
 			runCancel := func() {}
-			if *subagentTimeout > 0 {
-				runCtx, runCancel = context.WithTimeout(ctx, *subagentTimeout)
+			if resolvedSubagentTimeout > 0 {
+				runCtx, runCancel = context.WithTimeout(ctx, resolvedSubagentTimeout)
 			}
 			defer runCancel()
 			// SetContext is not part of common.Orchestrator; the factory
@@ -733,8 +744,8 @@ func main() {
 			// user's kill and crashes all surface differently here.
 			var cause string
 			switch {
-			case *subagentTimeout > 0 && runCtx.Err() == context.DeadlineExceeded:
-				cause = fmt.Sprintf("time budget exhausted (%s)", *subagentTimeout)
+			case resolvedSubagentTimeout > 0 && runCtx.Err() == context.DeadlineExceeded:
+				cause = fmt.Sprintf("time budget exhausted (%s)", resolvedSubagentTimeout)
 			case errors.Is(err, context.Canceled) || child.IsStopRequested():
 				cause = "cancelled or killed by the user"
 			case err != nil:
@@ -781,6 +792,22 @@ func deriveEffectiveSessionID(historyPath string) string {
 		return ""
 	}
 	return id
+}
+
+// resolveSubagentTimeBudget resolves the effective per-subagent wall-clock
+// budget: an explicitly-passed -subagent-timeout flag wins over the
+// config.json "subagent-timeout" entry, which wins over the
+// appconfig.DefaultSubagentTimeout default. Explicitness is detected on the
+// given FlagSet the same way main() detects --save-subagent-histories.
+// A zero or negative budget means unlimited.
+func resolveSubagentTimeBudget(fs *flag.FlagSet, cfg *appconfig.Config, flagValue time.Duration) (time.Duration, string) {
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "subagent-timeout" {
+			explicit = true
+		}
+	})
+	return appconfig.ResolveSubagentTimeout(cfg, explicit, flagValue)
 }
 func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableImages bool, logitBias map[string]int) *client.Client {
 	c := client.NewClient(client.Config{
