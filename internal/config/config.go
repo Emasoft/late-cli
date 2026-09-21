@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 )
 
 const DefaultOpenAIBaseURL = "http://localhost:8080"
@@ -20,6 +21,11 @@ const (
 	PermissionModeUnsupervised       = "i-promise-i-have-backups-and-will-not-file-issues"
 	PermissionModeForceRevaluate     = "force-revaluate-dangerous-commands"
 )
+
+// DefaultSubagentTimeout is the default wall-clock budget for a single
+// subagent run, applied when neither the --subagent-timeout flag nor the
+// config.json "subagent_timeout" entry provides a value.
+const DefaultSubagentTimeout = 24 * time.Hour
 
 type EnvLookup func(string) (string, bool)
 
@@ -76,6 +82,13 @@ type Config struct {
 	// default (ask-for-user-approval). Set via config file; the CLI flags
 	// of the same names override it.
 	PermissionMode string `json:"permission-mode,omitempty"`
+
+	// SubagentTimeout is an optional wall-clock budget for a single subagent
+	// run, parsed with time.ParseDuration (e.g. "45m", "2h"). "0" or a
+	// negative value means unlimited. Empty means the built-in default
+	// (DefaultSubagentTimeout). Precedence: an explicitly passed
+	// --subagent-timeout flag wins over this entry.
+	SubagentTimeout string `json:"subagent_timeout,omitempty"`
 
 	// Legacy subagent fields for backward compatibility
 	SubagentBaseURL string `json:"subagent_base_url,omitempty"`
@@ -293,6 +306,28 @@ func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag, forceRevaluat
 		}
 	}
 	return PermissionModeAskForUserApproval, "", nil
+}
+
+// ResolveSubagentTimeout resolves the global wall-clock budget for a single
+// subagent run. Precedence: explicitly passed CLI flag > config.json
+// "subagent_timeout" entry > DefaultSubagentTimeout (24h).
+//
+// A config value that parses via time.ParseDuration passes through as-is:
+// "0" or a negative value means unlimited — callers guard with "> 0" and
+// treat any non-positive budget as unlimited. An unparseable non-empty
+// config value is ignored: the default is returned together with a warning
+// for the caller to surface.
+func ResolveSubagentTimeout(cfg *Config, cliExplicit bool, cliValue time.Duration) (time.Duration, string) {
+	if cliExplicit {
+		return cliValue, ""
+	}
+	if cfg != nil && cfg.SubagentTimeout != "" {
+		if parsed, err := time.ParseDuration(cfg.SubagentTimeout); err == nil {
+			return parsed, ""
+		}
+		return DefaultSubagentTimeout, fmt.Sprintf("ignoring invalid config.json subagent_timeout %q; using default 24h", cfg.SubagentTimeout)
+	}
+	return DefaultSubagentTimeout, ""
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

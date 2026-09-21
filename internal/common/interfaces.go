@@ -113,6 +113,25 @@ type RecoveryEvent struct {
 
 func (e RecoveryEvent) OrchestratorID() string { return e.ID }
 
+// SubagentIdleEvent is sent when an agent has been truly idle — no stream
+// progress, no in-flight tool, no in-flight nested subagent — for longer
+// than the configured idle threshold. Probe carries the last few transcript
+// entries so the recipient can decide whether the agent is stuck.
+type SubagentIdleEvent struct {
+	ID      string
+	IdleFor time.Duration
+	Probe   []string
+}
+
+func (e SubagentIdleEvent) OrchestratorID() string { return e.ID }
+
+// ActivityMarker is implemented by orchestrators that track their own
+// activity for the idle watchdog. Nested subagent runners call MarkActivity
+// on the parent so it does not look idle while its child is working.
+type ActivityMarker interface {
+	MarkActivity()
+}
+
 // PromptRequest defines a generic requirement for user input.
 type PromptRequest struct {
 	ID          string

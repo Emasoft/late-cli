@@ -106,7 +106,9 @@ func main() {
 	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents.")
 	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt.")
 	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum turns per subagent.")
-	subagentTimeout := flag.Duration("subagent-timeout", 30*time.Minute, "Max wall-clock time for one subagent run (0 = unlimited)")
+	subagentTimeout := flag.Duration("subagent-timeout", appconfig.DefaultSubagentTimeout, "Max wall-clock time for one subagent run (0 = unlimited; config.json subagent_timeout applies unless the flag is passed)")
+	subagentIdleTimeout := flag.Duration("subagent-idle-timeout", 15*time.Minute, "Notify when a subagent has been truly idle (no stream progress, no in-flight tool, no nested spawn) for this long (0 = off)")
+	subagentIdleKillAfter := flag.Duration("subagent-idle-kill-after", 0, "Kill a subagent that stays truly idle past this duration (0 = notify only)")
 	// LATE_MAX_STREAM_RETRIES optionally overrides the default retry budget
 	// for LLM stream errors; an explicit -max-stream-retries flag wins over it.
 	maxStreamRetriesDefault := executor.DefaultMaxStreamRetries
@@ -139,6 +141,13 @@ func main() {
 		writeHelp(os.Stderr, flag.CommandLine)
 	}
 	flag.Parse()
+
+	// Record which flags were explicitly passed on the command line. The app
+	// config loads AFTER flag.Parse below, so flag.Visit (which reports only
+	// command-line-set flags) is the only reliable "explicit flag > config"
+	// precedence signal for resolvers such as ResolveSubagentTimeout.
+	explicitFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
 
 	tool.SetSqzEnabled(*enableSqzReq)
 	// Shell tool bound: 0/negative (--bash-timeout=0) disables it —
@@ -392,6 +401,16 @@ func main() {
 		}
 	}
 
+	// Resolve the global subagent run budget with precedence
+	// explicit --subagent-timeout flag > config.json "subagent_timeout" >
+	// DefaultSubagentTimeout (24h). A non-positive resolved budget ("0" or
+	// negative) means unlimited; an invalid config value is ignored with a
+	// warning and the default applies instead.
+	resolvedSubagentTimeout, subagentTimeoutWarning := appconfig.ResolveSubagentTimeout(appConfig, explicitFlags["subagent-timeout"], *subagentTimeout)
+	if subagentTimeoutWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", subagentTimeoutWarning)
+	}
+
 	// Parse explicit user logit bias overrides if provided
 	var explicitUserLogitBias map[string]int
 	if *logitBiasReq != "" {
@@ -590,6 +609,10 @@ func main() {
 	// Create root orchestrator
 	// We'll add middlewares later once the program is started
 	rootAgent := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+	// Idle watchdog policy applies to the root agent too: an orchestrator
+	// stuck with no stream progress, tool, or nested spawn reports idle (and,
+	// with --subagent-idle-kill-after, cancels its own run).
+	rootAgent.SetIdlePolicy(*subagentIdleTimeout, *subagentIdleKillAfter)
 
 	model := tui.NewModel(rootAgent, renderer, appConfig)
 	model.SetActiveThemeStyles(themeBytes)
@@ -745,7 +768,24 @@ func main() {
 	}()
 
 	if *enableSubagentsReq {
-		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string) (string, error) {
+		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string, timeoutOverride *time.Duration) (string, error) {
+			// Effective wall-clock budget for this run. Context layering:
+			// parent ctx (cancellation) ⊇ run budget (deadline) — runCtx is
+			// derived from ctx, so cancelling the parent still cancels the
+			// child while the budget only adds a deadline. Precedence:
+			// per-spawn override when positive > global resolved budget; an
+			// explicit per-spawn "0" (unlimited) suppresses the global
+			// budget; an absent override falls back to the global value.
+			// runBudget is kept in a local var so error classification can
+			// report e.g. "time budget exhausted (2h)".
+			runBudget := effectiveSubagentBudget(timeoutOverride, resolvedSubagentTimeout)
+			runCtx := ctx
+			var runCancel context.CancelFunc = func() {}
+			if runBudget > 0 {
+				runCtx, runCancel = context.WithTimeout(ctx, runBudget)
+			}
+			defer runCancel()
+
 			var currentSubagentClient *client.Client
 			if appConfig != nil {
 				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
@@ -774,32 +814,75 @@ func main() {
 			}
 			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
 
-			// Per-subagent wall-clock budget layered on top of the parent
-			// context (agent.NewSubagentOrchestrator already wires the child
-			// to the parent's context). 0 disables the budget, so no wrapper
-			// is installed then: context.WithTimeout with a non-positive
-			// duration would expire immediately and kill the run.
-			runCtx := ctx
-			runCancel := func() {}
-			if *subagentTimeout > 0 {
-				runCtx, runCancel = context.WithTimeout(ctx, *subagentTimeout)
+			// NewSubagentOrchestrator already set the child's context from
+			// the parent (agent.go: child.SetContext(parent.Context())) —
+			// keep that inheritance and layer the run budget on top: runCtx
+			// is derived from the runner ctx, so the parent ctx (cancellation)
+			// subsumes the budget (deadline). BaseOrchestrator.Execute then
+			// derives its run context from this one, so the deadline reaches
+			// the executor run loop. SetContext is not part of
+			// common.Orchestrator; the interface assertion keeps the spawn
+			// working if the concrete child type ever changes (it then simply
+			// keeps the parent context and runs without a budget rather than
+			// failing the spawn).
+			if sa, ok := child.(interface{ SetContext(context.Context) }); ok {
+				sa.SetContext(runCtx)
 			}
-			defer runCancel()
-			// SetContext is not part of common.Orchestrator; the factory
-			// always returns *orchestrator.BaseOrchestrator. If the concrete
-			// type ever changes, the child simply keeps the parent context
-			// and runs without a budget rather than failing the spawn.
-			if base, ok := child.(*orchestrator.BaseOrchestrator); ok {
-				base.SetContext(runCtx)
+
+			// The child runs its own idle watchdog with the same policy as
+			// the parent (it is a BaseOrchestrator too), so a stuck nested
+			// agent reports idle — or kills itself — independently.
+			if sa, ok := child.(interface {
+				SetIdlePolicy(idle, killAfter time.Duration)
+			}); ok {
+				sa.SetIdlePolicy(*subagentIdleTimeout, *subagentIdleKillAfter)
 			}
+
+			// The child streams on its own session, so the parent shows no
+			// progress while the nested run executes. Keep the parent's
+			// activity alive with a 1/minute heartbeat and mark the nested
+			// spawn busy, so the parent's idle watchdog neither fires nor
+			// idle-kills while its child is legitimately working.
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				t := time.NewTicker(time.Minute)
+				defer t.Stop()
+				for {
+					select {
+					case <-done:
+						return
+					case <-t.C:
+						// rootAgent is a *orchestrator.BaseOrchestrator,
+						// which satisfies common.ActivityMarker; the parent
+						// stays visibly active while the child works.
+						rootAgent.MarkActivity()
+					}
+				}
+			}()
+			// Mark the nested spawn busy on the parent for the idle watchdog.
+			rootAgent.BeginNestedSpawn()
+			defer rootAgent.EndNestedSpawn()
 
 			res, err := child.Execute("")
 			// Classify the termination BEFORE looking at err: the budget, the
-			// user's kill and crashes all surface differently here.
+			// idle watchdog, the user's kill and crashes all surface
+			// differently here. The idle-kill case must precede the
+			// user-cancel case: a watchdog kill surfaces as a plain
+			// context.Canceled from the child, and only IdleKillReason
+			// distinguishes it from a user stop. IdleKillReason is not part
+			// of common.Orchestrator; the interface assertion mirrors the
+			// SetContext/SetIdlePolicy ones above.
+			childIdleKillReason := ""
+			if sa, ok := child.(interface{ IdleKillReason() string }); ok {
+				childIdleKillReason = sa.IdleKillReason()
+			}
 			var cause string
 			switch {
-			case *subagentTimeout > 0 && runCtx.Err() == context.DeadlineExceeded:
-				cause = fmt.Sprintf("time budget exhausted (%s)", *subagentTimeout)
+			case childIdleKillReason != "":
+				cause = fmt.Sprintf("idle: killed by the harness idle watchdog (%s)", childIdleKillReason)
+			case runBudget > 0 && runCtx.Err() == context.DeadlineExceeded:
+				cause = fmt.Sprintf("time budget exhausted (%s)", runBudget)
 			case errors.Is(err, context.Canceled) || child.IsStopRequested():
 				cause = "cancelled or killed by the user"
 			case err != nil:
@@ -833,6 +916,21 @@ func main() {
 		fmt.Printf("Unspecified error: %v", err)
 		os.Exit(1)
 	}
+}
+
+// effectiveSubagentBudget selects the wall-clock budget for one subagent run.
+// Precedence: a positive per-spawn override wins; an explicit per-spawn "0"
+// (unlimited) suppresses the global budget; an absent override falls back to
+// the global budget. Any non-positive result means unlimited (no deadline) —
+// callers guard with "> 0" before deriving a WithTimeout context.
+func effectiveSubagentBudget(timeoutOverride *time.Duration, globalBudget time.Duration) time.Duration {
+	if timeoutOverride != nil {
+		if *timeoutOverride > 0 {
+			return *timeoutOverride
+		}
+		return 0 // explicit per-spawn unlimited suppresses the global budget
+	}
+	return globalBudget
 }
 
 // deriveEffectiveSessionID derives this run's session ID from the FINAL

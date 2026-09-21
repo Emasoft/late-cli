@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"late/internal/client"
 	"late/internal/common"
@@ -200,5 +201,65 @@ func TestExecuteToolCalls_CoderNonShellFailureHasNoNote(t *testing.T) {
 	}
 	if strings.Contains(sess.History[0].Content.String(), "[late harness]") {
 		t.Errorf("non-shell tool failure must not carry the harness note, got %q", sess.History[0].Content.String())
+	}
+}
+
+// TestExecuteToolCalls_WatchdogToolKillDoesNotAttachNote guards the merged
+// union of the subagent-control in-flight hook and the coder harness note:
+// when the idle watchdog kills the in-flight shell tool (stage 1 of the
+// escalation), the killed call's failure-shaped result ("Command failed with
+// exit code -1" — the group SIGKILL) must NOT trigger the harness note. The
+// kill is not a command failure to report back about — it is the harness
+// rescuing the run so the agent can recover; the tool result itself still
+// lands in history.
+func TestExecuteToolCalls_WatchdogToolKillDoesNotAttachNote(t *testing.T) {
+	sess := harnessSession(t)
+	ctx := withOrchestrator(context.Background(), "coder-subagent-1")
+
+	toolCalls := []client.ToolCall{
+		{ID: "tc_1", Function: client.FunctionCall{Name: "bash", Arguments: `{"command":"sleep 30"}`}},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ExecuteToolCalls(ctx, sess, toolCalls, []common.ToolMiddleware{approvedMiddleware()})
+	}()
+
+	// Wait until the shell call is in flight, then kill it exactly the way
+	// the orchestrator's idle watchdog does (stage-1 tool kill).
+	deadline := time.Now().Add(5 * time.Second)
+	killed := false
+	for !killed {
+		if sess.CancelInFlightTool() {
+			killed = true
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shell tool never registered its in-flight cancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ExecuteToolCalls returned an error after the tool kill: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ExecuteToolCalls did not return after the in-flight tool was killed")
+	}
+
+	for _, msg := range sess.History {
+		if text := msg.Content.String(); strings.Contains(text, "[late harness]") {
+			t.Fatalf("a watchdog tool kill must not attach the harness note, got %q", text)
+		}
+	}
+	// The killed call's result is still recorded so the model sees what
+	// happened to its command.
+	if len(sess.History) != 1 {
+		t.Fatalf("expected 1 history entry (the killed tool result), got %d", len(sess.History))
+	}
+	if got := sess.History[0].Content.String(); !strings.Contains(got, "exit code") && !strings.Contains(got, "killed") {
+		t.Errorf("expected the killed command's result in history, got %q", got)
 	}
 }

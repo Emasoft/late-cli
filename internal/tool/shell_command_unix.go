@@ -32,25 +32,27 @@ func getUnixShellPath() string {
 
 func newShellCommand(ctx context.Context, command string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, getUnixShellPath(), "-c", command)
-	// Run bash in its own process group and kill the WHOLE group on
-	// cancellation: CommandContext kills only the direct child, and a
-	// grandchild that inherited our stdout/stderr pipes would keep
-	// CombinedOutput blocked forever even after cancel.
+
+	// Run the shell in its own process group and kill the whole group on
+	// cancellation. exec.CommandContext only signals the direct child, so a
+	// grandchild that inherited stdout/stderr (the pipes Wait reads) would
+	// survive the shell and block Wait forever; a group-wide SIGKILL reaps the
+	// entire tree and WaitDelay (below) caps any pipe still held afterwards.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		// ESRCH (process already exited) is not a cancel failure: a command
-		// finishing exactly at cancellation must not surface "process
-		// already finished" from Wait as the tool error.
+		// Negative PID targets the process group; ESRCH means the group is
+		// already gone, which is success for a kill.
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 			return err
 		}
 		return nil
 	}
-	// If a graceful window is needed, Wait closes the pipes anyway after
-	// this delay so a pipe-holding grandchild can never block Wait().
+	// Give up waiting on pipe-holding descendants 5s after the group kill so
+	// Wait (and therefore CombinedOutput) always returns.
 	cmd.WaitDelay = 5 * time.Second
+
 	return cmd
 }

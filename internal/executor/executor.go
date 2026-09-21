@@ -104,9 +104,45 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 			}
 		}
 
-		result, err := runner(ctx, tc)
+		// Each tool call runs in its own cancellable context so a hung tool
+		// can be killed individually (via sess.CancelInFlightTool — used by
+		// the orchestrator's idle watchdog, or the user) without aborting the
+		// whole run. The cancel func is registered on the session for the
+		// duration of the call; every iteration derives a FRESH toolCtx from
+		// the parent ctx, so a cancelled call never poisons its successors.
+		toolCtx, toolCancel := context.WithCancel(ctx)
+		sess.SetInFlightToolCancel(toolCancel)
+		result, err := runner(toolCtx, tc)
+		sess.ClearInFlightToolCancel()
+
+		// inFlightKill: the call's own context was cancelled while the parent
+		// run is still alive — an in-flight-tool kill (harness idle watchdog
+		// or user), not a stop request. Must be captured BEFORE the deferred
+		// toolCancel() below (which cancels toolCtx unconditionally and would
+		// make every call look killed). Checked before the error rewrite and
+		// again before the harness note: a kill must neither be reported as a
+		// tool error (incoming) nor ask the coder to "report back" (harness
+		// note) — the watchdog kills the tool precisely so the agent can
+		// recover and keep working.
+		inFlightKill := ctx.Err() == nil && toolCtx.Err() != nil
+
+		toolCancel() // the call is done; release the derived context
+
 		if err != nil {
-			result = fmt.Sprintf("Error executing tool %s: %v", tc.Function.Name, err)
+			if inFlightKill {
+				// Surface the cancellation as a normal tool result — the model
+				// sees it and can recover — and keep processing the remaining
+				// calls. (A per-call timeout would land here too, as
+				// toolCtx.Err() == context.DeadlineExceeded; none exists on
+				// this branch yet — the shell timeout is enforced inside the
+				// tool itself and returns a normal result.)
+				result = "tool cancelled by the harness idle watchdog"
+			} else {
+				// Parent cancelled (or a plain tool failure): keep today's
+				// behaviour of noting the error; the run loop's subsequent
+				// ctx checks unwind the run.
+				result = fmt.Sprintf("Error executing tool %s: %v", tc.Function.Name, err)
+			}
 		}
 		if err := sess.AddToolResultMessage(tc.ID, result); err != nil {
 			return err
@@ -125,9 +161,15 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 		// otherwise ask the agent to report back right after the user
 		// explicitly stopped the run. A shell timeout (DeadlineExceeded) is
 		// not a user stop and still gets the note.
+		//
+		// An in-flight-tool kill (idle watchdog stage 1) also suppresses the
+		// note: the watchdog kills the hung shell so the agent can recover,
+		// but the shell surfaces the kill as a failure-shaped result
+		// ("Command failed with exit code -1" — SIGKILL) that would otherwise
+		// match IsShellFailureResult and demand a report-back the same turn.
 		userCanceled := errors.Is(ctx.Err(), context.Canceled)
 		if t := sess.Registry.Get(tc.Function.Name); t != nil {
-			if _, isShell := t.(*tool.ShellTool); isShell && !userCanceled &&
+			if _, isShell := t.(*tool.ShellTool); isShell && !userCanceled && !inFlightKill &&
 				strings.Contains(strings.ToLower(common.GetOrchestratorID(ctx)), "coder") &&
 				tool.IsShellFailureResult(result) {
 				note := "[late harness] error note: the command above failed. If fixing it requires modifying components or architecture beyond the task you were delegated, stop and report back to the main agent instead of proceeding on your own initiative."
