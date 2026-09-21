@@ -207,6 +207,26 @@ export OPENAI_MODEL="model-name"
 
 ---
 
+## Development
+
+### Development installer (`install-dev.sh`)
+`./install-dev.sh` is a strictly **development** installer: it builds from a git
+source and can install the unstable `main` branches. It is interactive by
+default and autodetects platform, current install, remotes and conflicts.
+
+Headless (dev boxes / CI):
+```bash
+./install-dev.sh --choice 1                 # local unstable dev (current branch, symlink)
+./install-dev.sh --choice 6                 # detection report only
+./install-dev.sh --choice 2 --target /tmp/bin --dry-run
+```
+`--choice N` maps to the menu entries (1 local-dev, 2 pinned, 3 fork-main,
+4 upstream-main, 5 official, 6 check), implies `--yes`, and requires no human
+supervision. Safety: the previous binary is archived as `.bak-<timestamp>`,
+brew-owned installs warn, running as root is refused.
+
+---
+
 ## License
 
 Built to create engineering leverage, not to supply free infrastructure for AI startups.
