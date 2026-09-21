@@ -23,9 +23,15 @@
 # Usage:
 #   ./install-dev.sh                     # interactive menu (needs a TTY)
 #   ./install-dev.sh <source> [flags]    # non-interactive
+#   ./install-dev.sh --choice N [flags]  # headless: menu entry N, implies --yes
 #   ./install-dev.sh --dry-run pinned    # print the plan, mutate nothing
 #
-# Flags (any position): --yes  --dry-run  --target DIR  --help
+# Flags (any position): --yes  --dry-run  --target DIR  --choice N  --help
+#
+# Headless mode (--choice N, 1..6 = the menu entries) implies --yes and
+# never shows the menu or prompts; running as root is refused (set
+# LATE_INSTALL_ALLOW_ROOT=1 to override). The 'official' source may still
+# prompt — the upstream script owns it.
 #
 # Go back to a brew-managed `late` at any time:
 #   brew uninstall late 2>/dev/null; brew install late
@@ -43,6 +49,7 @@ ASSUME_YES=0
 DRY_RUN=0
 TARGET_OVERRIDE=""
 SOURCE=""
+CHOICE=""
 LATE_TMP=""
 BAK_HINTS=""
 
@@ -70,6 +77,28 @@ warn() { echo "⚠️  $*" >&2; }
 info() { echo "=> $*"; }
 die()  { err "$*"; exit 1; }
 
+# usage_error — bad usage: print the error plus the full usage, exit 2.
+usage_error() {
+  err "$*"
+  usage >&2
+  exit 2
+}
+
+# arg_error — bad usage without the full usage block, exit 2.
+arg_error() {
+  err "$*"
+  exit 2
+}
+
+# refuse_root — the installer is user-level; refuse accidental root runs
+# (dev boxes and containers often run as root by default).
+refuse_root() {
+  if [ "$(id -u)" -eq 0 ] && [ "${LATE_INSTALL_ALLOW_ROOT:-0}" != "1" ]; then
+    err "late installer is user-level; set LATE_INSTALL_ALLOW_ROOT=1 to override"
+    exit 2
+  fi
+}
+
 usage() {
   cat <<EOF
 install-dev.sh — smart multi-source installer for the \`late\` command
@@ -92,10 +121,17 @@ Flags (any position):
   --dry-run      print the plan, mutate nothing (the repo build still runs;
                  it writes only bin/late inside the repo)
   --target DIR   override the install directory (not applicable to 'official')
+  --choice N     headless mode: select menu entry N (1 local-dev, 2 pinned,
+                 3 fork-main, 4 upstream-main, 5 official, 6 check);
+                 implies --yes, never shows the menu or prompts. 'official'
+                 may still prompt — the upstream script owns it.
   --help         show this help
 
 With no SOURCE and a TTY on stdin an interactive menu is shown; without a
-TTY one choice is read from a single stdin line.
+TTY one choice is read from a single stdin line. --choice N skips the menu
+entirely (headless mode).
+
+Running as root is refused (set LATE_INSTALL_ALLOW_ROOT=1 to override).
 
 Every install archives a displaced binary as <target>.bak-<timestamp>
 (never overwritten) and prints a revert hint.
@@ -747,6 +783,36 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# validate_choice N — --choice must be an integer in 1..6 (menu entries).
+validate_choice() {
+  case "$1" in
+    ''|*[!0-9]*)
+      usage_error "--choice expects an integer 1-6 (got: '$1')" ;;
+  esac
+  if [ "$1" -lt 1 ] || [ "$1" -gt 6 ]; then
+    usage_error "--choice expects an integer 1-6 (got: $1)"
+  fi
+}
+
+# validate_target_override — fool-proofing for an explicit --target: it must
+# be an absolute path and must not name a system directory (/usr/local/bin
+# stays allowed).
+validate_target_override() {
+  [ -n "$TARGET_OVERRIDE" ] || return 0
+  case "$TARGET_OVERRIDE" in
+    /*) ;;
+    *)  arg_error "--target must be an absolute path (got: ${TARGET_OVERRIDE})" ;;
+  esac
+  local norm="$TARGET_OVERRIDE"
+  while [ "$norm" != "/" ] && [ "${norm%/}" != "$norm" ]; do
+    norm="${norm%/}"
+  done
+  case "$norm" in
+    /|/bin|/sbin|/etc|/usr)
+      arg_error "refusing --target ${TARGET_OVERRIDE}: system directory (use e.g. /usr/local/bin or ~/.local/bin)" ;;
+  esac
+}
+
 parse_args() {
   local positional_count=0
   while [ $# -gt 0 ]; do
@@ -770,13 +836,43 @@ parse_args() {
           die "--target requires a directory argument"
         fi
         ;;
-      --help|-h|help)
+      --choice)
+        if [ "$positional_count" -gt 0 ]; then
+          arg_error "pass either an option name or --choice N"
+        fi
+        if [ $# -lt 2 ]; then
+          usage_error "--choice requires a number argument (1-6)"
+        fi
+        validate_choice "$2"
+        CHOICE="$2"
+        shift
+        ;;
+      --choice=*)
+        if [ "$positional_count" -gt 0 ]; then
+          arg_error "pass either an option name or --choice N"
+        fi
+        CHOICE="${1#--choice=}"
+        if [ -z "$CHOICE" ]; then
+          usage_error "--choice requires a number argument (1-6)"
+        fi
+        validate_choice "$CHOICE"
+        ;;
+      --help|-h)
+        SOURCE="help"
+        ;;
+      help)
+        if [ -n "$CHOICE" ]; then
+          arg_error "pass either an option name or --choice N"
+        fi
         SOURCE="help"
         ;;
       check|local-dev|pinned|fork-main|upstream-main|official)
         positional_count=$((positional_count + 1))
         if [ "$positional_count" -gt 1 ]; then
           die "only one SOURCE argument is allowed (got another: $1)"
+        fi
+        if [ -n "$CHOICE" ]; then
+          arg_error "pass either an option name or --choice N"
         fi
         SOURCE="$1"
         ;;
@@ -789,10 +885,19 @@ parse_args() {
 }
 
 main() {
+  refuse_root
   parse_args "$@"
+  validate_target_override
   if [ "$SOURCE" = "help" ]; then
     usage
     return 0
+  fi
+  if [ -n "$CHOICE" ]; then
+    # Headless mode: --choice N selects the menu entry, implies --yes and
+    # never shows the menu or prompts. 'official' may still prompt because
+    # the upstream script owns its interaction.
+    ASSUME_YES=1
+    SOURCE="$(choice_to_source "$CHOICE")"
   fi
   run_detection
   if [ -z "$SOURCE" ]; then
