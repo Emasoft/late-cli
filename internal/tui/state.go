@@ -428,8 +428,9 @@ type McpStatusMsg struct {
 
 // ToastMsg carries a temporary toast notification into the TUI update loop.
 type ToastMsg struct {
-	Text    string
-	Warning bool
+	Text     string
+	Warning  bool
+	Duration time.Duration
 }
 
 // BootstrapStatusMsg carries startup progress into the TUI update loop.

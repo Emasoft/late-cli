@@ -1134,3 +1134,62 @@ func TestRunLoopRecoveryOncePerTurn(t *testing.T) {
 		t.Fatalf("history length = %d, want 4 (seeded user, tool call, tool result, final reply)", len(sess.History))
 	}
 }
+
+// TestRunLoopOnRecoverFiresOnHTTPConnectBeforeChunks verifies that onRecover fires
+// upon HTTP 200 connect of the retried attempt, before streaming has finished.
+func TestRunLoopOnRecoverFiresOnHTTPConnectBeforeChunks(t *testing.T) {
+	var recoveryTime time.Time
+	var streamFinishedTime time.Time
+
+	var posts atomic.Int64
+	rs := newRetryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		p := posts.Add(1)
+		if p == 1 {
+			serveStatus(w, http.StatusInternalServerError, "first attempt down")
+			return
+		}
+		// Second attempt: send 200 headers, then delay before sending chunks
+		// to simulate prompt processing / TTFT
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprint(w, "data: "+`{"choices":[{"index":0,"delta":{"content":"delayed chunk"}}]}`+"\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(50 * time.Millisecond)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	sess := newRetryTestSession(t, rs.server.URL)
+	onRecover := func() {
+		recoveryTime = time.Now()
+	}
+
+	ctx, cancel := runLoopCtx(3, 15*time.Second)
+	defer cancel()
+
+	res, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, nil, onRecover, nil)
+	streamFinishedTime = time.Now()
+
+	if err != nil {
+		t.Fatalf("RunLoop failed: %v", err)
+	}
+	if res != "delayed chunk" {
+		t.Fatalf("RunLoop result = %q, want 'delayed chunk'", res)
+	}
+	if recoveryTime.IsZero() {
+		t.Fatal("onRecover was never called")
+	}
+	// recoveryTime should have fired well before streamFinishedTime (at least ~100ms before)
+	if streamFinishedTime.Sub(recoveryTime) < 50*time.Millisecond {
+		t.Errorf("onRecover fired at %v, but stream finished at %v; difference %v should be >= 50ms",
+			recoveryTime, streamFinishedTime, streamFinishedTime.Sub(recoveryTime))
+	}
+}

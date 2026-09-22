@@ -354,7 +354,14 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	if (s.State == StateStreaming || s.State == StateThinking) && !s.StreamingState.Completed {
 		active := s.StreamingState
 		if active.Content != "" || active.ReasoningContent != "" || len(active.ToolCalls) > 0 {
-			entries = append(entries, transcriptEntry{active: true, index: len(history), role: "assistant", content: active.Content, reasoning: active.ReasoningContent, labels: toolLabels(active.ToolCalls, true)})
+			labels := toolLabels(active.ToolCalls, true)
+			if s.RetryVerb != "" {
+				labels = append(labels, transcriptLabel{
+					rendered: statusWarningStyle.Render("  ↳ interrupted · retrying..."),
+					activity: "interrupted · retrying...",
+				})
+			}
+			entries = append(entries, transcriptEntry{active: true, index: len(history), role: "assistant", content: active.Content, reasoning: active.ReasoningContent, labels: labels})
 		} else if !hasActiveTool {
 			entries = append(entries, transcriptEntry{index: len(history), role: "thinking", content: "thinking..."})
 		}
@@ -371,6 +378,9 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: "**Context Limit Warning**\n\nOver 90% of the context is used. Press Enter again to proceed, or start a new session."})
 	}
 	if s.Error != nil {
+		if s.StreamingState.Content != "" {
+			entries = append(entries, transcriptEntry{index: len(history), role: "assistant", content: s.StreamingState.Content})
+		}
 		entries = append(entries, transcriptEntry{index: -1, role: "error", content: transcriptError(s.Error)})
 	} else if m.Err != nil {
 		entries = append(entries, transcriptEntry{index: -1, role: "error", content: transcriptError(m.Err)})

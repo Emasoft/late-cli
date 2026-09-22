@@ -194,6 +194,10 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 			return
 		}
 
+		if req.OnConnect != nil {
+			req.OnConnect()
+		}
+
 		scanner := bufio.NewScanner(resp.Body)
 		// Some providers emit very long SSE lines (e.g. huge tool-call argument
 		// deltas or inline base64 parts). The default 64 KB scanner limit would

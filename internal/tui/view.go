@@ -1510,6 +1510,20 @@ func (m *Model) renderModelPickerView() {
 // text use the same clock; only this visible row is repainted on animation ticks.
 func (m *Model) renderActivityAt(text string, width int, now time.Time) string {
 	text = strings.Join(strings.Fields(text), " ")
+	if strings.HasPrefix(text, "interrupted") || strings.Contains(text, "interrupted · retrying") {
+		dots := []string{".", "..", "..."}[(now.UnixMilli()/350)%3]
+		base := strings.TrimPrefix(text, "↳")
+		base = strings.TrimPrefix(strings.TrimSpace(base), "↳")
+		base = strings.TrimSpace(base)
+		base = strings.TrimRight(strings.TrimSuffix(base, "..."), ".")
+		row := statusWarningStyle.Render("  ↳ " + base + dots)
+		truncated := ansi.Truncate(row, max(1, width), "")
+		rw := ansi.StringWidth(truncated)
+		if rw < width {
+			truncated += lipgloss.NewStyle().Background(appBgColor).Render(strings.Repeat(" ", width-rw))
+		}
+		return truncated
+	}
 	frames := spinner.Dot
 	frame := int(now.UnixNano()/int64(frames.FPS)) % len(frames.Frames)
 	marker := lipgloss.NewStyle().Foreground(primaryColor).Background(appBgColor).Render(strings.TrimSpace(frames.Frames[frame]))

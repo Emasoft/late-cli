@@ -287,6 +287,7 @@ func RunLoop(
 		var acc *StreamAccumulator
 		var err error
 		infraAttempts, badBodyAttempts := 0, 0
+		var recoveryFired bool
 		for {
 			// Pre-attempt guard (retries only): if the context died while we
 			// were waiting in a previous backoff (both select cases below can
@@ -296,7 +297,17 @@ func RunLoop(
 				return "", err
 			}
 
-			streamCh, errCh := sess.StartStream(ctx, extraBody)
+			var onConnect func()
+			if (infraAttempts+badBodyAttempts) > 0 && onRecover != nil {
+				onConnect = func() {
+					if !recoveryFired {
+						recoveryFired = true
+						onRecover()
+					}
+				}
+			}
+
+			streamCh, errCh := sess.StartStream(ctx, extraBody, onConnect)
 			acc, err = ConsumeStream(ctx, streamCh, errCh, onStreamChunk)
 			if err == nil {
 				break
@@ -381,10 +392,8 @@ func RunLoop(
 		// response. If at least one retry happened in this turn, signal
 		// recovery exactly once: the turn-start callback fired before the
 		// retries, so no thinking event will announce it.
-		if (infraAttempts+badBodyAttempts) > 0 && onRecover != nil {
-			// The retried attempt actually produced a response: signal
-			// recovery now (the turn-start callback fired before the
-			// retries, so no thinking event will announce it).
+		if (infraAttempts+badBodyAttempts) > 0 && onRecover != nil && !recoveryFired {
+			// Signal recovery if not already fired upon connect (e.g. mock session).
 			onRecover()
 		}
 
