@@ -145,11 +145,6 @@ var (
 				BorderBackground(appBgColor).
 				Foreground(textColor)
 
-	statusDivider = lipgloss.NewStyle().
-			Foreground(activeBorder).
-			Background(appBgColor).
-			Render(" │ ")
-
 	statusKeyStyle = lipgloss.NewStyle().
 			Foreground(subtextColor).
 			Background(appBgColor).

@@ -14,8 +14,10 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// FrameRate controls screen assembly and Bubble Tea's terminal refresh rate.
-const FrameRate = 120
+// FrameRate controls Bubble Tea's terminal refresh rate and transcript
+// presentation. At 60 FPS, a fast local model can display each token without
+// the visible coalescing caused by a lower presentation cadence.
+const FrameRate = 60
 
 const transcriptFrameInterval = time.Second / FrameRate
 
@@ -403,6 +405,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	answerStyle := assistantReplyStyle(width)
 	return func() tea.Msg {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
+		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if err != nil {
 				return source
@@ -413,7 +416,27 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			return out
 		}
-		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
+		// Completed Markdown blocks cannot be changed by later stream deltas, so
+		// retain their fully styled output. Only the unfinished tail is parsed on
+		// each update, preserving immediate Markdown without repeatedly rendering
+		// the complete growing response.
+		streamingMarkdown := func(source string) string {
+			complete, tail := splitStreamingMarkdown(source)
+			parts := make([]string, 0, len(complete)+1)
+			for _, block := range complete {
+				key := "stream-markdown:" + block
+				cached, ok := oldCache[key]
+				if !ok {
+					cached = []string{answerStyle.Render(strings.Trim(markdown(block), "\r\n"))}
+				}
+				result.cache[key] = cached
+				parts = append(parts, cached[0])
+			}
+			if text := strings.TrimLeft(tail, "\r\n"); text != "" {
+				parts = append(parts, answerStyle.Render(strings.Trim(markdown(text), "\r\n")))
+			}
+			return strings.Join(parts, "\n")
+		}
 		for _, entry := range entries {
 			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels)
 			rows, ok := oldCache[key]
@@ -447,7 +470,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						if entry.reasoning != "" {
 							parts = append(parts, "")
 						}
-						parts = append(parts, answerStyle.Render(strings.Trim(markdown(entry.content), "\r\n")))
+						if entry.active {
+							parts = append(parts, streamingMarkdown(entry.content))
+						} else {
+							rendered := markdown(entry.content)
+							parts = append(parts, answerStyle.Render(strings.Trim(rendered, "\r\n")))
+						}
 					}
 					if len(entry.labels) > 0 {
 						if len(parts) > 0 && parts[len(parts)-1] != "" {
@@ -525,6 +553,26 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		return result
 	}
+}
+
+// splitStreamingMarkdown returns stable blocks ending at blank lines outside
+// fenced code. Anything after the last safe boundary remains mutable. Keeping
+// an open fence in the tail is important because its closing delimiter changes
+// how the whole block must be rendered.
+func splitStreamingMarkdown(content string) (complete []string, tail string) {
+	inFence := false
+	lastSplit := 0
+	for i := 0; i < len(content); i++ {
+		if (i == 0 || content[i-1] == '\n') && i+3 <= len(content) && content[i:i+3] == "```" {
+			inFence = !inFence
+		}
+		if !inFence && i+1 < len(content) && content[i] == '\n' && content[i+1] == '\n' {
+			complete = append(complete, content[lastSplit:i+2])
+			lastSplit = i + 2
+			i++
+		}
+	}
+	return complete, content[lastSplit:]
 }
 
 func transcriptError(err error) string {
