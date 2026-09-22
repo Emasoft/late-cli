@@ -485,6 +485,15 @@ func (o *BaseOrchestrator) run() {
 		}
 	}
 
+	// Lifecycle: the loop exits on errors, stop requests, or completion. Any
+	// path that leaves this loop must clear isRunning — otherwise every later
+	// Submit is silently queued into pendingMsgs (consumed by a run that will
+	// never start) and the orchestrator hangs. Queued messages are preserved:
+	// the next run's first turn (onStartTurn) consumes them.
+	o.mu.Lock()
+	o.isRunning = false
+	o.mu.Unlock()
+
 	// Check if stop was requested and send StopRequestedEvent
 	if o.IsStopRequested() {
 		o.eventCh <- common.StopRequestedEvent{ID: o.id}
