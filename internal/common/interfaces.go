@@ -149,13 +149,14 @@ type InputProvider interface {
 type contextKey string
 
 const (
-	InputProviderKey     contextKey = "input_provider"
-	OrchestratorIDKey    contextKey = "orchestrator_id"
-	SkipConfirmationKey  contextKey = "skip_confirmation"
-	ToolApprovalKey      contextKey = "tool_approval"
-	MaxStreamRetriesKey  contextKey = "max_stream_retries"
-	MaxBadBodyRetriesKey contextKey = "max_bad_body_retries"
-	ForceRevaluateKey    contextKey = "force_revaluate"
+	InputProviderKey      contextKey = "input_provider"
+	OrchestratorIDKey     contextKey = "orchestrator_id"
+	SkipConfirmationKey   contextKey = "skip_confirmation"
+	ToolApprovalKey       contextKey = "tool_approval"
+	MaxStreamRetriesKey   contextKey = "max_stream_retries"
+	MaxBadBodyRetriesKey  contextKey = "max_bad_body_retries"
+	ForceRevaluateKey     contextKey = "force_revaluate"
+	MaxThrottleRetriesKey contextKey = "max_throttle_retries"
 )
 
 // MainAgentID is the orchestrator ID of the root/main agent.

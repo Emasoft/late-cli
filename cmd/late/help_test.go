@@ -33,6 +33,7 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 	fs.Int("max-stream-retries", 100, "usage of max-stream-retries")
 	fs.Duration("bash-timeout", 10*time.Minute, "usage of bash-timeout")
 	fs.Duration("subagent-timeout", 30*time.Minute, "usage of subagent-timeout")
+	fs.Int("max-concurrent-llm-requests", 6, "usage of max-concurrent-llm-requests")
 	return fs
 }
 

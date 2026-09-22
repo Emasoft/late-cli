@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"hash/fnv"
 	"image/color"
 	"math"
 	"os"
@@ -361,7 +360,7 @@ func (m *Model) renderMinimalEqualizerAt(now time.Time) string {
 
 		// Gentle incommensurate harmonic (golden ratio 1.618) creates organic, non-repeating crests
 		// Low amplitude ensures it never causes erratic snap or jitter
-		w2 := 0.35 * math.Sin(t*0.93+float64(i)*0.55+1.2)
+		w2 := 0.35 * math.Sin(t*0.93 + float64(i)*0.55 + 1.2)
 
 		// Breathing envelope gives gentle natural cadence
 		swell := 0.88 + 0.20*math.Sin(t*0.38+float64(i)*0.25)
@@ -505,53 +504,6 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 	return sb.String()
 }
 
-// agentTypeFromID derives a display category from an orchestrator ID:
-// "main" is the root orchestrator; subagents are minted as
-// "<type>-subagent-<n>" (BaseOrchestrator.NextChildID), so the category
-// is the prefix before "-subagent-". Any other id (future categories,
-// test doubles) falls back to the id itself. Returns "" for "".
-func agentTypeFromID(id string) string {
-	if id == "" {
-		return ""
-	}
-	if id == common.MainAgentID {
-		return "orchestrator"
-	}
-	if i := strings.Index(id, "-subagent-"); i > 0 {
-		return id[:i]
-	}
-	return id
-}
-
-// agentTypeColors assigns one bright color per agent category so the
-// status bar makes the current agent unmistakable at a glance.
-var agentTypeColors = map[string]color.Color{
-	"orchestrator": lipgloss.BrightGreen,
-	"researcher":   lipgloss.BrightCyan,
-	"coder":        lipgloss.BrightMagenta,
-}
-
-// futureAgentTypeColors gives categories without a dedicated entry a
-// stable bright color (FNV-1a of the category name), so agent types
-// added later as new subagent JSON configs remain visible and
-// consistently colored across renders and restarts.
-var futureAgentTypeColors = []color.Color{
-	lipgloss.BrightYellow,
-	lipgloss.BrightBlue,
-	lipgloss.BrightWhite,
-}
-
-// agentTypeStyle returns the bold bright-colored style for a category.
-func agentTypeStyle(agentType string) lipgloss.Style {
-	color, ok := agentTypeColors[agentType]
-	if !ok {
-		h := fnv.New32a()
-		h.Write([]byte(agentType))
-		color = futureAgentTypeColors[h.Sum32()%uint32(len(futureAgentTypeColors))]
-	}
-	return lipgloss.NewStyle().Bold(true).Foreground(color)
-}
-
 func (m *Model) statusBarView() string {
 	w := max(m.Width, 1)
 
@@ -614,13 +566,6 @@ func (m *Model) statusBarView() string {
 		}
 	}
 	leftItems = append(leftItems, statePart)
-
-	// Agent category of the focused agent (bright, one color per type),
-	// shown before the branch/CWD context. Always visible: agent identity
-	// is not CWD context, so -show-cwd=false must not hide it.
-	if agentType := agentTypeFromID(m.Focused.ID()); agentType != "" {
-		leftItems = append(leftItems, agentTypeStyle(agentType).Render(agentType))
-	}
 
 	// Branch or CWD (whisper-muted, unobtrusive context)
 	if m.ShowCWD {
