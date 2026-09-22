@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestBaseOrchestrator_ResetContextIfCancelledPreservesConfiguration(t *testing.T) {
@@ -305,5 +306,132 @@ func TestBaseOrchestrator_Execute_EmptyTextDoesNotAddMessage(t *testing.T) {
 	}
 	if userMsgCount != 1 {
 		t.Fatalf("expected exactly 1 user message, got %d", userMsgCount)
+	}
+}
+
+func TestBaseOrchestrator_DrainQueuedMessages(t *testing.T) {
+	tmpDir := t.TempDir()
+	historyPath := filepath.Join(tmpDir, "session.json")
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	sess := session.New(c, historyPath, nil, "", false)
+	o := NewBaseOrchestrator("test", sess, nil, 1)
+
+	// Simulate orchestrator is currently running
+	o.isRunning = true
+
+	// Submit queued messages
+	if err := o.Submit("queued 1", nil); err != nil {
+		t.Fatalf("Submit error: %v", err)
+	}
+	if err := o.Submit("queued 2", nil); err != nil {
+		t.Fatalf("Submit error: %v", err)
+	}
+
+	queued := o.QueuedMessages()
+	if len(queued) != 2 || queued[0] != "queued 1" || queued[1] != "queued 2" {
+		t.Fatalf("QueuedMessages() = %v, want [queued 1, queued 2]", queued)
+	}
+
+	drained := o.DrainQueuedMessages()
+	if len(drained) != 2 || drained[0] != "queued 1" || drained[1] != "queued 2" {
+		t.Fatalf("DrainQueuedMessages() = %v, want [queued 1, queued 2]", drained)
+	}
+
+	// After draining, QueuedMessages should be empty
+	if len(o.QueuedMessages()) != 0 {
+		t.Fatalf("QueuedMessages() after drain = %v, want empty", o.QueuedMessages())
+	}
+
+	// Subsequent drain returns nil
+	if o.DrainQueuedMessages() != nil {
+		t.Fatalf("DrainQueuedMessages() second call want nil")
+	}
+}
+
+func TestBaseOrchestrator_CancelClearsQueuedMessages(t *testing.T) {
+	tmpDir := t.TempDir()
+	historyPath := filepath.Join(tmpDir, "session.json")
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	sess := session.New(c, historyPath, nil, "", false)
+	o := NewBaseOrchestrator("test", sess, nil, 1)
+
+	o.isRunning = true
+	_ = o.Submit("queued prompt", nil)
+
+	if len(o.QueuedMessages()) != 1 {
+		t.Fatalf("expected 1 queued message")
+	}
+
+	o.Cancel()
+
+	if len(o.QueuedMessages()) != 0 {
+		t.Fatalf("Cancel() did not clear queued messages: %v", o.QueuedMessages())
+	}
+}
+
+func TestBaseOrchestrator_CancelDuringRunDoesNotCommitQueuedMessages(t *testing.T) {
+	// Setup a server that holds the connection until cancelled
+	holdCh := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-holdCh
+	}))
+	defer ts.Close()
+	defer close(holdCh)
+
+	tmpDir := t.TempDir()
+	historyPath := filepath.Join(tmpDir, "session.json")
+	c := client.NewClient(client.Config{BaseURL: ts.URL})
+	sess := session.New(c, historyPath, nil, "", false)
+	o := NewBaseOrchestrator("test", sess, nil, 5)
+
+	// Start initial turn
+	if err := o.Submit("turn 1", nil); err != nil {
+		t.Fatalf("Submit turn 1 failed: %v", err)
+	}
+
+	// Wait briefly so run() starts
+	time.Sleep(50 * time.Millisecond)
+
+	// Queue turn 2
+	if err := o.Submit("turn 2", nil); err != nil {
+		t.Fatalf("Submit turn 2 failed: %v", err)
+	}
+
+	// Drain queued messages (simulating user pressing ctrl+g)
+	drained := o.DrainQueuedMessages()
+	if len(drained) != 1 || drained[0] != "turn 2" {
+		t.Fatalf("drained = %v, want [turn 2]", drained)
+	}
+
+	// Cancel orchestrator
+	o.Cancel()
+
+	// Wait for run() to finish
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		o.mu.RLock()
+		running := o.isRunning
+		o.mu.RUnlock()
+		if !running || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	o.mu.RLock()
+	running := o.isRunning
+	o.mu.RUnlock()
+	if running {
+		t.Fatalf("orchestrator is still running after Cancel()")
+	}
+
+	// Verify that "turn 2" was NEVER committed to session history
+	for _, m := range o.History() {
+		if m.Content.String() == "turn 2" {
+			t.Fatalf("turn 2 was committed to session history despite cancellation")
+		}
 	}
 }

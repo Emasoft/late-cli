@@ -41,6 +41,7 @@ type Orchestrator interface {
 	MaxTokens() int
 	SupportsVision() bool
 	QueuedMessages() []string
+	DrainQueuedMessages() []string
 }
 
 // Event represents something that happened in the orchestrator.

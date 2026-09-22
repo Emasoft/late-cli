@@ -109,8 +109,30 @@ func (o *BaseOrchestrator) QueuedMessages() []string {
 	defer o.mu.RUnlock()
 	var msgs []string
 	for _, m := range o.pendingMsgs {
-		msgs = append(msgs, m.Content.String())
+		text := m.Content.UIString()
+		if text == "" {
+			text = m.Content.String()
+		}
+		msgs = append(msgs, text)
 	}
+	return msgs
+}
+
+func (o *BaseOrchestrator) DrainQueuedMessages() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.pendingMsgs) == 0 {
+		return nil
+	}
+	msgs := make([]string, 0, len(o.pendingMsgs))
+	for _, m := range o.pendingMsgs {
+		text := m.Content.UIString()
+		if text == "" {
+			text = m.Content.String()
+		}
+		msgs = append(msgs, text)
+	}
+	o.pendingMsgs = nil
 	return msgs
 }
 
@@ -228,6 +250,9 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 	var extraBody map[string]any
 
 	onStartTurn := func() {
+		if ctx.Err() != nil {
+			return
+		}
 		o.RefreshContextSize(ctx)
 		o.mu.Lock()
 		msgs := o.pendingMsgs
@@ -332,12 +357,26 @@ func (o *BaseOrchestrator) run() {
 	o.mu.Unlock()
 
 	defer cancel() // Ensure we don't leak the context when run() finishes
+	defer func() {
+		o.mu.Lock()
+		o.isRunning = false
+		o.pendingMsgs = nil
+		o.mu.Unlock()
+	}()
 
 	// Inject orchestrator ID into context for tool interactions
 	ctx = context.WithValue(ctx, common.OrchestratorIDKey, o.id)
 
 	for {
+		if ctx.Err() != nil {
+			o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
+			break
+		}
+
 		onStartTurn := func() {
+			if ctx.Err() != nil {
+				return
+			}
 			o.RefreshContextSize(ctx)
 			o.mu.Lock()
 			msgs := o.pendingMsgs
@@ -505,6 +544,8 @@ func (o *BaseOrchestrator) Events() <-chan common.Event {
 func (o *BaseOrchestrator) Cancel() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	o.pendingMsgs = nil
 
 	if o.cancel != nil {
 		o.cancel()

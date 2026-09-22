@@ -269,6 +269,9 @@ func RunLoop(
 	}
 
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		if onStartTurn != nil {
 			onStartTurn()
 		}

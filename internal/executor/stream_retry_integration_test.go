@@ -479,23 +479,12 @@ func TestRunLoopCancelDuringBackoffStops(t *testing.T) {
 	defer cancel()
 
 	// Mirror the TUI stop path: cancel as soon as the first RetryEvent
-	// arrives, i.e. while RunLoop sits in its ctx-aware backoff sleep.
-	firstRetry := make(chan struct{})
+	// arrives, so RunLoop aborts before completing the backoff sleep.
+	var once sync.Once
 	onRetry := func(ev common.RetryEvent) {
 		collect(ev)
-		select {
-		case firstRetry <- struct{}{}:
-		default:
-		}
+		once.Do(cancel)
 	}
-	go func() {
-		select {
-		case <-firstRetry:
-			cancel()
-		case <-time.After(3 * time.Second):
-			// No retry ever fired; let the test's own assertions report it.
-		}
-	}()
 
 	start := time.Now()
 	_, err := RunLoop(ctx, sess, 1, nil, nil, nil, nil, onRetry, onRecover, nil)

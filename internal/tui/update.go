@@ -2018,6 +2018,24 @@ func (m Model) navigateHistory(dir int) Model {
 }
 
 func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
+	drained := m.Focused.DrainQueuedMessages()
+	if len(drained) > 0 {
+		restored := strings.Join(drained, "\n")
+		curr := m.Input.Value()
+		if curr != "" {
+			m.Input.SetValue(restored + "\n" + curr)
+		} else {
+			m.Input.SetValue(restored)
+		}
+		m.Input.CursorEnd()
+
+		for i := len(drained) - 1; i >= 0; i-- {
+			if len(m.InputHistory) > 0 && m.InputHistory[len(m.InputHistory)-1] == drained[i] {
+				m.InputHistory = m.InputHistory[:len(m.InputHistory)-1]
+			}
+		}
+	}
+
 	focusedState := m.GetAgentState(m.Focused.ID())
 	if focusedState.State == StateConfirmTool && focusedState.PendingConfirm != nil {
 		focusedState.PendingConfirm.ResultCh <- "n"
@@ -2030,7 +2048,7 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.updateViewport()
 		return m, nil
 	}
-	if focusedState.State == StateThinking || focusedState.State == StateStreaming {
+	if focusedState.State == StateThinking || focusedState.State == StateStreaming || focusedState.State == StateStopping {
 		focusedState.PendingStop = true
 		focusedState.State = StateStopping
 		focusedState.StatusText = "Stopping..."
@@ -2038,6 +2056,9 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.Focused.Cancel()
 		m.updateViewport()
 		return m, nil
+	}
+	if len(drained) > 0 {
+		m.updateViewport()
 	}
 	return m, nil
 }

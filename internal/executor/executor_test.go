@@ -374,3 +374,25 @@ func TestRegisterTools_TodoTools(t *testing.T) {
 	}
 }
 
+func TestRunLoop_PreCancelledContextDoesNotInvokeStartTurn(t *testing.T) {
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	histPath := filepath.Join(t.TempDir(), "history.json")
+	sess := session.New(c, histPath, nil, "", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var startTurnCalled bool
+	onStartTurn := func() {
+		startTurnCalled = true
+	}
+
+	_, err := RunLoop(ctx, sess, 1, nil, onStartTurn, nil, nil, nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if startTurnCalled {
+		t.Fatal("onStartTurn was invoked despite cancelled context")
+	}
+}
+
