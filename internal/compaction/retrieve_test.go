@@ -394,7 +394,7 @@ func TestRetrieve_ScoringErrorAbortsTheReadSide(t *testing.T) {
 		return http.StatusServiceUnavailable, `{"error": {"message": "down"}}`
 	})
 	// Shrink the client's retry curve for a fast test.
-	p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
+	shrinkPipelineRetryCurve(p)
 
 	records, err := p.Retrieve(context.Background(), "task", retrieveTestStore(), 0, 0, 0)
 	if err == nil {

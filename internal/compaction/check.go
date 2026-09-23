@@ -28,7 +28,10 @@ import (
 // The first failing stage stops the run (the later stages depend on the
 // earlier ones), and its Detail names the failure class (the Step 15 typed
 // errors) so the operator learns WHICH thing broke — bad key, malformed
-// request, unreachable server — not just that something did.
+// request, unreachable server — not just that something did. The offline
+// variant (RunPreflightOffline, in offline.go) runs the same stages over the
+// scripted scorer for the compaction-backend "offline" demo path: its stages
+// are local by design, not stubbed backends.
 
 // Stage names in a preflight report, in run order. "backend" is stage 0: the
 // report's opening line (and, when the CLI cannot resolve a backend at all,
@@ -88,11 +91,20 @@ type CheckResult struct {
 // stage's pointers — so a failed report is shorter than a passed one. The
 // boolean is the overall verdict: every stage OK.
 //
-// Every stage builds its own throwaway client (never a production client:
-// the check must not share rate-limit state or an auth poison flag with a
-// live pipeline) and sends ONE attempt per request: a preflight names what
-// broke, it does not ride out an outage with retries.
+// The stages run over ONE throwaway client (never a production client: the
+// check must not share rate-limit state or an auth poison flag with a live
+// pipeline) that sends ONE attempt per request: a preflight names what broke,
+// it does not ride out an outage with retries. The offline preflight
+// (RunPreflightOffline) runs the same stages over the scripted scorer.
 func RunPreflight(ctx context.Context, backend ResolvedBackend, apiKey string, hc *http.Client) ([]CheckResult, bool) {
+	return runPreflightStages(ctx, newCheckClient(backend, apiKey, hc), backendDetail(backend, apiKey))
+}
+
+// runPreflightStages is the three-stage body shared by the backend preflight
+// (RunPreflight) and the offline one (RunPreflightOffline): scorer scores
+// every stage, backendLine is stage 0's opening line. Stage order and the
+// stop-at-first-failure contract are documented on RunPreflight.
+func runPreflightStages(ctx context.Context, scorer Scorer, backendLine string) ([]CheckResult, bool) {
 	results := make([]CheckResult, 0, 4)
 
 	// Stage 0 — backend: the report's opening line (name, endpoint, model,
@@ -101,13 +113,13 @@ func RunPreflight(ctx context.Context, backend ResolvedBackend, apiKey string, h
 	results = append(results, CheckResult{
 		Stage:  CheckStageBackend,
 		OK:     true,
-		Detail: backendDetail(backend, apiKey),
+		Detail: backendLine,
 	})
 
 	// Stage 1 — questions: a minimal batch must parse and every id must
 	// come back with a numeric score and no failure.
 	start := time.Now()
-	qErr := probeScoreBatch(ctx, newCheckClient(backend, apiKey, hc), len(probeTexts(3)))
+	qErr := probeScoreBatch(ctx, scorer, len(probeTexts(3)))
 	qr := CheckResult{Stage: CheckStageQuestions, Latency: time.Since(start)}
 	if qErr != nil {
 		qr.Detail = failureDetail(qErr)
@@ -119,11 +131,11 @@ func RunPreflight(ctx context.Context, backend ResolvedBackend, apiKey string, h
 
 	// Stage 2 — gate: a throwaway pipeline (in-memory store, no shadow log)
 	// compacts a synthetic ~2KB tool output with the keep threshold pinned
-	// at 1.0, so every score below 1.0 elides whatever the backend answers.
+	// at 1.0, so every score below 1.0 elides whatever the scorer answers.
 	original := checkToolOutput()
 	store := NewStore()
 	start = time.Now()
-	compacted, gErr := checkGate(ctx, backend, apiKey, hc, store, original)
+	compacted, gErr := checkGate(ctx, scorer, store, original)
 	gr := CheckResult{Stage: CheckStageGate, Latency: time.Since(start)}
 	if gErr != nil {
 		gr.Detail = failureDetail(gErr)
@@ -173,8 +185,10 @@ func ProbeBackend(ctx context.Context, backend ResolvedBackend, apiKey string) e
 // items) and ProbeBackend (one): one ScoreBatch whose every id must come back
 // with a score and without a failure. ScoreBatch fail-opens rather than
 // dropping ids, so a missing score is defensive; the real verdict is the
-// joined-error return, non-nil exactly when at least one item failed.
-func probeScoreBatch(ctx context.Context, c *DecisionClient, count int) error {
+// joined-error return, non-nil exactly when at least one item failed. The
+// scorer is the Scorer interface: the offline preflight passes its scripted
+// scorer, which by construction always answers every id.
+func probeScoreBatch(ctx context.Context, c Scorer, count int) error {
 	items := probeTexts(count)
 	scores, err := c.ScoreBatch(ctx, probeTask, items)
 	if err != nil {
@@ -207,15 +221,14 @@ func newCheckClient(backend ResolvedBackend, apiKey string, hc *http.Client) *De
 // shadow log — the check writes nothing to disk) compacts the synthetic tool
 // output with the keep threshold pinned at 1.0 and every gate guard neutral
 // (no protected kinds, no tripwire — elided tokens can never exceed 100% of
-// the total — and the token min-gate off). Whatever the real scorer answers,
-// any score below 1.0 elides: the stage proves the gate relocates real output
-// into the store and leaves pointers behind. The pipeline's client is shrunk
-// to one attempt like every check client.
-func checkGate(ctx context.Context, backend ResolvedBackend, apiKey string, hc *http.Client, store *Store, output string) (CompactResult, error) {
-	p := NewPipeline(backend, apiKey, nil, PipelineOptions{HTTPClient: hc})
+// the total — and the token min-gate off). Whatever the scorer answers, any
+// score below 1.0 elides: the stage proves the gate relocates real output
+// into the store and leaves pointers behind. The backend preflight passes a
+// check client shrunk to one attempt (newCheckClient); the offline preflight
+// passes its scripted scorer.
+func checkGate(ctx context.Context, scorer Scorer, store *Store, output string) (CompactResult, error) {
+	p := newPipelineWithScorer(scorer, nil, 0)
 	p.warnTo = io.Discard // the check's own report is the warning surface
-	p.client.maxAttempts = 1
-	p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
 	p.EnableRelocation(store, 1.0)
 	p.ApplyGateConfig(GateConfig{
 		KeepThreshold:    1.0,
