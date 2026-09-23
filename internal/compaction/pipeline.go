@@ -2,8 +2,11 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -33,6 +36,19 @@ type Pipeline struct {
 	threshold float64
 	gate      GateConfig
 	gateSet   bool
+
+	// Auth-poison state (the reference's JevAuthError policy): the moment
+	// scoring sees an auth-class error (401/403) the pipeline disables
+	// scoring for the rest of the session — a bad key will not heal — and
+	// emits ONE clear warning no matter how many tool calls trip over it
+	// (the sync.Once-style guard: authMu guards dead/reason/warned, so
+	// concurrent first failures produce exactly one note). warnTo is where
+	// that note goes; os.Stderr in production, swappable in tests.
+	authMu     sync.Mutex
+	authDead   bool
+	authReason string
+	authWarned bool
+	warnTo     io.Writer
 }
 
 // PipelineOptions tunes the pipeline; zero values are production defaults.
@@ -59,7 +75,40 @@ func NewPipeline(backend ResolvedBackend, apiKey string, shadow *ShadowLog, opts
 	if max <= 0 {
 		max = DefaultMaxSegChars
 	}
-	return &Pipeline{client: c, shadow: shadow, maxSegChars: max, now: time.Now}
+	return &Pipeline{client: c, shadow: shadow, maxSegChars: max, now: time.Now, warnTo: os.Stderr}
+}
+
+// noteAuthFailure records an auth rejection: compaction scoring is disabled
+// for the rest of the session (the reference's JevAuthError policy — a bad
+// or missing key will not heal within the session), and one clear warning is
+// emitted, exactly once. The decision client poisons itself the same way;
+// this is the pipeline-side half so the tool path stops calling entirely.
+func (p *Pipeline) noteAuthFailure(reason string) {
+	if p == nil {
+		return
+	}
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	if p.authDead {
+		return
+	}
+	p.authDead = true
+	p.authReason = reason
+	if !p.authWarned {
+		p.authWarned = true
+		fmt.Fprintf(p.warnTo, "Warning: compaction scoring disabled for this session (%v)\n", reason)
+	}
+}
+
+// authDisabled reports whether scoring was disabled by an auth rejection,
+// together with the reason recorded when it happened.
+func (p *Pipeline) authDisabled() (bool, string) {
+	if p == nil {
+		return false, ""
+	}
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	return p.authDead, p.authReason
 }
 
 // HistoryScorer exposes the pipeline's decision client as the scorer for
@@ -107,7 +156,10 @@ func scoreTask(toolName string) string {
 //
 // The error return is non-nil exactly when at least one segment failed to
 // score (mirroring DecisionClient.ScoreBatch's joined item errors); the
-// scores themselves are always usable thanks to fail-open.
+// scores themselves are always usable thanks to fail-open. An auth-class
+// error (the reference's JevAuthError, 401/403) additionally disables the
+// pipeline's scoring for the rest of the session — one warning is logged,
+// and CompactToolOutput stops calling the backend entirely.
 func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string) (SegmentScores, error) {
 	var out SegmentScores
 	if p == nil || p.client == nil {
@@ -129,6 +181,15 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 	out.Scores = scores
 	if err != nil {
 		out.Errors = append(out.Errors, err)
+		var ce *Error
+		if errors.As(err, &ce) && ce.Kind == KindAuth {
+			// Auth is a session-level configuration failure: disable
+			// scoring (one warning) instead of failing every future tool
+			// call against a backend that will only say 401 again. The
+			// client poisons itself too, so even direct ScoreBatch users
+			// stop hitting the network.
+			p.noteAuthFailure(ce.Error())
+		}
 	}
 
 	// Shadow log: one line per segment. In shadow mode (stage 1) the decision

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"late/internal/client"
@@ -163,12 +164,33 @@ type DecisionClient struct {
 	limiter *tokenBucket
 	http    *http.Client
 
+	// unavailable is the poison flag: set the moment the backend rejects
+	// auth (401/403), which no retry or re-sent key can fix. Once set,
+	// ScoreBatch fails open without touching the network and Unavailable()
+	// lets callers stop asking for the rest of the session (no per-message
+	// request storms against a backend that can only say 401 again).
+	unavailable atomic.Bool
+
 	// Retry knobs. Unexported fields rather than constants solely so
 	// same-package tests can shrink the curve; production code must never
 	// reassign them (mirrors the executor's throttle-knob convention).
 	maxAttempts int
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
+}
+
+// Unavailable reports whether the client has been poisoned by an auth
+// rejection (401/403): the backend refused the credentials, so scoring is
+// disabled for the rest of the session. Callers check this to stop asking
+// for scores; ScoreBatch itself keeps failing open (keep scores, typed
+// KindAuth errors) without touching the network.
+func (c *DecisionClient) Unavailable() bool {
+	return c.unavailable.Load()
+}
+
+// poison marks the client unavailable after an auth rejection. Idempotent.
+func (c *DecisionClient) poison() {
+	c.unavailable.Store(true)
 }
 
 // NewDecisionClient builds a client for a resolved backend. apiKey overrides
@@ -206,7 +228,12 @@ type packed struct {
 //
 // It never fails hard: any item that cannot be scored comes back as keepScore
 // (1.0) plus a recorded error. The returned error is non-nil exactly when at
-// least one item failed, as an errors.Join of *ItemScoreError values.
+// least one item failed, as an errors.Join of *ItemScoreError values whose
+// Err carries the classified *Error where one exists: budget violations
+// (KindBudget, raised before send), and the request-level class (auth,
+// validation, unavailable) when the whole batch failed. An auth rejection
+// (401/403) additionally poisons the client: Unavailable() turns true and
+// every later ScoreBatch fails open with typed auth errors and no requests.
 func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[string]Item) (map[string]float64, error) {
 	scores := make(map[string]float64, len(items))
 	if len(items) == 0 {
@@ -216,18 +243,33 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 		task = defaultTask
 	}
 
+	ids := make([]string, 0, len(items))
+	for id := range items {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	if c.Unavailable() {
+		// Poisoned by an earlier auth rejection: scoring is off for the
+		// session. Fail open without touching the network — every id gets
+		// the keep score and one typed auth error.
+		errs := make([]error, 0, len(ids))
+		for _, id := range ids {
+			scores[id] = keepScore
+			errs = append(errs, &ItemScoreError{
+				ItemID: id,
+				Err:    authError(0, opScoreBatch, errScoringDisabled),
+			})
+		}
+		return scores, errors.Join(errs...)
+	}
+
 	question := noulQuestion(task)
 	questionTokens := common.EstimateTokenCount(question.Prompt)
 	itemCost := func(itemTokens int) int {
 		return itemTokens + questionTokens
 	}
 	overhead := requestOverheadTokens + common.EstimateTokenCount(task) + questionTokens
-
-	ids := make([]string, 0, len(items))
-	for id := range items {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
 
 	var (
 		errs        []error
@@ -267,13 +309,15 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 			tok = common.EstimateTokenCount(it.Text)
 		}
 		if cost := overhead + itemCost(tok); cost > MaxStateTokens {
-			// A single item that cannot fit even alone in a request is
-			// skipped with an error; fail-open keeps it.
+			// A single item that cannot fit even alone in a request is a
+			// budget violation (the reference's JevBudgetError: raised
+			// before sending). It is skipped per item — the fail-open keep
+			// score stands — while the rest of the batch still scores.
 			scores[id] = keepScore
 			errs = append(errs, &ItemScoreError{
 				ItemID: id,
-				Err: fmt.Errorf("item too large to score: %d estimated tokens exceeds the %d-token state+questions budget",
-					tok, MaxStateTokens),
+				Err: budgetError(opScoreBatch, fmt.Errorf("item too large to score: %d estimated tokens exceeds the %d-token state+questions budget",
+					tok, MaxStateTokens)),
 			})
 			continue
 		}
@@ -290,9 +334,16 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 
 // scoreBatchRequest sends one batch as a single decisions request and returns
 // the parsed scores plus any per-item answer errors. A non-nil request error
-// means the whole batch failed (after retries); per-item errors mark
+// means the whole batch failed (after retries — except auth and validation,
+// which come back on the first attempt, never retried); per-item errors mark
 // individual unusable answers.
 func (c *DecisionClient) scoreBatchRequest(ctx context.Context, task string, question decisionQuestion, batch map[string]Item) (map[string]float64, map[string]error, error) {
+	if c.Unavailable() {
+		// Poisoned mid-call (an earlier batch in this same ScoreBatch hit
+		// an auth rejection): fail the remaining batches without touching
+		// the network — the caller fail-opens each item.
+		return nil, nil, authError(0, opScoreBatch, errScoringDisabled)
+	}
 	items := make(map[string]stateItem, len(batch))
 	questions := make(map[string]decisionQuestion, len(batch))
 	for id, it := range batch {
@@ -368,19 +419,32 @@ func (c *DecisionClient) attempt(ctx context.Context, body []byte) (map[string]f
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		// Transport failure — classified (retryable vs permanent TLS) by
-		// isRetryableDecisionError.
-		return nil, nil, err
+		// Transport failure — classified as Unavailable (the reference's
+		// JevUnavailableError: retried, then fail-open). A permanent
+		// TLS/scheme mismatch wraps the same class, but the retry decision
+		// still refuses it via the transport checks.
+		return nil, nil, classifyStatus(opScoreBatch, 0, "", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, newDecisionStatusError(resp)
+		statusErr := newDecisionStatusError(resp)
+		classified := classifyStatus(opScoreBatch, statusErr.StatusCode, statusErr.Body, statusErr)
+		if classified.Kind == KindAuth {
+			// The backend refused the credentials: nothing sent after this
+			// can succeed. Poison the client so the rest of the session
+			// stops calling (fail-open, no request storms).
+			c.poison()
+		}
+		return nil, nil, classified
 	}
 
 	var decoded decisionResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDecisionResponseBytes)).Decode(&decoded); err != nil {
-		return nil, nil, fmt.Errorf("decode decisions response: %w", err)
+		// A 200 that does not speak the protocol is the backend being
+		// broken, not the request being wrong: Unavailable, retried like
+		// any other transient failure.
+		return nil, nil, unavailableError(0, opScoreBatch, fmt.Errorf("decode decisions response: %w", err))
 	}
 	answered, answerErrs := parseAnswers(decoded.Answers)
 	return answered, answerErrs, nil
@@ -388,7 +452,7 @@ func (c *DecisionClient) attempt(ctx context.Context, body []byte) (map[string]f
 
 // newDecisionStatusError converts a non-200 response into a
 // *DecisionStatusError, reading the error body once and bounded.
-func newDecisionStatusError(resp *http.Response) error {
+func newDecisionStatusError(resp *http.Response) *DecisionStatusError {
 	e := &DecisionStatusError{
 		StatusCode: resp.StatusCode,
 		Status:     resp.Status,
@@ -428,13 +492,28 @@ var nonRetryableStatuses = map[int]bool{
 // isRetryableDecisionError classifies a failed attempt: protocol-transient
 // statuses, any other 5xx (server-side trouble), and ordinary transport
 // failures are retryable; deterministic client errors, TLS/certificate
-// failures, and cancellation are not.
+// failures, and cancellation are not. Typed taxonomy errors decide by class:
+// only KindUnavailable can ever be retried — auth (401/403) and validation
+// (400/404/422) come back to the caller on the first attempt (the reference
+// never retries JevValidationError) — and even an Unavailable classification
+// still falls through to the transport checks, so a permanent TLS/scheme
+// failure wrapped as Unavailable is not retried either.
 func isRetryableDecisionError(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
+	}
+	var ce *Error
+	if errors.As(err, &ce) {
+		switch ce.Kind {
+		case KindAuth, KindValidation, KindBudget:
+			// Deterministic: retrying cannot change the answer. Budget is
+			// raised before send and resolved by splitting, not retrying.
+			return false
+		}
+		// KindUnavailable falls through to the transport checks below.
 	}
 	var se *DecisionStatusError
 	if errors.As(err, &se) {

@@ -62,9 +62,13 @@ import (
 //     does not stop the walk: those scores are used, the scorer's errors
 //     accumulate and surface at the end via errors.Join. The walk stops
 //     mid-flight only when the scorer returns no usable scores for a
-//     message; messages already rewritten stay rewritten (their pointers
-//     and stored originals are valid) and the returned error reports how
-//     far the walk got. Compaction never breaks a session.
+//     message, or when the scorer reports an auth-class failure
+//     (compaction.KindAuth — a bad or missing API key, which no later
+//     message can score either): that stops the walk immediately with the
+//     typed error instead of firing one doomed request per message.
+//     Messages already rewritten stay rewritten (their pointers and stored
+//     originals are valid) and the returned error reports how far the walk
+//     got. Compaction never breaks a session.
 //   - Shadow mode (compaction-mode "shadow") runs the full scoring walk and
 //     computes the honest would-save report without mutating history.
 //
@@ -351,6 +355,16 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		}
 		scores, err := scorer.ScoreBatch(ctx, task, items)
 		if err != nil {
+			var ae *compaction.Error
+			if errors.As(err, &ae) && ae.Kind == compaction.KindAuth {
+				// Auth (the reference's JevAuthError: 401/403 — bad or
+				// missing API key) is a session-level failure: no later
+				// message can score either, so continuing the walk would
+				// only fire one doomed request per message. Stop right
+				// here and surface the typed error; everything already
+				// rewritten stays rewritten.
+				return report, fmt.Errorf("context compaction stopped after %d messages: %w", scored, err)
+			}
 			if !scoresComplete(items, scores) {
 				// Wholesale failure: the scorer returned no usable scores
 				// for this message. Fail-open mid-walk: stop the walk.

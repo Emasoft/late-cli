@@ -221,6 +221,12 @@ type CompactResult struct {
 	// output's tokens, so it was distrusted and everything was kept. Empty
 	// means the decisions stood.
 	Tripwire string
+	// Disabled is non-empty when compaction scoring is off for the session:
+	// the decision backend rejected auth (401/403 — a bad or missing API
+	// key), so nothing can be scored and the output came back untouched.
+	// It carries the one-line reason; the warning itself is logged once on
+	// the pipeline (never per tool call). Empty means the decisions stood.
+	Disabled string
 }
 
 // EnableRelocation arms stage 2 on the pipeline: from now on
@@ -283,8 +289,22 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 // outage, bad answer, canceled context) means no reliable elision decision
 // exists, so the original output is returned unchanged (Elided empty) along
 // with the error. Compaction must never break a tool call.
+//
+// One exception to the retry storm: an auth-class failure (the reference's
+// JevAuthError, 401/403) disables scoring for the rest of the session — the
+// result reports Disabled with the reason, one warning is logged on the
+// pipeline, and every later call returns the output untouched without
+// touching the backend again.
 func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output string) (CompactResult, error) {
 	out := CompactResult{CompactText: output}
+
+	// Auth-poisoned pipeline: scoring is off for the session. Return the
+	// output untouched without another doomed backend round trip — the
+	// one-time warning was emitted when the rejection was first seen.
+	if dead, reason := p.authDisabled(); dead {
+		out.Disabled = reason
+		return out, nil
+	}
 
 	// Min-gate: below MinGateTokens the scoring round trip costs more than
 	// elision can possibly save — skip scoring entirely.
@@ -294,7 +314,13 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 
 	scores, err := p.ScoreToolOutput(ctx, toolName, output)
 	if err != nil {
-		// Fail-open: keep the whole output verbatim.
+		// Fail-open: keep the whole output verbatim. An auth rejection
+		// additionally disabled scoring for the rest of the session —
+		// report that in the result so callers can tell the difference
+		// between a transient outage and compaction being switched off.
+		if dead, reason := p.authDisabled(); dead {
+			out.Disabled = reason
+		}
 		return out, err
 	}
 
