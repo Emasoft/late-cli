@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -112,24 +113,75 @@ func fixtureSegments(t *testing.T, fixture []client.ChatMessage) map[int][]compa
 	return out
 }
 
+// stubErrShape selects what a failing stubScorer call returns alongside its
+// error — the three ScoreBatch shapes the walk must tell apart.
+type stubErrShape int
+
+const (
+	// stubErrWholesale returns no usable scores with the error: a backend
+	// that produced nothing scoreable (the walk-abort shape).
+	stubErrWholesale stubErrShape = iota
+	// stubErrFailOpen returns a complete score map (this stub's normal
+	// answers for every requested id) alongside the error — the
+	// compaction.DecisionClient.ScoreBatch fail-open contract.
+	stubErrFailOpen
+	// stubErrPartial returns a map missing some requested ids alongside the
+	// error: only the first errPartialIds item ids (sorted) are answered.
+	stubErrPartial
+)
+
 // stubScorer is the map-based HistoryScorer stub: it scores each item by
-// exact segment-text lookup (fallback otherwise), can fail the Nth call, and
-// records every task it saw. No network.
+// exact segment-text lookup (fallback otherwise), can fail the Nth call in
+// any of the three error shapes, and records every task it saw. No network.
 type stubScorer struct {
-	scores    map[string]float64
-	fallback  float64
-	err       error
-	errOnCall int // 1-based ScoreBatch call that fails; 0 = never
-	calls     int
-	tasks     []string
+	scores   map[string]float64
+	fallback float64
+	err      error
+	// errOnCall is the 1-based ScoreBatch call that fails; 0 = never (or
+	// every call fails when err is set).
+	errOnCall int
+	// errShape selects the failing call's return shape (default wholesale).
+	errShape stubErrShape
+	// errPartialIds caps the partial shape's answer map size; unused
+	// otherwise.
+	errPartialIds int
+	calls         int
+	tasks         []string
 }
 
 func (s *stubScorer) ScoreBatch(_ context.Context, task string, items map[string]compaction.Item) (map[string]float64, error) {
 	s.calls++
 	s.tasks = append(s.tasks, task)
 	if s.err != nil && (s.errOnCall == 0 || s.calls == s.errOnCall) {
-		return nil, s.err
+		switch s.errShape {
+		case stubErrFailOpen:
+			// Fail-open shape: a complete score map returned alongside the
+			// error — every id usable.
+			return s.answer(items), s.err
+		case stubErrPartial:
+			// Partial shape: keep only the first errPartialIds ids (sorted,
+			// so the split is deterministic); the rest stay unanswered.
+			out := s.answer(items)
+			ids := make([]string, 0, len(out))
+			for id := range out {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			for _, id := range ids[s.errPartialIds:] {
+				delete(out, id)
+			}
+			return out, s.err
+		default:
+			// Wholesale shape: no usable scores.
+			return nil, s.err
+		}
 	}
+	return s.answer(items), nil
+}
+
+// answer builds the stub's normal score map for items: the exact-text score
+// when present, the fallback otherwise.
+func (s *stubScorer) answer(items map[string]compaction.Item) map[string]float64 {
 	out := make(map[string]float64, len(items))
 	for id, it := range items {
 		if score, ok := s.scores[it.Text]; ok {
@@ -138,7 +190,7 @@ func (s *stubScorer) ScoreBatch(_ context.Context, task string, items map[string
 			out[id] = s.fallback
 		}
 	}
-	return out, nil
+	return out
 }
 
 // elideFirstScorer scores the FIRST segment of every precomputed candidate
@@ -177,7 +229,7 @@ func assertZeroReport(t *testing.T, report CompactionReport, wantScanned int) {
 	if report.MessagesScanned != wantScanned {
 		t.Errorf("MessagesScanned = %d, want %d", report.MessagesScanned, wantScanned)
 	}
-	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 || report.TokensSaved != 0 || report.StoreSize != 0 {
+	if report.MessagesScored != 0 || report.MessagesCompacted != 0 || report.SegmentsElided != 0 || report.TokensSaved != 0 || report.StoreSize != 0 {
 		t.Errorf("expected a no-op report, got %+v", report)
 	}
 	if report.TokensAfter != report.TokensBefore {
@@ -391,6 +443,7 @@ func TestCompactContextShadowModeDoesNotMutate(t *testing.T) {
 	}
 	// Honest staging: every number matches the real run.
 	if gotShadow.MessagesScanned != gotMutating.MessagesScanned ||
+		gotShadow.MessagesScored != gotMutating.MessagesScored ||
 		gotShadow.MessagesCompacted != gotMutating.MessagesCompacted ||
 		gotShadow.SegmentsElided != gotMutating.SegmentsElided ||
 		gotShadow.TokensBefore != gotMutating.TokensBefore ||
@@ -415,9 +468,10 @@ func TestCompactContextShadowModeDoesNotMutate(t *testing.T) {
 	}
 }
 
-// (g) Fail-open mid-walk: the scorer fails on the third candidate; the first
-// two rewritten messages stay rewritten, the rest are untouched, and the
-// error reports how far the walk got.
+// (g) Wholesale mid-walk failure: the scorer fails on the third candidate
+// with no usable scores (the default stubErrWholesale shape); the first two
+// rewritten messages stay rewritten, the rest are untouched, and the error
+// reports how far the walk got.
 func TestCompactContextFailOpenMidWalk(t *testing.T) {
 	sentinel := errors.New("scorer unavailable")
 	fixture := []client.ChatMessage{
@@ -467,6 +521,165 @@ func TestCompactContextFailOpenMidWalk(t *testing.T) {
 	}
 	if report.SegmentsElided != 2 {
 		t.Errorf("SegmentsElided = %d, want 2", report.SegmentsElided)
+	}
+}
+
+// (Step 7a) A scorer error WITH a complete score map is the pipeline's
+// fail-open contract (compaction.DecisionClient.ScoreBatch answers every id,
+// failed items as keep-scores): the walk completes with a normal-run report,
+// every scored message is counted in MessagesScored, and the scorer's errors
+// surface at the end wrapped in the returned error — instead of the old,
+// wrong "context compaction stopped after 0 messages" abort.
+func TestCompactContextFailOpenCompleteScoresFinishWalk(t *testing.T) {
+	sentinel := errors.New("scorer degraded")
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+	scorer := elideFirstScorer(segs)
+	// Every call fails but answers every id with the stub's normal scores:
+	// the run must be indistinguishable from a clean one except for the
+	// surfaced error.
+	scorer.err = sentinel
+	scorer.errShape = stubErrFailOpen
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err == nil {
+		t.Fatal("CompactContext() error = nil, want the scorer's fail-open errors surfaced")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error does not wrap the scorer failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "stopped after") {
+		t.Errorf("a completed walk must not report a mid-walk stop: %v", err)
+	}
+
+	// The report reflects a normal run: every candidate rewritten, one
+	// segment each elided.
+	if report.MessagesCompacted != len(segs) {
+		t.Errorf("MessagesCompacted = %d, want %d", report.MessagesCompacted, len(segs))
+	}
+	if report.SegmentsElided != len(segs) {
+		t.Errorf("SegmentsElided = %d, want %d", report.SegmentsElided, len(segs))
+	}
+	if report.MessagesScored != len(segs) {
+		t.Errorf("MessagesScored = %d, want %d (every candidate scored, fail-open ones included)", report.MessagesScored, len(segs))
+	}
+	if report.TokensSaved <= 0 {
+		t.Errorf("TokensSaved = %d, want > 0", report.TokensSaved)
+	}
+	// The walk really completed: the last candidate was rewritten too.
+	if !strings.Contains(s.History[8].Content.Text, "[[elided id=") {
+		t.Error("expected the last candidate (fixture index 8) to be compacted — the walk must not stop")
+	}
+}
+
+// (Step 7b) A scorer error with a PARTIAL score map (some requested ids
+// missing) is a wholesale failure: the walk aborts with "context compaction
+// stopped after N messages", N the messages successfully scored before the
+// failure — a partial answer is never trusted for elisions.
+func TestCompactContextPartialScoresAbortMidWalk(t *testing.T) {
+	sentinel := errors.New("scorer degraded")
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),         // frozen
+		cmpStamped(cmpUser("first question"), 1),          // frozen
+		cmpStamped(cmpAssistant("first answer"), 2),       // frozen
+		cmpStamped(cmpAssistant(cmpLongText("c1", 3)), 3), // candidate 1 — scored cleanly
+		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),      // candidate 2 — partial scores here
+		cmpStamped(cmpAssistant(cmpLongText("c3", 3)), 5), // candidate 3
+		cmpStamped(cmpTool(cmpLongText("c4", 3)), 6),      // candidate 4
+	}
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+	if len(segs) != 4 {
+		t.Fatalf("fixture candidates = %d, want 4", len(segs))
+	}
+	scorer := elideFirstScorer(segs)
+	scorer.err = sentinel
+	scorer.errOnCall = 2
+	scorer.errShape = stubErrPartial
+	scorer.errPartialIds = 1 // one of candidate 2's three segments answered
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err == nil {
+		t.Fatal("CompactContext() error = nil, want the wholesale failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error does not wrap the scorer failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "stopped after 1 messages") {
+		t.Errorf("error %q does not report the one message scored before the failure", err)
+	}
+	if report.MessagesScored != 1 {
+		t.Errorf("MessagesScored = %d, want 1", report.MessagesScored)
+	}
+	// Candidate 1 was scored and rewritten before the failure.
+	if !strings.Contains(s.History[3].Content.Text, "[[elided id=") {
+		t.Error("fixture message 3 should have been rewritten before the failure")
+	}
+	// Candidates 2+ are untouched — the walk stopped at the partial answer.
+	for _, idx := range []int{4, 5, 6} {
+		if got, want := s.History[idx].Content.Text, fixture[idx].Content.Text; got != want {
+			t.Errorf("fixture message %d was mutated after the partial failure:\n got %q", idx, truncateRunes(got, 120))
+		}
+	}
+	if report.MessagesCompacted != 1 || report.SegmentsElided != 1 {
+		t.Errorf("expected exactly the pre-failure rewrite, got %+v", report)
+	}
+}
+
+// (Step 7c) A clean scorer: nil error, and MessagesScored counts every
+// message whose segments were scored.
+func TestCompactContextCleanScorerCountsScoredMessages(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+	scorer := elideFirstScorer(segs)
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+	if report.MessagesScored != len(segs) {
+		t.Errorf("MessagesScored = %d, want %d (one per scored candidate)", report.MessagesScored, len(segs))
+	}
+	if report.MessagesScored != scorer.calls {
+		t.Errorf("MessagesScored = %d, scorer calls = %d; want them equal", report.MessagesScored, scorer.calls)
+	}
+}
+
+// (Step 7d) The user's regression pin: when the very first candidate's
+// ScoreBatch fails wholesale (a backend rejecting the scoring request — no
+// usable scores at all), the error says "stopped after 0 messages" and
+// nothing is rewritten. The fail-open-complete variant of the same symptom no
+// longer aborts — see TestCompactContextFailOpenCompleteScoresFinishWalk.
+func TestCompactContextWholesaleFailureOnFirstCandidateStopsAtZero(t *testing.T) {
+	sentinel := errors.New("decisions API error (422): model too small")
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+	scorer := elideFirstScorer(segs)
+	scorer.err = sentinel
+	scorer.errOnCall = 1 // wholesale: no usable scores (default stubErrWholesale)
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err == nil {
+		t.Fatal("CompactContext() error = nil, want the scorer failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error does not wrap the scorer failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "context compaction stopped after 0 messages") {
+		t.Errorf("error %q does not pin the zero-progress abort", err)
+	}
+	if report.MessagesScored != 0 {
+		t.Errorf("MessagesScored = %d, want 0", report.MessagesScored)
+	}
+	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 {
+		t.Errorf("expected a no-rewrite report, got %+v", report)
+	}
+	// Nothing was rewritten: the first candidate (fixture index 4) is intact.
+	if got, want := s.History[4].Content.Text, fixture[4].Content.Text; got != want {
+		t.Errorf("fixture message 4 was rewritten before the abort:\n got %q", truncateRunes(got, 120))
 	}
 }
 
@@ -574,6 +787,9 @@ func TestCompactContextAllHighScoresNoOp(t *testing.T) {
 	}
 	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 || report.TokensSaved != 0 || report.StoreSize != 0 {
 		t.Errorf("expected a no-op report, got %+v", report)
+	}
+	if report.MessagesScored != len(segs) {
+		t.Errorf("MessagesScored = %d, want %d (every candidate scored)", report.MessagesScored, len(segs))
 	}
 	if scorer.calls != len(segs) {
 		t.Errorf("scorer calls = %d, want %d", scorer.calls, len(segs))
