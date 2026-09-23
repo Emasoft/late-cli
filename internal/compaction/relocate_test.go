@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -357,6 +358,22 @@ func TestPipeline_RelocationShadowLogDecisions(t *testing.T) {
 		}
 		if report.Entries != 3 || report.ElidedEntries != 1 {
 			t.Fatalf("Replay() = %+v, want 3 entries with 1 elided", report)
+		}
+		// Step 13: every decision entry carries the gate floor it was made
+		// against (all fixtures are text segments, so the floor is the keep
+		// threshold), letting replay re-decide from score vs threshold.
+		lines := readLines(t, shadow.Path())
+		if len(lines) != 3 {
+			t.Fatalf("got %d shadow lines, want 3", len(lines))
+		}
+		for _, line := range lines {
+			var e ShadowEntry
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Fatalf("shadow line invalid: %v", err)
+			}
+			if e.Threshold != 0.35 {
+				t.Errorf("decision for %s threshold = %v, want the gate floor 0.35", e.SegmentID, e.Threshold)
+			}
 		}
 	})
 

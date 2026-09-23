@@ -120,6 +120,13 @@ type Store struct {
 	next int
 	// path is the JSONL backing file; "" is in-memory only.
 	path string
+	// shadow is the outcome log the expand tool attributes expand outcomes
+	// through (Step 13): wiring attaches the session's shadow log with
+	// WithShadowLog, and the expand tool — the only expand path — reads it
+	// back to append one outcome per record id and per contributing segment
+	// id. nil (the default) disables outcome logging: the expand tool skips
+	// it silently.
+	shadow *ShadowLog
 }
 
 // NewStore returns an empty in-memory original-text store.
@@ -175,6 +182,36 @@ func (s *Store) Path() string {
 		return ""
 	}
 	return s.path
+}
+
+// WithShadowLog attaches l as the store's outcome log and returns the store
+// for call-site chaining: the expand tool reads it back through ShadowLog
+// and appends one "expand" outcome per record id and per contributing
+// segment id on every retrieval — the reference pipeline.py expand()
+// attribution that ShadowLog.FalseNegativeRate and the replay table's
+// still-missed column are built on. A nil log (or a nil store) is accepted
+// and simply disables outcome logging, mirroring how a nil shadow log
+// disables decision logging on the pipeline. Wiring calls this once at
+// startup, before any agent can run a tool call.
+func (s *Store) WithShadowLog(l *ShadowLog) *Store {
+	if s == nil {
+		return s
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shadow = l
+	return s
+}
+
+// ShadowLog returns the store's attached outcome log, or nil when none was
+// set (the expand tool skips outcome logging then).
+func (s *Store) ShadowLog() *ShadowLog {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shadow
 }
 
 // Get returns the original text stored for id — the record's Text field, so

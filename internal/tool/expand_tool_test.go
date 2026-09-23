@@ -3,8 +3,12 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"late/internal/compaction"
 )
 
 // fakeExpandStore is a minimal ExpandStore for unit-testing the tool layer.
@@ -88,6 +92,143 @@ func TestExpandTool_StoreWithoutEntries(t *testing.T) {
 	_, err := e.Execute(context.Background(), []byte(`{"id":"elide-1"}`))
 	if err == nil || !strings.Contains(err.Error(), "unknown elided id") {
 		t.Errorf("Execute() error = %v, want the unknown-elided-id error", err)
+	}
+}
+
+// readShadowOutcomes parses a shadow log's JSONL lines into entries; the
+// fake-free helper keeps the outcome assertions independent of the
+// compaction package's own test helpers. A missing log file is zero
+// outcomes: the log is only created on the first append.
+func readShadowOutcomes(t *testing.T, path string) []compaction.ShadowEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read shadow log: %v", err)
+	}
+	var out []compaction.ShadowEntry
+	for i, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var e compaction.ShadowEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("shadow line %d invalid: %v (%q)", i, err, line)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// TestExpandTool_WritesOutcomes: a successful expand bumps the record's
+// expand counter and appends one expand outcome per record id AND one per
+// contributing segment id — the Step 13 attribution ledger.
+func TestExpandTool_WritesOutcomes(t *testing.T) {
+	shadowPath := filepath.Join(t.TempDir(), "shadow.jsonl")
+	shadow, err := compaction.NewShadowLogAt(shadowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := compaction.NewStore().WithShadowLog(shadow)
+	store.PutRecord(compaction.Record{
+		ID:         "r:1a2b3c4d",
+		Text:       "the original run",
+		Tokens:     42,
+		SegmentIDs: []string{"seg-1", "seg-2"},
+	})
+
+	e := ExpandTool{Store: store}
+	if _, err := e.Execute(context.Background(), []byte(`{"id":"r:1a2b3c4d"}`)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// The record's expand counter moved (Store.Touch ran).
+	rec, ok := store.GetRecord("r:1a2b3c4d")
+	if !ok {
+		t.Fatal("record vanished from the store")
+	}
+	if rec.ExpandCount != 1 {
+		t.Errorf("ExpandCount = %d, want 1", rec.ExpandCount)
+	}
+
+	outcomes := readShadowOutcomes(t, shadowPath)
+	if len(outcomes) != 3 { // 1 record id + 2 segment ids
+		t.Fatalf("got %d outcome lines, want 3", len(outcomes))
+	}
+	ids := make(map[string]bool, len(outcomes))
+	for _, oc := range outcomes {
+		if oc.Type != compaction.EntryTypeExpand {
+			t.Errorf("outcome type = %q, want %q", oc.Type, compaction.EntryTypeExpand)
+		}
+		if oc.ItemID == "" {
+			t.Error("outcome carries no item id")
+		}
+		ids[oc.ItemID] = true
+	}
+	for _, want := range []string{"r:1a2b3c4d", "seg-1", "seg-2"} {
+		if !ids[want] {
+			t.Errorf("no expand outcome attributed to %q (got %v)", want, ids)
+		}
+	}
+
+	// A second retrieval appends another round of outcomes (the ledger is
+	// append-only; Stats counts distinct ids).
+	if _, err := e.Execute(context.Background(), []byte(`{"id":"r:1a2b3c4d"}`)); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if got := len(readShadowOutcomes(t, shadowPath)); got != 6 {
+		t.Errorf("after two expands got %d outcome lines, want 6", got)
+	}
+	if rec, _ := store.GetRecord("r:1a2b3c4d"); rec.ExpandCount != 2 {
+		t.Errorf("ExpandCount after two expands = %d, want 2", rec.ExpandCount)
+	}
+}
+
+// TestExpandTool_OutcomesWithoutShadowLog: a store with no shadow log
+// attached (and, implicitly, one without persistence) still expands — the
+// outcome ledger is best-effort and nil-safe, never a precondition.
+func TestExpandTool_OutcomesWithoutShadowLog(t *testing.T) {
+	store := compaction.NewStore()
+	store.PutRecord(compaction.Record{
+		ID:         "elide-3",
+		Text:       "the original",
+		SegmentIDs: []string{"seg-1"},
+	})
+	e := ExpandTool{Store: store}
+	got, err := e.Execute(context.Background(), []byte(`{"id":"elide-3"}`))
+	if err != nil || got != "the original" {
+		t.Fatalf("Execute() = (%q, %v), want the original with no error", got, err)
+	}
+	if rec, _ := store.GetRecord("elide-3"); rec.ExpandCount != 1 {
+		t.Errorf("ExpandCount = %d, want 1 (Touch still runs without a shadow log)", rec.ExpandCount)
+	}
+	if store.ShadowLog() != nil {
+		t.Error("ShadowLog() = non-nil, want nil when nothing was attached")
+	}
+}
+
+// TestExpandTool_UnknownIDRecordsNothing: a failed lookup must not touch the
+// counters or the outcome ledger.
+func TestExpandTool_UnknownIDRecordsNothing(t *testing.T) {
+	shadowPath := filepath.Join(t.TempDir(), "shadow.jsonl")
+	shadow, err := compaction.NewShadowLogAt(shadowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := compaction.NewStore().WithShadowLog(shadow)
+	store.PutRecord(compaction.Record{ID: "r:good", Text: "kept", SegmentIDs: []string{"seg-1"}})
+
+	e := ExpandTool{Store: store}
+	if _, err := e.Execute(context.Background(), []byte(`{"id":"r:missing"}`)); err == nil {
+		t.Fatal("Execute(unknown id) error = nil, want the unknown-elided-id error")
+	}
+	if outcomes := readShadowOutcomes(t, shadowPath); len(outcomes) != 0 {
+		t.Errorf("got %d outcome lines, want 0 (failed lookups record nothing)", len(outcomes))
+	}
+	if rec, _ := store.GetRecord("r:good"); rec.ExpandCount != 0 {
+		t.Errorf("ExpandCount = %d, want 0 (the miss must not bump anything)", rec.ExpandCount)
 	}
 }
 
