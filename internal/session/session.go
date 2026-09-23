@@ -44,6 +44,18 @@ type Session struct {
 	// (GenerateSessionMeta) so it survives save/reload.
 	compactionHighWater int
 	compactionMu        sync.Mutex
+
+	// retrievedBlock holds the ephemeral retrieved-context block staged by
+	// InjectRetrieved (retrieve.go) for the NEXT stream request: StartStream
+	// appends it as the LAST outgoing message — the tail of the message list
+	// is the work area; the frozen prefix (the head) is never touched. It is
+	// request-scoped by contract: it exists only in the outgoing request
+	// copy, never in History and never on disk, and every InjectRetrieved
+	// call overwrites it (an empty result clears it). Guarded by
+	// retrievedMu, so a staged block is also safe against the TUI's
+	// cross-goroutine paths.
+	retrievedMu    sync.Mutex
+	retrievedBlock string
 }
 
 func New(c *client.Client, historyPath string, history []client.ChatMessage, systemPrompt string, useTools bool) *Session {
@@ -352,6 +364,19 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any, onC
 	// sanitizer repairs the copy sent to the API; the saved history is
 	// intentionally left untouched.
 	messages = append(messages, SanitizeForRequest(s.History)...)
+
+	// Retrieved context (Step 17, compaction-retrieval): the block staged by
+	// InjectRetrieved is appended LAST, so it lands in the work area — after
+	// the frozen prefix by construction — and is ephemeral: it lives only in
+	// this request copy, never in s.History, never on disk, and the TUI
+	// transcript (which renders History) never shows it. Role "system" marks
+	// it as harness-injected context rather than a user turn.
+	if block := s.retrievedBlockForRequest(); block != "" {
+		messages = append(messages, client.ChatMessage{
+			Role:    retrievedContextRole,
+			Content: client.TextContent(block),
+		})
+	}
 
 	var onConn func()
 	if len(onConnect) > 0 && onConnect[0] != nil {

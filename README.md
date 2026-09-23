@@ -206,6 +206,7 @@ export OPENAI_MODEL="model-name"
 * **Agent Skills & MCP Support:** Natively consume external Model Context Protocol (MCP) servers and third-party Agent Skills with zero configuration overhead.
 * **Context Compaction with an Expand Tool (staged: shadow → enabled):** Oversized tool outputs are segmented and scored; low-scoring segments can be elided into pointers with the original text retrievable via the `expand` tool (see the Quickstart).
 * **Full-History Compaction (`/jev-compact-context` + autocompact):** One command — or an automatic trigger at a configurable context-usage percent (`jev-autocompact`, `jev-autocompact-percent`) — scores the whole conversation after a frozen prefix and elides low-scoring segments into pointers, originals retrievable via the `expand` tool (see the Quickstart).
+* **Retrieved Context (`compaction-retrieval`, default off):** The read side of the compaction store — before each request its summaries are scored against the current task and the top matches are appended to the request's work area (never the frozen prefix, never persisted), with `kind=retrieve` decisions logged for replay (see the Quickstart).
 * **Git Worktree Support:** Run independent, parallel agent instances across multiple branches simultaneously with zero context bleeding.
 
 ---

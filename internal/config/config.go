@@ -212,6 +212,16 @@ type Config struct {
 	// warning (see ResolveCompactionProtectedFloor).
 	CompactionProtectedFloor int `json:"compaction-protected-floor,omitempty"`
 
+	// CompactionRetrieval enables the retrieve() read side of the compaction
+	// record store (Step 17): before every stream request the store's digest
+	// summaries are scored against the current task and the top-k relevant
+	// records are appended to the outgoing request's work area (never the
+	// frozen prefix, never persisted to history). Default false. It needs a
+	// record store to read, which only fills when compaction-mode is
+	// "enabled" — ResolveCompactionRetrieval warns about the inert
+	// combinations.
+	CompactionRetrieval bool `json:"compaction-retrieval,omitempty"`
+
 	// Degraded is set by LoadConfig when config.json exists but could not
 	// be read or parsed: the returned config is a fallback default, not
 	// the user's real settings. SaveConfig refuses to persist a degraded
@@ -575,6 +585,29 @@ func ResolveCompactionProtectedFloor(cfg *Config) (percent int, warning string) 
 	return DefaultCompactionProtectedFloorPercent,
 		fmt.Sprintf("ignoring invalid config.json compaction-protected-floor %d; using %d",
 			cfg.CompactionProtectedFloor, DefaultCompactionProtectedFloorPercent)
+}
+
+// ResolveCompactionRetrieval returns whether the compaction store's
+// retrieve() read side is enabled, mirroring ResolveAutocompact's resolver
+// shape (value plus warning). The switch is a plain boolean defaulting to
+// false: absent means retrieval never runs. A bool config entry has no
+// invalid VALUE — a wrong-typed config.json value fails the whole parse and
+// is surfaced by the degraded-config guard — so the warning return carries
+// the one invalid COMBINATION instead: retrieval enabled while
+// compaction-mode is not "enabled". The record store only fills when
+// relocation runs (mode "enabled"), so in shadow or off mode retrieval
+// would score an eternally empty store and inject nothing; the resolver
+// still honors the switch (harmless no-op) and lets the warning explain.
+func ResolveCompactionRetrieval(cfg *Config) (enabled bool, warning string) {
+	if cfg == nil || !cfg.CompactionRetrieval {
+		return false, ""
+	}
+	mode, _ := ResolveCompactionMode(cfg)
+	if mode != CompactionModeEnabled {
+		return true, fmt.Sprintf("config.json compaction-retrieval has no effect while compaction-mode is %q: the record store only fills in %q mode",
+			mode, CompactionModeEnabled)
+	}
+	return true, ""
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

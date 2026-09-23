@@ -86,6 +86,14 @@ type BaseOrchestrator struct {
 	idleKillAfter    time.Duration
 	idleTickInterval time.Duration
 
+	// retrievalHookFn runs at every turn start — right before that turn's
+	// stream request — when installed (main wires it behind the
+	// compaction-retrieval config switch to Session.InjectRetrieved). The
+	// hook owns its failures: it must never panic the turn, and a retrieval
+	// that found nothing or failed simply stages no context. Guarded by mu;
+	// nil (the default) is the plain no-hook behavior.
+	retrievalHookFn func(context.Context)
+
 	// idleKillReason records why the idle watchdog cancelled this run; guarded
 	// by mu. Empty unless the watchdog killed the run.
 	idleKillReason string
@@ -188,6 +196,26 @@ func (o *BaseOrchestrator) SetIdlePolicy(idle, killAfter time.Duration) {
 	defer o.mu.Unlock()
 	o.idleTimeout = idle
 	o.idleKillAfter = killAfter
+}
+
+// SetRetrievalHook installs h as this orchestrator's retrieval hook: it
+// runs at every turn start, right before that turn's stream request, after
+// the pending messages joined history (so a retrieval scored against the
+// just-submitted task sees it). main installs it behind the
+// compaction-retrieval switch, closing over the compaction pipeline, the
+// shared record store, and the agent's session (Session.InjectRetrieved).
+// Must be called before the first run; passing nil removes the hook.
+func (o *BaseOrchestrator) SetRetrievalHook(h func(context.Context)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.retrievalHookFn = h
+}
+
+// retrievalHook returns the installed hook or nil (thread-safe).
+func (o *BaseOrchestrator) retrievalHook() func(context.Context) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.retrievalHookFn
 }
 
 // MarkActivity records a sign of life — a streamed chunk, a tool execution,
@@ -635,6 +663,16 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			_ = o.sess.AddMessage(msg)
 		}
 
+		// Retrieval read side (Step 17): the hook — installed by main behind
+		// compaction-retrieval — scores the compaction store against the
+		// task and stages the retrieved block; Session.StartStream appends
+		// it last (the work area). It runs after the pending messages joined
+		// history so the just-submitted task is what gets scored against.
+		// The hook owns its failures: it never aborts the turn.
+		if h := o.retrievalHook(); h != nil {
+			h(ctx)
+		}
+
 		// Transient per-turn status: non-blocking with drop counting (see
 		// trySendProgress).
 		o.trySendProgress(common.StatusEvent{ID: o.id, Status: "thinking"})
@@ -784,6 +822,12 @@ func (o *BaseOrchestrator) run() {
 
 			for _, msg := range msgs {
 				_ = o.sess.AddMessage(msg)
+			}
+
+			// Retrieval read side (Step 17): same hook as Execute's turn
+			// start — this is the run()/Submit path's stream request.
+			if h := o.retrievalHook(); h != nil {
+				h(ctx)
 			}
 
 			// Transient per-turn status: non-blocking with drop counting (see

@@ -195,6 +195,17 @@ Scoring is fail-open: any backend error keeps the original tool output. Segments
 * `jev-autocompact` (bool, default `false`) — when enabled and the context usage crosses the percent, the same compaction runs automatically.
 * `jev-autocompact-percent` (default `99`, valid range 1–100) — the context-usage percentage that fires it. The trigger runs once per crossing and re-arms after compaction shrinks usage back down (or when `/new` starts a fresh conversation).
 
+### Retrieved Context (`compaction-retrieval`)
+
+```json
+{
+  "compaction-mode": "enabled",
+  "compaction-retrieval": true
+}
+```
+
+`compaction-retrieval` (bool, default `false`) turns on the read side of the compaction store: before every stream request, the store's per-record summaries are scored against the current task and the top matches (up to 5 records scoring ≥ 0.5, capped at a 24k-token digest budget) are appended to the END of the outgoing request as a "Retrieved context" block. That is the work area by construction — it never touches the frozen prefix, never lands in history, and never shows in the transcript, so it costs tokens only for the request that carries it and is re-scored fresh every turn. Each scored record is logged to the shadow log as a `kind=retrieve` decision (`injected`/`skipped`), so `-replay-shadow` tooling can audit what retrieval would have injected at other thresholds. The switch only does something under `compaction-mode: enabled` — that is the only mode whose record store ever fills (the resolver warns about the inert combinations) — and a scoring failure stages nothing for that turn rather than injecting unranked records.
+
 ---
 
 ## Tool Approval
