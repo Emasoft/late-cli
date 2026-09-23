@@ -79,6 +79,12 @@ func TestPipeline_ScoreToolOutputEndToEnd(t *testing.T) {
 		if e.Decision != DecisionKeep {
 			t.Errorf("shadow decision = %q, want %q (shadow-only stage)", e.Decision, DecisionKeep)
 		}
+		// No gate was applied and relocation is not armed, so no elision
+		// threshold is in force: the entry records 0 (omitted in JSON) —
+		// Stats/FalseNegativeRate never count such an entry as elided.
+		if e.Threshold != 0 {
+			t.Errorf("shadow threshold = %v, want 0 (no gate in force)", e.Threshold)
+		}
 		if e.TaskHash == "" || e.TaskHash != got.TaskHash {
 			t.Errorf("shadow TaskHash = %q, want the pipeline's %q", e.TaskHash, got.TaskHash)
 		}

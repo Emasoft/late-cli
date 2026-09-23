@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,13 +32,26 @@ const (
 	// entry carries Action "tripwire" and the output's total token count;
 	// it is not a per-segment decision and Replay skips it.
 	EntryTypeTripwire = "tripwire"
+	// EntryTypeExpand marks an expand outcome: a stored record whose original
+	// the agent fetched back through the expand tool. Every expand is a
+	// recorded false negative of the elision decision that relocated the
+	// record's content — the input to FalseNegativeRate and the replay
+	// table's still-missed column. One outcome names the record id (ItemID);
+	// one outcome per contributing segment id accompanies it (the reference
+	// pipeline.py expand() attribution).
+	EntryTypeExpand = "expand"
+	// EntryTypeHit marks a hit outcome: a record whose content was used
+	// after retrieval (the reference store's mark_hits). ItemID names the
+	// record or segment the hit attributes to.
+	EntryTypeHit = "hit"
 )
 
 // ShadowEntry is one JSONL line in the shadow log: a single scored segment
-// at a single decision point — or, with Type "history-run", a whole
-// history-compaction run's summary (then only TS, TaskHash and Run carry
-// data). The raw task text never reaches the log — only its TaskHash digest
-// does.
+// at a single decision point — an outcome line (Type "expand"/"hit") naming
+// the record or segment it attributes to via ItemID — or, with Type
+// "history-run", a whole history-compaction run's summary (then only TS,
+// TaskHash and Run carry data). The raw task text never reaches the log —
+// only its TaskHash digest does.
 type ShadowEntry struct {
 	TS        time.Time `json:"ts"`
 	TaskHash  string    `json:"task_hash"`
@@ -53,8 +67,29 @@ type ShadowEntry struct {
 	// whose Decision field carries the action. Additive: older logs simply
 	// lack the field.
 	Action string `json:"action,omitempty"`
+	// Threshold is the score floor the decision was made against — the gate
+	// floor in force at decision time (the protected-kind floor for
+	// protected kinds, else the relocation threshold). Stats,
+	// FalseNegativeRate and ReplayTable re-run the recorded decision from
+	// score vs threshold without re-scoring. Additive: legacy lines predate
+	// the field (0 = no threshold was in force).
+	Threshold float64 `json:"threshold,omitempty"`
+	// ItemID is the record or segment id an OUTCOME entry (Type "expand" or
+	// "hit") attributes to; decision entries carry SegmentID instead.
+	// Additive.
+	ItemID string `json:"item_id,omitempty"`
+	// Turn is the conversation turn the outcome happened in; 0 while turn
+	// plumbing does not exist anywhere in the port. Additive.
+	Turn int `json:"turn,omitempty"`
 	// Run carries the run totals for Type "history-run" entries.
 	Run *RunSummary `json:"run,omitempty"`
+}
+
+// isDecision reports whether the entry is a per-segment decision: an
+// explicit Type "decision" or empty Type (the legacy spelling). Outcomes,
+// tripwire overrides, and run summaries are not.
+func (e ShadowEntry) isDecision() bool {
+	return e.Type == "" || e.Type == EntryTypeDecision
 }
 
 // RunSummary is the per-run totals of one history-compaction pass — the
@@ -72,8 +107,10 @@ type RunSummary struct {
 }
 
 // ReplayReport summarizes what WOULD have been elided at a score threshold.
-// Miss-risk — whether eliding a segment would actually have lost information
-// the agent needed — is not computable offline, so the report is counts only.
+// The counts are entry-based; miss-risk — whether eliding a segment would
+// actually have lost information the agent needed — is computable from the
+// expand/hit outcome lines once they exist: see FalseNegativeRate and
+// ReplayTable (whose StillMissed column is built on them).
 type ReplayReport struct {
 	Threshold      float64 `json:"threshold"`
 	Entries        int     `json:"entries"`         // decision lines read
@@ -145,13 +182,13 @@ func NewShadowLogAt(path string) (*ShadowLog, error) {
 // Path returns the log file path.
 func (l *ShadowLog) Path() string { return l.path }
 
-// Append writes one decision line. Zero fields are defaulted: a zero TS
-// becomes time.Now() and an empty Decision becomes DecisionKeep. The entry
-// is serialized first so a marshal failure cannot leave a torn line behind.
+// Append writes one shadow-log line. Zero fields are defaulted: a zero TS
+// becomes time.Now() and a decision entry's empty Decision becomes
+// DecisionKeep — outcomes (Type "expand"/"hit") and run summaries carry no
+// decision and are never defaulted. The entry is serialized first so a
+// marshal failure cannot leave a torn line behind.
 func (l *ShadowLog) Append(e ShadowEntry) error {
-	// Decision is a per-segment concept: only decision entries (empty Type is
-	// the legacy spelling) default to keep — a run summary carries none.
-	if e.Decision == "" && e.Type != EntryTypeHistoryRun {
+	if e.Decision == "" && e.isDecision() {
 		e.Decision = DecisionKeep
 	}
 	if e.TS.IsZero() {
@@ -188,26 +225,50 @@ func (l *ShadowLog) AppendRun(taskHash string, run RunSummary) error {
 	})
 }
 
-// Replay reads the whole log and reports what WOULD be elided at threshold:
-// every decision whose score is strictly below threshold counts as elided.
-// History-run summary lines are not decisions — they carry no segment — so
-// they are skipped, not counted as malformed. A missing log file is an empty
-// report, not an error (nothing has been scored yet).
-func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
+// AppendOutcome writes one outcome line (Type "expand" or "hit") naming the
+// item it attributes to: the record id itself for the record-level outcome,
+// plus one outcome per contributing segment id — the reference pipeline.py
+// expand() attribution that ties every expand back to the score decisions
+// that caused the elision. kind must be one of the two outcome types;
+// turn is the conversation turn (0 while turn plumbing does not exist).
+// Outcomes go through the same crash-atomic append path as decisions;
+// FalseNegativeRate and the replay table's still-missed column are built on
+// them.
+func (l *ShadowLog) AppendOutcome(kind, itemID string, turn int) error {
+	if kind != EntryTypeExpand && kind != EntryTypeHit {
+		return fmt.Errorf("compaction: unknown outcome kind %q", kind)
+	}
+	if itemID == "" {
+		return fmt.Errorf("compaction: outcome needs an item id")
+	}
+	return l.Append(ShadowEntry{
+		Type:   kind,
+		ItemID: itemID,
+		Turn:   turn,
+	})
+}
+
+// readEntries parses the whole log into entries in file order — appends are
+// serialized whole lines, so file order is chronological. Blank lines are
+// skipped; malformed lines (the torn residue of a crash mid-append) are
+// counted in the second return value and skipped. A missing log file is
+// (nil, 0, nil): nothing has been scored yet, not an error.
+func (l *ShadowLog) readEntries() ([]ShadowEntry, int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	f, err := os.Open(l.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return ReplayReport{Threshold: threshold}, nil
+			return nil, 0, nil
 		}
-		return ReplayReport{}, fmt.Errorf("compaction: open shadow log %s: %w", l.path, err)
+		return nil, 0, fmt.Errorf("compaction: open shadow log %s: %w", l.path, err)
 	}
 	defer f.Close()
 
-	report := ReplayReport{Threshold: threshold}
-	seen := make(map[string]bool)
-	elidedSeen := make(map[string]bool)
+	var (
+		entries   []ShadowEntry
+		malformed int
+	)
 	sc := bufio.NewScanner(f)
 	// Segment IDs are short but the lines carry no payload text; a 4 MiB
 	// cap is purely defensive against a corrupted or hostile log.
@@ -219,14 +280,38 @@ func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 		}
 		var e ShadowEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			report.MalformedLines++
+			malformed++
 			continue
 		}
-		if e.Type != "" && e.Type != EntryTypeDecision {
+		entries = append(entries, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, malformed, fmt.Errorf("compaction: read shadow log %s: %w", l.path, err)
+	}
+	return entries, malformed, nil
+}
+
+// Replay reads the whole log and reports what WOULD be elided at threshold:
+// every decision whose score is strictly below threshold counts as elided.
+// History-run summaries, tripwire records, and outcome lines are not
+// decisions — they carry no segment score — so they are skipped, not counted
+// as malformed. A missing log file is an empty report, not an error (nothing
+// has been scored yet).
+func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
+	entries, malformed, err := l.readEntries()
+	if err != nil {
+		return ReplayReport{}, err
+	}
+
+	report := ReplayReport{Threshold: threshold, MalformedLines: malformed}
+	seen := make(map[string]bool)
+	elidedSeen := make(map[string]bool)
+	for _, e := range entries {
+		if !e.isDecision() {
 			// Non-decision entries (history-run summaries, tripwire records,
-			// and any future outcome type) are not per-segment decisions:
-			// counting them would inflate Entries/TokensTotal and mint a ""
-			// unique segment.
+			// expand/hit outcomes) are not per-segment decisions: counting
+			// them would inflate Entries/TokensTotal and mint a "" unique
+			// segment.
 			continue
 		}
 		report.Entries++
@@ -244,8 +329,173 @@ func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 			}
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return ReplayReport{}, fmt.Errorf("compaction: read shadow log %s: %w", l.path, err)
-	}
 	return report, nil
+}
+
+// Stats summarizes a shadow log's decisions and outcomes: how many
+// per-segment decisions were recorded, how many of those the log itself
+// vouches were — or, in shadow mode, would have been — elided at the
+// threshold recorded with them, and how many distinct items carry expand
+// and hit outcomes. A missing log file is a zero Stats, not an error.
+type Stats struct {
+	// Decisions is the number of per-segment decision entries.
+	Decisions int `json:"decisions"`
+	// ElidedDecisions is the number of decision entries whose score is
+	// strictly below the threshold recorded with them. Legacy entries
+	// without a recorded threshold (0 = none in force) can never count: no
+	// score is below an unknown floor.
+	ElidedDecisions int `json:"elided_decisions"`
+	// Expands is the number of distinct item ids with an expand outcome.
+	Expands int `json:"expands"`
+	// Hits is the number of distinct item ids with a hit outcome.
+	Hits int `json:"hits"`
+}
+
+// Stats reads the whole log and counts decisions and outcomes. Outcome
+// entries (Type "expand"/"hit") never count as decisions, and outcome item
+// ids are counted distinct — one record expanded five times is one expand.
+func (l *ShadowLog) Stats() (Stats, error) {
+	entries, _, err := l.readEntries()
+	if err != nil {
+		return Stats{}, err
+	}
+	var st Stats
+	expanded := make(map[string]bool)
+	hit := make(map[string]bool)
+	for _, e := range entries {
+		switch {
+		case e.isDecision():
+			st.Decisions++
+			if e.Threshold > 0 && e.Score < e.Threshold {
+				st.ElidedDecisions++
+			}
+		case e.Type == EntryTypeExpand && e.ItemID != "":
+			expanded[e.ItemID] = true
+		case e.Type == EntryTypeHit && e.ItemID != "":
+			hit[e.ItemID] = true
+		}
+	}
+	st.Expands = len(expanded)
+	st.Hits = len(hit)
+	return st, nil
+}
+
+// FalseNegativeRate reports the share of elided segments the agent later had
+// to expand — every expand is a recorded false negative of the elision
+// decision that relocated its content (the reference's outcome ledger).
+//
+// Precisely: the numerator counts the DISTINCT segment ids with a decision
+// entry whose score is strictly below the threshold recorded with it AND a
+// later expand outcome naming that id (later = appended after the decision
+// line); the denominator counts the DISTINCT segment ids elided at their own
+// recorded threshold. 0 when nothing was elided — an empty ledger is not an
+// error. Legacy entries without a recorded threshold never count as elided.
+func (l *ShadowLog) FalseNegativeRate() (float64, error) {
+	entries, _, err := l.readEntries()
+	if err != nil {
+		return 0, err
+	}
+	elided := make(map[string]bool)
+	for _, e := range entries {
+		if e.isDecision() && e.SegmentID != "" && elidedAtOwnThreshold(e) {
+			elided[e.SegmentID] = true
+		}
+	}
+	if len(elided) == 0 {
+		return 0, nil
+	}
+	missed := stillMissedIDs(entries, elidedAtOwnThreshold)
+	return float64(len(missed)) / float64(len(elided)), nil
+}
+
+// elidedAtOwnThreshold is the elision predicate on a decision entry's own
+// recorded data: score strictly below the threshold recorded with it. An
+// entry without a recorded threshold (legacy lines, or no threshold in
+// force) is never elided — an unknown floor vouches for nothing.
+func elidedAtOwnThreshold(e ShadowEntry) bool {
+	return e.Threshold > 0 && e.Score < e.Threshold
+}
+
+// stillMissedIDs returns the distinct segment ids the elide predicate
+// selects — a "would relocate" set — that ALSO have a later expand outcome
+// naming them: content the predicate would have removed that the agent
+// demonstrably had to fetch back. Expand outcomes may name a record id
+// (the record-level outcome) instead of a segment id; record ids never
+// match a segment id here, so only the per-segment attribution links.
+func stillMissedIDs(entries []ShadowEntry, elided func(ShadowEntry) bool) map[string]bool {
+	// lastExpandAt maps an item id to the LAST line index of an expand
+	// outcome naming it (the scan runs in ascending order, so the final
+	// assignment is the maximum).
+	lastExpandAt := make(map[string]int)
+	for i, e := range entries {
+		if e.Type == EntryTypeExpand && e.ItemID != "" {
+			lastExpandAt[e.ItemID] = i
+		}
+	}
+	missed := make(map[string]bool)
+	for i, e := range entries {
+		if !e.isDecision() || e.SegmentID == "" || !elided(e) {
+			continue
+		}
+		if j, ok := lastExpandAt[e.SegmentID]; ok && j > i {
+			missed[e.SegmentID] = true
+		}
+	}
+	return missed
+}
+
+// ReplayRow is one threshold's replay of the recorded decisions — what the
+// gate WOULD have done at that threshold, re-decided from the recorded
+// scores without re-running the scorer (the reference's replay table; that
+// is the point of replay: the same run, re-decided at other settings).
+type ReplayRow struct {
+	// Threshold is the replayed keep threshold.
+	Threshold float64 `json:"threshold"`
+	// Kept is the number of decision entries whose score is at or above the
+	// threshold — they would have stayed in the output.
+	Kept int `json:"kept"`
+	// Relocated is the number of decision entries whose score is strictly
+	// below the threshold — they would have been elided. Entries, not
+	// distinct segments: a segment re-scored twice counts twice.
+	Relocated int `json:"relocated"`
+	// TokensSaved is the total token count of the relocated entries — the
+	// tokens the threshold would have saved.
+	TokensSaved int `json:"tokens_saved"`
+	// StillMissed is the number of DISTINCT relocated segment ids that have
+	// a later expand outcome: content the threshold would have removed that
+	// the agent demonstrably needed back.
+	StillMissed int `json:"still_missed"`
+}
+
+// ReplayTable replays the log's recorded scores at every given threshold,
+// returning one row per threshold sorted ascending. Each entry is re-decided
+// from its own recorded score against the GIVEN threshold — the entry's own
+// recorded threshold plays no part here. A missing log file yields a zero
+// row per threshold, not an error.
+func (l *ShadowLog) ReplayTable(thresholds []float64) ([]ReplayRow, error) {
+	entries, _, err := l.readEntries()
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]ReplayRow, 0, len(thresholds))
+	for _, th := range thresholds {
+		row := ReplayRow{Threshold: th}
+		for _, e := range entries {
+			if !e.isDecision() {
+				continue
+			}
+			if e.Score < th {
+				row.Relocated++
+				row.TokensSaved += e.Tokens
+			} else {
+				row.Kept++
+			}
+		}
+		row.StillMissed = len(stillMissedIDs(entries, func(e ShadowEntry) bool {
+			return e.Score < th
+		}))
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Threshold < rows[j].Threshold })
+	return rows, nil
 }

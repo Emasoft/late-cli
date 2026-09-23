@@ -22,6 +22,22 @@ type ExpandStore interface {
 	Get(id string) (string, bool)
 }
 
+// expandOutcomeStore is the optional outcome side of the expand store: the
+// production *compaction.Store implements it (Touch counters, the attached
+// shadow log, record snapshots); minimal test fakes need not. Execute
+// type-asserts the store and silently records nothing when it lacks the
+// side — outcomes are a ledger, never a precondition for expanding.
+type expandOutcomeStore interface {
+	// Touch bumps a record's expand/hit counters; reports whether the
+	// record exists.
+	Touch(id string, expand, hit bool) bool
+	// ShadowLog returns the store's attached outcome log, or nil.
+	ShadowLog() *compaction.ShadowLog
+	// GetRecord snapshots a record — its SegmentIDs attribute the expand
+	// back to the score decisions that caused the elision.
+	GetRecord(id string) (*compaction.Record, bool)
+}
+
 // ExpandTool retrieves the original text of a tool-output run that
 // compaction relocated (compaction-mode "enabled"): compacted results
 // contain pointer lines like
@@ -36,7 +52,10 @@ type ExpandStore interface {
 // Passing a whole pointer line instead of the bare id works too: the id is
 // parsed out of it. It is registered on the main session registry when
 // compaction-mode is enabled, and subagents inherit it from the parent
-// registry.
+// registry. Each successful retrieval is recorded as an expand outcome (the
+// store's Touch counter plus shadow-log outcome lines attributing back to
+// the record and its contributing segments) when the store carries a shadow
+// log; see recordExpandOutcome.
 type ExpandTool struct {
 	Store ExpandStore
 }
@@ -90,7 +109,45 @@ func (t ExpandTool) Execute(ctx context.Context, args json.RawMessage) (string, 
 	if !ok {
 		return "", fmt.Errorf("unknown elided id %q", id)
 	}
+	t.recordExpandOutcome(id)
 	return original, nil
+}
+
+// recordExpandOutcome marks one successful retrieval — every expand is a
+// recorded false negative (the reference pipeline.py expand()): the record's
+// expand counter moves (Store.Touch), and one "expand" outcome naming the
+// record id plus one naming each contributing segment id land in the
+// store's attached shadow log, attributing the expand back to the score
+// decisions that caused the elision (ShadowLog.FalseNegativeRate and the
+// replay table's still-missed column are built on it).
+//
+// Best-effort and nil-safe by contract: a store without the outcome side
+// (test fakes) or without an attached shadow log records nothing, a failed
+// outcome append never fails the expand itself, and turn stays 0 (turn
+// plumbing does not exist yet, mirroring every other writer).
+func (t ExpandTool) recordExpandOutcome(id string) {
+	s, ok := t.Store.(expandOutcomeStore)
+	if !ok {
+		return
+	}
+	if !s.Touch(id, true, false) {
+		return // unknown record: nothing to attribute
+	}
+	shadow := s.ShadowLog()
+	if shadow == nil {
+		return // no outcome log attached at wiring: skip silently
+	}
+	_ = shadow.AppendOutcome(compaction.EntryTypeExpand, id, 0)
+	rec, ok := s.GetRecord(id)
+	if !ok {
+		return
+	}
+	for _, segID := range rec.SegmentIDs {
+		if segID == "" {
+			continue
+		}
+		_ = shadow.AppendOutcome(compaction.EntryTypeExpand, segID, 0)
+	}
 }
 
 // expandID extracts the id argument from raw tool arguments for the

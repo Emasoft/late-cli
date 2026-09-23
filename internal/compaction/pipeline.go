@@ -147,8 +147,15 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 			if !ok {
 				score = keepScore
 			}
+			// The floor this segment's elide decision turns on: the
+			// protected-kind floor when the kind has one, else the
+			// relocation threshold in force. Recorded with the entry so
+			// Stats, FalseNegativeRate, and ReplayTable can re-run the
+			// decision from score vs threshold without re-scoring (0 when
+			// no threshold is in force — never counts as elided).
+			floor := gate.floor(s.Kind)
 			decision := DecisionKeep
-			if relocStore != nil && score < gate.floor(s.Kind) {
+			if relocStore != nil && score < floor {
 				decision = DecisionElide
 			}
 			if aerr := p.shadow.Append(ShadowEntry{
@@ -158,6 +165,7 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 				Tokens:    s.Tokens,
 				Score:     score,
 				Decision:  decision,
+				Threshold: floor,
 			}); aerr != nil {
 				out.Errors = append(out.Errors, fmt.Errorf("shadow log append for %s: %w", s.ID, aerr))
 			}

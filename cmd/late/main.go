@@ -32,6 +32,7 @@ import (
 	"late/internal/tui"
 
 	"encoding/json"
+	"text/tabwriter"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
@@ -152,6 +153,7 @@ func main() {
 	// expand tool so originals stay retrievable).
 	compactionModeReq := flag.String("compaction-mode", "", "Tool-output compaction stage: off, shadow (score + shadow log only), or enabled (also relocate low-scoring segments; adds the expand tool). Overrides config.json compaction-mode. Default: shadow.")
 	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled.")
+	replayShadowReq := flag.String("replay-shadow", "", "Replay the default shadow log at the given comma-separated thresholds (e.g. 0.10,0.35,0.50): print the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, then exit. Read-only; the TUI does not start.")
 
 	flag.Usage = func() {
 		writeHelp(os.Stderr, flag.CommandLine)
@@ -183,6 +185,23 @@ func main() {
 
 	if *helpReq {
 		flag.Usage()
+		return
+	}
+
+	// -replay-shadow: read-only offline replay of the default shadow log —
+	// one kept/relocated/tokens-saved/still-missed row per given threshold
+	// (re-decided from the recorded scores, no scorer round trip) plus the
+	// false-negative rate — then exit without starting the TUI.
+	if *replayShadowReq != "" {
+		thresholds, err := parseReplayThresholds(*replayShadowReq)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runReplayShadow(thresholds); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -715,6 +734,12 @@ func main() {
 				// store — compaction keeps working, pointers merely stop
 				// surviving restarts (the shadow-log warning pattern).
 				store := openCompactionStore()
+				// Outcomes: the expand tool attributes every expand back to
+				// the record and its contributing segment ids through the
+				// shadow log attached here (Step 13's false-negative
+				// ledger). Nil-safe — a missing shadow log simply disables
+				// outcome logging.
+				store = store.WithShadowLog(compactionShadowLog)
 				pipeline.EnableRelocation(store, compactionThreshold)
 				// The expand tool returns relocated originals. Registered on
 				// the main registry before any spawn: subagents inherit it
@@ -1154,6 +1179,82 @@ func openCompactionStoreAt(path string) *compaction.Store {
 		return compaction.NewStore()
 	}
 	return store
+}
+
+// parseReplayThresholds parses a -replay-shadow value: a comma-separated
+// list of keep thresholds in (0, 1], e.g. "0.10,0.35,0.50". Surrounding
+// whitespace is tolerated. Empty entries, non-numeric values, and
+// out-of-range thresholds are errors — the caller asked for an explicit
+// replay, so silently clamping would misrepresent it.
+func parseReplayThresholds(s string) ([]float64, error) {
+	var out []float64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("invalid -replay-shadow value %q: empty threshold", s)
+		}
+		th, err := strconv.ParseFloat(part, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -replay-shadow threshold %q: %v", part, err)
+		}
+		if th <= 0 || th > 1 {
+			return nil, fmt.Errorf("invalid -replay-shadow threshold %v: must be in (0, 1]", th)
+		}
+		out = append(out, th)
+	}
+	return out, nil
+}
+
+// runReplayShadow prints the replay table (one row per threshold, re-decided
+// from the log's recorded scores without any scorer round trip) plus the
+// false-negative rate line for the default shadow log, then returns; the
+// caller exits. Strictly read-only: a missing log is reported as "nothing
+// scored yet" and nothing is created — the only constructor reached,
+// NewShadowLogAt, runs after a stat confirmed the file exists (its parent
+// mkdir is then a no-op) and nothing appends to it.
+func runReplayShadow(thresholds []float64) error {
+	path, err := compaction.DefaultShadowPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("No shadow log at %s — nothing scored yet (compaction modes shadow and enabled write it).\n", path)
+			return nil
+		}
+		return err
+	}
+	shadowLog, err := compaction.NewShadowLogAt(path)
+	if err != nil {
+		return err
+	}
+	rows, err := shadowLog.ReplayTable(thresholds)
+	if err != nil {
+		return err
+	}
+	ffr, err := shadowLog.FalseNegativeRate()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Shadow log: %s\n\n", path)
+	fmt.Print(formatReplayTable(rows, ffr))
+	return nil
+}
+
+// formatReplayTable renders the replay rows as an aligned table — threshold,
+// kept, relocated, tokens saved, still missed — followed by the
+// false-negative rate line. Split from runReplayShadow so tests can pin the
+// exact rendering.
+func formatReplayTable(rows []compaction.ReplayRow, ffr float64) string {
+	var b strings.Builder
+	tw := tabwriter.NewWriter(&b, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "threshold\tkept\trelocated\ttokens saved\tstill missed")
+	for _, r := range rows {
+		fmt.Fprintf(tw, "%.2f\t%d\t%d\t%d\t%d\n", r.Threshold, r.Kept, r.Relocated, r.TokensSaved, r.StillMissed)
+	}
+	tw.Flush()
+	fmt.Fprintf(&b, "\nfalse-negative rate: %.1f%%\n", ffr*100)
+	return b.String()
 }
 
 // historyCompactionRunner adapts the live session for the TUI's
