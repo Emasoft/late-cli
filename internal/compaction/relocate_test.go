@@ -33,6 +33,21 @@ func boundaryScores(threshold float64) map[string]float64 {
 	}
 }
 
+// applyTestGate applies a gate config sized for the small relocation
+// fixtures: they are a few hundred bytes (a few dozen tokens), far below the
+// reference DefaultGateConfig's 400-token min-gate, so the token gate is
+// disabled and the keep threshold pinned explicitly. maxElide caps the
+// elide-fraction tripwire (1 disables it, since elided tokens can never
+// exceed the total), so fixtures that elide everything still exercise the
+// pointer path they were written for.
+func applyTestGate(p *Pipeline, keepThreshold, maxElide float64) {
+	p.ApplyGateConfig(GateConfig{
+		KeepThreshold:    keepThreshold,
+		MinGateTokens:    0,
+		MaxElideFraction: maxElide,
+	})
+}
+
 // TestPipeline_EnableRelocationThresholdBoundary pins the relocation
 // contract: the segment scoring exactly at the threshold stays, the one
 // below it is elided into the store, the high scorer stays, and the compact
@@ -44,6 +59,7 @@ func TestPipeline_EnableRelocationThresholdBoundary(t *testing.T) {
 
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p.EnableRelocation(store, threshold)
+	applyTestGate(p, threshold, 0.7)
 
 	output, keeper1, filler, keeper2 := relocationOutput()
 	got, err := p.CompactToolOutput(context.Background(), "Bash", output)
@@ -120,6 +136,7 @@ func TestPipeline_CompactOutputNothingElidedKeepsOriginalBytes(t *testing.T) {
 	store := NewStore()
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: high.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p.EnableRelocation(store, 0.35)
+	applyTestGate(p, 0.35, 0.7)
 
 	output := strings.Repeat("keep me\n\n", 40)
 	got, err := p.CompactToolOutput(context.Background(), "Bash", output)
@@ -138,17 +155,23 @@ func TestPipeline_CompactOutputNothingElidedKeepsOriginalBytes(t *testing.T) {
 }
 
 // TestPipeline_CompactOutputAllElided: every segment below the threshold
-// leaves only pointer lines behind.
+// leaves only pointer lines behind. The gate's tripwire is disabled for this
+// fixture: eliding everything is 100% of tokens, past the 0.7 default — the
+// tripwire's own behavior is covered in gate_test.go.
 func TestPipeline_CompactOutputAllElided(t *testing.T) {
 	d := newDecisionsServer(t, fixedScoresHandler(map[string]float64{"seg-1": 0.1, "seg-2": 0.2}))
 	store := NewStore()
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p.EnableRelocation(store, 0.35)
+	applyTestGate(p, 0.35, 1)
 
 	output := strings.Repeat("x", 120) + "\n\n" + strings.Repeat("y", 120)
 	got, err := p.CompactToolOutput(context.Background(), "Bash", output)
 	if err != nil {
 		t.Fatalf("CompactToolOutput() error = %v", err)
+	}
+	if got.Tripwire != "" {
+		t.Errorf("Tripwire = %q, want empty (tripwire disabled for this fixture)", got.Tripwire)
 	}
 	if len(got.Elided) != 2 {
 		t.Fatalf("Elided = %d segments, want 2", len(got.Elided))
@@ -189,6 +212,7 @@ func TestPipeline_CompactOutputFailOpenKeepsOriginal(t *testing.T) {
 				p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
 			}
 			p.EnableRelocation(store, 0.35)
+			applyTestGate(p, 0.35, 0.7)
 
 			got, err := p.CompactToolOutput(context.Background(), "Bash", output)
 			if tc.wantErr && err == nil {
@@ -213,6 +237,7 @@ func TestPipeline_CompactWithoutRelocationIsShadow(t *testing.T) {
 	d := newDecisionsServer(t, fixedScoresHandler(map[string]float64{"seg-1": 0.01, "seg-2": 0.02}))
 	store := NewStore()
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
+	applyTestGate(p, 0.35, 0.7)
 
 	output := strings.Repeat("a", 120) + "\n\n" + strings.Repeat("b", 120)
 	got, err := p.CompactToolOutput(context.Background(), "Bash", output)
@@ -244,6 +269,7 @@ func TestPipeline_RelocationShadowLogDecisions(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", shadow, PipelineOptions{})
+		applyTestGate(p, 0.35, 0.7)
 		if armed {
 			p.EnableRelocation(NewStore(), 0.35)
 		}
@@ -288,6 +314,7 @@ func TestPipeline_ElideIDsIncrementAcrossCalls(t *testing.T) {
 	store := NewStore()
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p.EnableRelocation(store, 0.35)
+	applyTestGate(p, 0.35, 1)
 
 	ctx := context.Background()
 	first, err := p.CompactToolOutput(ctx, "Bash", strings.Repeat("a", 120)+"\n\n"+strings.Repeat("b", 120))
@@ -320,6 +347,7 @@ func TestPipeline_CompactToolResultTrailer(t *testing.T) {
 	store := NewStore()
 	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p.EnableRelocation(store, 0.35)
+	applyTestGate(p, 0.35, 0.7)
 
 	got := p.CompactToolResult(context.Background(), "Bash", output)
 	for _, want := range []string{
@@ -338,6 +366,7 @@ func TestPipeline_CompactToolResultTrailer(t *testing.T) {
 	high := newDecisionsServer(t, fixedScoresHandler(map[string]float64{"seg-1": 0.9, "seg-2": 0.9, "seg-3": 0.9}))
 	p2 := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: high.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 	p2.EnableRelocation(store, 0.35)
+	applyTestGate(p2, 0.35, 0.7)
 	if got := p2.CompactToolResult(context.Background(), "Bash", output); got != output {
 		t.Errorf("CompactToolResult() with nothing elided must return the original, got:\n%s", got)
 	}
@@ -354,6 +383,10 @@ func TestPipeline_EnableRelocationClampsThreshold(t *testing.T) {
 		store := NewStore()
 		p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 		p.EnableRelocation(store, bad)
+		// The invalid keep threshold clamps to "unset" (the armed threshold
+		// stays in force) and the tripwire is disabled so the single
+		// all-eliding fixture elides normally.
+		applyTestGate(p, bad, 1)
 		got, err := p.CompactToolOutput(context.Background(), "Bash", output)
 		if err != nil {
 			t.Fatalf("threshold %v: CompactToolOutput() error = %v", bad, err)

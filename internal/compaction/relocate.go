@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"late/internal/common"
 )
 
 // DecisionElide is the shadow-log decision recorded for a segment whose
@@ -50,6 +52,12 @@ type CompactResult struct {
 	// Elided carries the relocated segments (originals included) for the
 	// caller's Store. Empty when nothing was elided.
 	Elided []ElidedSegment
+	// Tripwire is non-empty when the gate's safety tripwire fired and the
+	// scorer's elision decisions were discarded: TripwireMaxElideFraction
+	// means the scorer wanted to elide more than MaxElideFraction of the
+	// output's tokens, so it was distrusted and everything was kept. Empty
+	// means the decisions stood.
+	Tripwire string
 }
 
 // Store holds the original text of elided segments, keyed by elide id, so
@@ -144,10 +152,22 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 }
 
 // CompactToolOutput scores one tool output and, when relocation is armed,
-// relocates every segment scoring strictly below the threshold: the
-// segment's original goes into the armed store and its slot in the result is
-// replaced by an [[elided …]] pointer line. The returned CompactText is the
-// tool result that should enter history.
+// relocates every segment scoring strictly below its floor — the
+// protected-kind floor when the segment's kind has one (the gate's
+// ProtectedKinds), else the keep threshold: the segment's original goes into
+// the armed store and its slot in the result is replaced by an [[elided …]]
+// pointer line. The returned CompactText is the tool result that should
+// enter history.
+//
+// Two gate guards run before and after the per-segment decisions:
+//
+//   - MinGateTokens: an output estimated below that many tokens is returned
+//     unchanged without scoring it (no backend call) — the round trip costs
+//     more than any possible elision saves.
+//   - The MaxElideFraction tripwire: when the scorer wants to elide more
+//     than that share of the output's tokens, it is distrusted and NOTHING
+//     is elided; the result reports Tripwire=TripwireMaxElideFraction and
+//     the shadow log records the override.
 //
 // Fail-open contract, extended to relocation: any scoring error (provider
 // outage, bad answer, canceled context) means no reliable elision decision
@@ -156,36 +176,69 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output string) (CompactResult, error) {
 	out := CompactResult{CompactText: output}
 
+	// Min-gate: below MinGateTokens the scoring round trip costs more than
+	// elision can possibly save — skip scoring entirely.
+	if min := p.minGateTokens(); min > 0 && common.EstimateTokenCount(output) < min {
+		return out, nil
+	}
+
 	scores, err := p.ScoreToolOutput(ctx, toolName, output)
 	if err != nil {
 		// Fail-open: keep the whole output verbatim.
 		return out, err
 	}
 
-	store, threshold := p.relocationArmed()
+	store, _ := p.relocationArmed()
 	if store == nil || len(scores.Segments) == 0 {
 		return out, nil
 	}
 
-	var kept []Segment
-	for _, seg := range scores.Segments {
+	// Decide per segment first (flags only), so the tripwire can still veto
+	// the whole batch before anything is stored or replaced.
+	gate := p.resolveGate()
+	totalTokens, elidedTokens := 0, 0
+	elide := make([]bool, len(scores.Segments))
+	for i, seg := range scores.Segments {
 		score, ok := scores.Scores[seg.ID]
 		if !ok {
 			score = keepScore // defensive; ScoreToolOutput fills every id
 		}
-		if score < threshold {
-			id := store.NextID()
-			store.Put(id, seg.Text)
-			out.Elided = append(out.Elided, ElidedSegment{
-				ID:      id,
-				Lines:   countLines(seg.Text),
-				Tokens:  seg.Tokens,
-				Preview: previewOf(seg.Text),
-				Text:    seg.Text,
-			})
+		totalTokens += seg.Tokens
+		if score < gate.floor(seg.Kind) {
+			elide[i] = true
+			elidedTokens += seg.Tokens
+		}
+	}
+
+	// TRIPWIRE: a scorer that wants to drop most of the output is wrong
+	// more often than not (and one broken score map could gut a tool result
+	// wholesale). Distrust it: elide nothing, say so in the result, and log
+	// the override.
+	if gate.cfg.MaxElideFraction > 0 && totalTokens > 0 &&
+		float64(elidedTokens) > gate.cfg.MaxElideFraction*float64(totalTokens) {
+		for i := range elide {
+			elide[i] = false
+		}
+		elidedTokens = 0
+		out.Tripwire = TripwireMaxElideFraction
+		p.logTripwire(scores.TaskHash, totalTokens)
+	}
+
+	var kept []Segment
+	for i, seg := range scores.Segments {
+		if !elide[i] {
+			kept = append(kept, seg)
 			continue
 		}
-		kept = append(kept, seg)
+		id := store.NextID()
+		store.Put(id, seg.Text)
+		out.Elided = append(out.Elided, ElidedSegment{
+			ID:      id,
+			Lines:   countLines(seg.Text),
+			Tokens:  seg.Tokens,
+			Preview: previewOf(seg.Text),
+			Text:    seg.Text,
+		})
 	}
 
 	if len(out.Elided) == 0 {

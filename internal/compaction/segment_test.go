@@ -200,3 +200,179 @@ func TestSegmentSegments_MultiByteOffsets(t *testing.T) {
 		t.Errorf("segment 0 span = [%d,%d), want [0,%d)", segs[0].StartByte, segs[0].EndByte, len("日本語のテキスト\n\n"))
 	}
 }
+
+// TestClassifyKind pins the kind heuristics, most specific first. Each case
+// is one deterministic classification of a whole segment's text.
+func TestClassifyKind(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want SegmentKind
+	}{
+		{name: "empty is text", text: "", want: KindText},
+		{name: "prose is text", text: "The parser accepts three input formats and normalizes them before scoring.", want: KindText},
+		{
+			name: "fenced code block is code",
+			text: "```go\nfmt.Println(\"hi\")\n```",
+			want: KindCode,
+		},
+		{
+			name: "fence beats diff markers inside it",
+			text: "```diff\n+++ b/x.go\n@@ -1 +1 @@\n```",
+			want: KindCode,
+		},
+		{
+			name: "diff header is diff",
+			text: "diff --git a/x.go b/x.go\nindex 1234..5678 100644\n--- a/x.go\n+++ b/x.go",
+			want: KindDiff,
+		},
+		{
+			name: "plus-plus prefix is diff",
+			text: "+++ b/internal/x.go\n@@ -1 +1 @@",
+			want: KindDiff,
+		},
+		{
+			name: "hunk header is diff",
+			text: "@@ -12,7 +12,9 @@ func main() {",
+			want: KindDiff,
+		},
+		{
+			name: "go panic header is stacktrace",
+			text: "goroutine 1 [running]:\nmain.main()\n\t/home/dev/app/main.go:42 +0x1a4",
+			want: KindStacktrace,
+		},
+		{
+			name: "python traceback is stacktrace",
+			text: "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>",
+			want: KindStacktrace,
+		},
+		{
+			name: "java frame with leading tab is stacktrace",
+			text: "\tat com.example.Foo.bar(Foo.java:99)\nat com.example.Foo.baz(Foo.java:10)",
+			want: KindStacktrace,
+		},
+		{
+			name: "exception name is stacktrace",
+			text: "java.lang.NullPointerException: cannot invoke method on null",
+			want: KindStacktrace,
+		},
+		{
+			name: "json object is json",
+			text: `{"ok": true, "items": [1, 2, 3]}`,
+			want: KindJSON,
+		},
+		{
+			name: "json array is json",
+			text: `[{"id": 1}, {"id": 2}]`,
+			want: KindJSON,
+		},
+		{
+			name: "bracketed prose is not json",
+			text: "[TODO] fix the parser before the next release",
+			want: KindText,
+		},
+		{
+			name: "broken json is not json",
+			text: `{"ok": true, "trailing":`,
+			want: KindText,
+		},
+		{
+			name: "iso timestamps are log",
+			text: "2024-01-02T15:04:05Z INFO boot\n2024-01-02T15:04:06Z ERROR fail\n2024-01-02T15:04:07Z INFO ready",
+			want: KindLog,
+		},
+		{
+			name: "space-separated timestamps are log",
+			text: "2024-01-02 15:04:05 starting import\n2024-01-02 15:04:06 import done",
+			want: KindLog,
+		},
+		{
+			name: "bracketed times are log",
+			text: "[12:00:00] boot ok\n[12:00:01] ready\n[12:00:02] done",
+			want: KindLog,
+		},
+		{
+			name: "severity prefixes are log",
+			text: "WARN disk nearly full\nERROR write failed\nINFO retrying",
+			want: KindLog,
+		},
+		{
+			name: "one timestamp mention in prose is not a log",
+			text: "The deploy finished at 2024-01-02 15:04:05 sharp, and everyone celebrated.",
+			want: KindText,
+		},
+		{
+			name: "pipe rows with consistent columns are table",
+			text: "name | count\nalpha | 2\nbeta | 3",
+			want: KindTable,
+		},
+		{
+			name: "inconsistent columns are not a table",
+			text: "name | count\nalpha | 2 | extra\nbeta | 3",
+			want: KindText,
+		},
+		{
+			name: "a single pipe line is not a table",
+			text: "alpha | beta",
+			want: KindText,
+		},
+		{
+			name: "prose mentioning a pipe is not a table",
+			text: "Use a | sparingly.\nOr not at all.\nReally, don't.",
+			want: KindText,
+		},
+		{
+			name: "diff beats exception-looking content",
+			text: "+++ b/x.py\n@@ -1 +1 @@\n-raise Exception('x')",
+			want: KindDiff,
+		},
+		{
+			name: "stacktrace beats table",
+			text: "goroutine 1 [running]:\nmain.a()\nmain.b() | frame",
+			want: KindStacktrace,
+		},
+		{
+			name: "log beats table",
+			text: "2024-01-02T15:04:05Z INFO a | b\n2024-01-02T15:04:06Z INFO c | d",
+			want: KindLog,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyKind(tc.text); got != tc.want {
+				t.Errorf("classifyKind(%q) = %q, want %q", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSegmentSegments_KindClassification checks that segmentation stamps
+// every segment with its kind while leaving the byte-offset contract
+// untouched.
+func TestSegmentSegments_KindClassification(t *testing.T) {
+	prose := strings.Repeat("plain prose. ", 8) // 104 chars: over the tiny floor
+	var tableRows []string
+	for i := 0; i < 6; i++ {
+		tableRows = append(tableRows, fmt.Sprintf("item-%02d | count-%02d | note", i, i))
+	}
+	table := strings.Join(tableRows, "\n")
+	stack := "goroutine 1 [running]:\nmain.main()\n\t/home/dev/app/main.go:42 +0x1a4\nexit status 2"
+	// Over the 80-char tiny-paragraph floor so it stays its own segment.
+	diff := "diff --git a/main.go b/main.go\nindex 1234..5678 100644\n--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,4 @@"
+	// Both over the 80-char tiny-paragraph floor so each stays its own segment.
+	js := `{"ok": true, "items": [1, 2, 3], "note": "padding padding padding padding padding"}`
+
+	out := strings.Join([]string{prose, table, stack, diff, js}, "\n\n")
+	segs := SegmentSegments(out, 0)
+	if len(segs) != 5 {
+		t.Fatalf("got %d segments, want 5: %+v", len(segs), segs)
+	}
+	wantKinds := []SegmentKind{KindText, KindTable, KindStacktrace, KindDiff, KindJSON}
+	for i, want := range wantKinds {
+		if segs[i].Kind != want {
+			t.Errorf("segment %d Kind = %q, want %q (text %q)", i, segs[i].Kind, want, segs[i].Text)
+		}
+	}
+	assertSegmentsInvariant(t, out, segs)
+}

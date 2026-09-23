@@ -20,14 +20,19 @@ type Pipeline struct {
 	// now is the clock for shadow-log timestamps; a var solely for tests.
 	now func() time.Time
 
-	// Relocation state (stage 2). relocMu guards the armed store and the
-	// elision threshold: one pipeline is shared by the root agent and every
-	// subagent, whose tool calls run concurrently. The elide-id counter
-	// lives in the Store itself so the session's history compaction shares
-	// the same id space (Store.NextID).
+	// Relocation state (stage 2). relocMu guards the armed store, the
+	// elision threshold, and the gate configuration: one pipeline is shared
+	// by the root agent and every subagent, whose tool calls run
+	// concurrently. The elide-id counter lives in the Store itself so the
+	// session's history compaction shares the same id space (Store.NextID).
+	//
+	// gate/gateSet hold the GateConfig applied via ApplyGateConfig; unset,
+	// the pipeline runs on DefaultGateConfig (see gate.go).
 	relocMu   sync.Mutex
 	reloc     *Store
 	threshold float64
+	gate      GateConfig
+	gateSet   bool
 }
 
 // PipelineOptions tunes the pipeline; zero values are production defaults.
@@ -129,18 +134,21 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 	// Shadow log: one line per segment. In shadow mode (stage 1) the decision
 	// is always keep. When relocation is armed (stage 2), the recorded
 	// decision reflects what CompactToolOutput does with this score: elide
-	// strictly below threshold, keep otherwise. Append failures are recorded
-	// but never fail the call — logging must not be able to break scoring.
+	// strictly below the segment's floor (the protected-kind floor when the
+	// kind has one, else the relocation threshold), keep otherwise. Append
+	// failures are recorded but never fail the call — logging must not be
+	// able to break scoring.
 	if p.shadow != nil {
 		now := p.now()
-		relocStore, threshold := p.relocationArmed()
+		relocStore, _ := p.relocationArmed()
+		gate := p.resolveGate()
 		for _, s := range out.Segments {
 			score, ok := out.Scores[s.ID]
 			if !ok {
 				score = keepScore
 			}
 			decision := DecisionKeep
-			if relocStore != nil && score < threshold {
+			if relocStore != nil && score < gate.floor(s.Kind) {
 				decision = DecisionElide
 			}
 			if aerr := p.shadow.Append(ShadowEntry{
