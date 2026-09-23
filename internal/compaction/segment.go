@@ -41,6 +41,13 @@ type Segment struct {
 	// stacktrace and diff segments are only elided below their own, much
 	// lower, floor.
 	Kind SegmentKind
+	// LineStart/LineEnd are the 1-based [first, last] line numbers the
+	// segment's span occupies in the segmented string (the reference's
+	// line_span) — the numbers a pointer for this segment carries. Computed
+	// at segmentation time from the byte offsets; 0/0 never occurs for
+	// segments from SegmentSegments.
+	LineStart int
+	LineEnd   int
 }
 
 // SegmentKind classifies a segment's content so the gate can treat kinds
@@ -207,10 +214,24 @@ func SegmentSegments(toolOutput string, maxSegChars int) []Segment {
 
 	var segs []Segment
 	n := 0
+	// newlines counts the '\n' bytes in toolOutput[:cursor]; pieces arrive
+	// in offset order, so line numbers come from one linear pass. (The
+	// reference carries the same information as line_span.)
+	cursor, newlines := 0, 0
 	for _, sp := range mergeParagraphs(paras, toolOutput, maxSegChars) {
 		for _, piece := range splitOversized(toolOutput, sp, maxSegChars) {
 			n++
 			text := toolOutput[piece.start:piece.end]
+			newlines += strings.Count(toolOutput[cursor:piece.start], "\n")
+			lineStart := newlines + 1
+			newlines += strings.Count(toolOutput[piece.start:piece.end], "\n")
+			// The last byte of the span terminates its line when it is a
+			// newline; either way the span ends on that line.
+			lineEnd := newlines + 1
+			if toolOutput[piece.end-1] == '\n' {
+				lineEnd--
+			}
+			cursor = piece.end
 			segs = append(segs, Segment{
 				ID:        fmt.Sprintf("seg-%d", n),
 				Text:      text,
@@ -218,6 +239,8 @@ func SegmentSegments(toolOutput string, maxSegChars int) []Segment {
 				EndByte:   piece.end,
 				Tokens:    common.EstimateTokenCount(text),
 				Kind:      classifyKind(text),
+				LineStart: lineStart,
+				LineEnd:   lineEnd,
 			})
 		}
 	}

@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-// assertOffsetsInvariant checks the Segment contract: original[s.StartByte:
-// s.EndByte] == s.Text for every segment, plus tokens and ID numbering.
+// assertSegmentsInvariant checks the Segment contract: original[s.StartByte:
+// s.EndByte] == s.Text for every segment, plus tokens, ID numbering, and the
+// 1-based line span recomputed from the byte offsets.
 func assertSegmentsInvariant(t *testing.T, original string, segs []Segment) {
 	t.Helper()
 	for i, s := range segs {
@@ -22,6 +23,19 @@ func assertSegmentsInvariant(t *testing.T, original string, segs []Segment) {
 		}
 		if want := fmt.Sprintf("seg-%d", i+1); s.ID != want {
 			t.Errorf("segment %d ID = %q, want %q", i, s.ID, want)
+		}
+		if want := 1 + strings.Count(original[:s.StartByte], "\n"); s.LineStart != want {
+			t.Errorf("segment %d (%s): LineStart = %d, want %d (recomputed from StartByte)", i, s.ID, s.LineStart, want)
+		}
+		wantEnd := 1 + strings.Count(original[:s.EndByte], "\n")
+		if s.EndByte > 0 && original[s.EndByte-1] == '\n' {
+			wantEnd--
+		}
+		if s.LineEnd != wantEnd {
+			t.Errorf("segment %d (%s): LineEnd = %d, want %d (recomputed from EndByte)", i, s.ID, s.LineEnd, wantEnd)
+		}
+		if s.LineStart > s.LineEnd {
+			t.Errorf("segment %d (%s): LineStart %d > LineEnd %d", i, s.ID, s.LineStart, s.LineEnd)
 		}
 	}
 	for i := 1; i < len(segs); i++ {
@@ -54,6 +68,37 @@ func TestSegmentSegments_ParagraphSplitting(t *testing.T) {
 	if joined.String() != out {
 		t.Errorf("concatenated segments = %q, want original %q", joined.String(), out)
 	}
+}
+
+// TestSegmentSegments_LineSpans pins the 1-based line spans the pointer
+// format needs (the reference's line_span): each segment covers the lines
+// its span occupies, blank-line separators included.
+func TestSegmentSegments_LineSpans(t *testing.T) {
+	out := "first paragraph\n\nsecond paragraph\n\nthird paragraph"
+	segs := SegmentSegments(out, 0)
+	if len(segs) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segs))
+	}
+	for i, want := range [][2]int{{1, 2}, {3, 4}, {5, 5}} {
+		if got := [2]int{segs[i].LineStart, segs[i].LineEnd}; got != want {
+			t.Errorf("segment %d line span = %v, want %v", i, got, want)
+		}
+	}
+	assertSegmentsInvariant(t, out, segs)
+
+	// A hard rune-safe cut mid-line (no newline inside the cap window) still
+	// lands both pieces on the same line.
+	long := strings.Repeat("a", 1500)
+	segs = SegmentSegments(long, 0)
+	if len(segs) < 2 {
+		t.Fatalf("got %d segments, want the oversized split", len(segs))
+	}
+	for i, s := range segs {
+		if got := [2]int{s.LineStart, s.LineEnd}; got != [2]int{1, 1} {
+			t.Errorf("piece %d line span = %v, want [1 1] (single-line output)", i, got)
+		}
+	}
+	assertSegmentsInvariant(t, long, segs)
 }
 
 func TestSegmentSegments_TinyParagraphsMerged(t *testing.T) {

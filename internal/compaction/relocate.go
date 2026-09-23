@@ -2,7 +2,11 @@ package compaction
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -20,37 +24,197 @@ const DecisionElide = "elide"
 // comes from the upstream repo's own shadow-log replay data.
 const DefaultRelocationThreshold = 0.35
 
-// previewChars is how many characters of an elided segment's original text
-// are shown inside its pointer line, so the agent can guess whether the
-// segment is worth expanding without paying for it.
-const previewChars = 60
+// SummaryMaxChars is the reference summary_max_chars: how many characters of
+// an elided run's first non-blank line its pointer carries, so the agent can
+// guess whether the run is worth expanding without paying for it.
+const SummaryMaxChars = 120
 
-// ElidedSegment is one segment removed from a tool result by relocation.
-// ID/Tokens/Lines/Preview describe the pointer that replaced the segment;
-// Text is the original that was stored for the expand tool.
+// contentIDPrefix is the reference's prefix for elided-run record ids:
+// content-addressed ("r:<8hex>"), so the same run text always maps to the
+// same id — and to the same store record.
+const contentIDPrefix = "r"
+
+// Pointer id charset, ported from the reference _POINTER_RE. Content ids
+// ("r:<8hex>") and legacy counter ids ("elide-<n>") both fit it.
+const pointerIDCharset = `[A-Za-z0-9:_.-]+`
+
+// pointerPattern is the reference _POINTER_RE, byte for byte: one
+// [[elided …]] pointer with a mandatory id, an optional "lines=a-b" range,
+// a mandatory token count, and a double-quoted summary in which backslash
+// escapes are allowed. Used both to parse pointers and (plus the optional
+// trailing newline) to substitute them back during Reconstruct.
+const pointerPattern = `\[\[elided id=(?P<id>` + pointerIDCharset + `)` +
+	`(?: lines=(?P<start>\d+)-(?P<end>\d+))?` +
+	` tokens=(?P<tokens>\d+)` +
+	` "(?P<summary>(?:[^"\\]|\\.)*)"\]\]`
+
+var (
+	pointerRe     = regexp.MustCompile(pointerPattern)
+	pointerLineRe = regexp.MustCompile(pointerPattern + `\n?`)
+	// unescapeRe is the reference's summary unescape: re.sub(r"\\(.)", r"\1").
+	unescapeRe = regexp.MustCompile(`\\(.)`)
+)
+
+// ContentID derives the stable short id for a piece of content: the first 8
+// hex chars of sha256(salt + "\x00" + text), prefixed. Ported from the
+// reference content_id (types.py). Same input → same id, always — which is
+// what makes elided-run records content-addressed: re-compacting identical
+// text cannot mint a second record for it.
+func ContentID(text, salt, prefix string) string {
+	sum := sha256.Sum256([]byte(salt + "\x00" + text))
+	return prefix + ":" + hex.EncodeToString(sum[:])[:8]
+}
+
+// Pointer is the one-line stand-in left in context for relocated content
+// (the reference types.py Pointer). Lines is the 1-based [first, last] line
+// range of the elided run in the original output, or nil when unknown; the
+// id names the run's record in the Store (content ids "r:<8hex>", or legacy
+// counter ids "elide-<n>", both parse).
+type Pointer struct {
+	ID      string
+	Lines   *[2]int
+	Tokens  int
+	Summary string
+}
+
+// FormatPointer renders one pointer line — the exact format ParsePointer
+// parses back. The summary is escaped (backslashes first, then quotes) so
+// the result is always a single line the regex can recover it from.
+func FormatPointer(p Pointer) string {
+	lines := ""
+	if p.Lines != nil {
+		lines = fmt.Sprintf(" lines=%d-%d", p.Lines[0], p.Lines[1])
+	}
+	summary := strings.ReplaceAll(p.Summary, "\\", "\\\\")
+	summary = strings.ReplaceAll(summary, `"`, `\"`)
+	return fmt.Sprintf(`[[elided id=%s%s tokens=%d "%s"]]`, p.ID, lines, p.Tokens, summary)
+}
+
+// ParsePointer parses one pointer line — the inverse of FormatPointer,
+// ported from the reference parse_pointer. The second return is false when
+// line carries no pointer at all. Legacy "elide-<n>" ids parse too (the id
+// charset allows them), and a missing lines part yields a nil Lines.
+func ParsePointer(line string) (Pointer, bool) {
+	m := pointerRe.FindStringSubmatch(line)
+	if m == nil {
+		return Pointer{}, false
+	}
+	get := func(name string) string { return m[pointerRe.SubexpIndex(name)] }
+	p := Pointer{
+		ID:      get("id"),
+		Summary: unescapeSummary(get("summary")),
+	}
+	p.Tokens, _ = strconv.Atoi(get("tokens"))
+	if start, end := get("start"), get("end"); start != "" && end != "" {
+		a, _ := strconv.Atoi(start)
+		b, _ := strconv.Atoi(end)
+		p.Lines = &[2]int{a, b}
+	}
+	return p, true
+}
+
+// FindPointers returns every pointer in text, in order of appearance
+// (the reference find_pointers).
+func FindPointers(text string) []Pointer {
+	matches := pointerRe.FindAllString(text, -1)
+	out := make([]Pointer, 0, len(matches))
+	for _, match := range matches {
+		if p, ok := ParsePointer(match); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// unescapeSummary undoes FormatPointer's escaping: every backslash-escaped
+// character collapses to the character itself (the reference's
+// re.sub(r"\\(.)", r"\1", summary)).
+func unescapeSummary(s string) string {
+	return unescapeRe.ReplaceAllString(s, "$1")
+}
+
+// Summarise builds a pointer summary from run text (the reference
+// _summarise): the first non-blank line, whitespace-flattened, cut at the
+// last word boundary within limit runes with a "…" suffix. An empty text
+// (or one with no non-blank line) summarises to "".
+func Summarise(text string, limit int) string {
+	for _, rawLine := range strings.Split(text, "\n") {
+		line := strings.Join(strings.Fields(rawLine), " ")
+		if line == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) <= limit {
+			return line
+		}
+		if limit <= 0 {
+			return "…"
+		}
+		cut := string(runes[:limit])
+		// Word-boundary cut: drop the trailing partial word (rsplit(" ", 1)[0]),
+		// falling back to the raw cut when that leaves nothing.
+		if idx := strings.LastIndex(cut, " "); idx >= 0 {
+			cut = cut[:idx]
+		}
+		if cut == "" {
+			cut = string(runes[:limit])
+		}
+		return cut + "…"
+	}
+	return ""
+}
+
+// Reconstruct substitutes every pointer in text back with the original text
+// it stands for — the byte-for-byte inverse of what admit/compaction
+// produced, provided the records are still in the store (the reference
+// reconstruct). Each match is the pointer line plus its trailing newline, so
+// the substituted text lands exactly where the run was; a pointer whose id
+// is unknown (record gone, foreign text) is left as-is. A nil store leaves
+// every pointer in place.
+func Reconstruct(text string, store *Store) string {
+	return pointerLineRe.ReplaceAllStringFunc(text, func(match string) string {
+		p, ok := ParsePointer(match)
+		if !ok {
+			return match // unreachable: the regex just matched
+		}
+		original, found := store.Get(p.ID)
+		if !found {
+			return match
+		}
+		return original
+	})
+}
+
+// ElidedSegment is one RUN of consecutive segments removed from a tool
+// result (or history message) by relocation. ID/Lines/Tokens/Summary
+// describe the pointer that replaced the run; Text is the concatenated
+// original the store keeps for the expand tool.
 type ElidedSegment struct {
-	// ID is the store key ("elide-<n>", a per-store counter shared by
-	// tool-output and history compaction).
+	// ID is the run's content id ("r:<8hex>" — ContentID of the run text
+	// with the tool name as salt), so the same run stored twice collapses
+	// onto one record.
 	ID string
-	// Lines is the line count of the stored original text.
-	Lines int
-	// Tokens is the segment's estimated token count.
+	// Lines is the 1-based [first, last] line range the run occupied in the
+	// original output.
+	Lines [2]int
+	// Tokens is the run's summed token count.
 	Tokens int
-	// Preview is the first previewChars characters of the original with
-	// line breaks and tabs flattened to spaces.
-	Preview string
-	// Text is the original segment text (what the expand tool returns).
+	// Segments is the number of source segments the run grouped.
+	Segments int
+	// Summary is Summarise(Text, SummaryMaxChars) — the pointer's preview.
+	Summary string
+	// Text is the original run text (what the expand tool returns).
 	Text string
 }
 
 // CompactResult is the outcome of relocating one tool output.
 type CompactResult struct {
-	// CompactText is the replacement tool result: the kept segments followed
-	// by one [[elided …]] pointer line per elided segment. When nothing was
-	// elided this is the original output byte-for-byte.
+	// CompactText is the replacement tool result: kept segments in place,
+	// each run of elided segments replaced by one [[elided …]] pointer line.
+	// When nothing was elided this is the original output byte-for-byte.
 	CompactText string
-	// Elided carries the relocated segments (originals included) for the
-	// caller's Store. Empty when nothing was elided.
+	// Elided carries the relocated runs (originals included) for the
+	// caller's Store, in order of appearance. Empty when nothing was elided.
 	Elided []ElidedSegment
 	// Tripwire is non-empty when the gate's safety tripwire fired and the
 	// scorer's elision decisions were discarded: TripwireMaxElideFraction
@@ -60,14 +224,16 @@ type CompactResult struct {
 	Tripwire string
 }
 
-// Store holds the original text of elided segments, keyed by elide id, so
-// the expand tool can retrieve what compaction removed. It is safe for
+// Store holds the original text of elided runs, keyed by pointer id, so the
+// expand tool can retrieve what compaction removed. It is safe for
 // concurrent use: the root agent and every subagent share one store.
 //
-// The store owns the elide-id counter: the session's CompactContext shares
-// the pipeline's elide-id space with the expand tool through this one store
-// (NextID/Put), so tool-output and history pointers can never collide —
-// "elide-<n>" always names exactly one original.
+// Ids are content-addressed for runs produced by this pipeline
+// (ContentID, "r:<8hex>"); the legacy counter (NextID, "elide-<n>") remains
+// only so pointers minted by older builds still resolve. Put is idempotent:
+// storing under an id that already exists keeps the first record — two
+// compactions of identical text share one record instead of duplicating it,
+// and legacy ids, being unique per NextID call, never collide anyway.
 type Store struct {
 	mu        sync.Mutex
 	originals map[string]string
@@ -92,10 +258,37 @@ func (s *Store) Get(id string) (string, bool) {
 	return text, ok
 }
 
-// NextID mints the next elide-pointer id ("elide-<n>", 1-based). The
-// session's CompactContext shares the pipeline's elide-id space with the
-// expand tool through this counter, so history and tool-output pointers
-// minted into one store never collide. A nil store returns "".
+// Put stores text under id. Idempotent: an existing id keeps its first
+// record (see the Store doc). A nil store is a no-op.
+func (s *Store) Put(id, text string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.originals == nil {
+		s.originals = make(map[string]string)
+	}
+	if _, exists := s.originals[id]; exists {
+		return
+	}
+	s.originals[id] = text
+}
+
+// Len reports how many records the store holds (tests and diagnostics).
+func (s *Store) Len() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.originals)
+}
+
+// NextID mints the next legacy elide-pointer id ("elide-<n>", 1-based).
+// New pointers are content-addressed and never mint ids; the counter exists
+// only so pre-content-id stores keep minting distinct legacy keys. A nil
+// store returns "".
 func (s *Store) NextID() string {
 	if s == nil {
 		return ""
@@ -106,27 +299,12 @@ func (s *Store) NextID() string {
 	return fmt.Sprintf("elide-%d", s.next)
 }
 
-// Put stores text under id (minted by NextID) — the exported write side the
-// session's CompactContext uses to relocate elided history segments, next to
-// the pipeline's own tool-output relocation. A nil store is a no-op.
-func (s *Store) Put(id, text string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.originals == nil {
-		s.originals = make(map[string]string)
-	}
-	s.originals[id] = text
-}
-
 // EnableRelocation arms stage 2 on the pipeline: from now on
 // CompactToolOutput elides segments whose score is strictly below threshold
-// into store and replaces them with [[elided …]] pointers. threshold outside
-// (0, 1] falls back to DefaultRelocationThreshold. Calling it again re-arms
-// with the new values; passing a nil store disarms relocation (the pipeline
-// degenerates to shadow-only scoring).
+// into store and replaces each run of them with [[elided …]] pointers.
+// threshold outside (0, 1] falls back to DefaultRelocationThreshold. Calling
+// it again re-arms with the new values; passing a nil store disarms
+// relocation (the pipeline degenerates to shadow-only scoring).
 func (p *Pipeline) EnableRelocation(store *Store, threshold float64) {
 	if p == nil {
 		return
@@ -158,6 +336,14 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 // the armed store and its slot in the result is replaced by an [[elided …]]
 // pointer line. The returned CompactText is the tool result that should
 // enter history.
+//
+// Runs: consecutive below-floor segments are grouped into ONE run (the
+// reference pipeline's flush_run pattern) sharing a single record and a
+// single pointer — the record's text is the concatenated run, its id is
+// ContentID(runText, toolName, "r"), and the pointer carries the run's
+// [first, last] line range in the original output. Pointer lines stand
+// exactly where the runs stood, so Reconstruct(compacted, store) restores
+// the original byte for byte.
 //
 // Two gate guards run before and after the per-segment decisions:
 //
@@ -225,21 +411,58 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 	}
 
 	var kept []Segment
+	var b strings.Builder
+	var run []Segment
+
+	// flushRun relocates the accumulated run of consecutive elided segments
+	// (the reference pipeline's flush_run): the concatenated run text goes
+	// into the store under its content id, and one pointer line — run line
+	// range, summed tokens, 120-char summary — takes the run's place in the
+	// output.
+	flushRun := func() {
+		if len(run) == 0 {
+			return
+		}
+		var text strings.Builder
+		for _, seg := range run {
+			text.WriteString(seg.Text)
+		}
+		runText := text.String()
+		id := ContentID(runText, toolName, contentIDPrefix)
+		store.Put(id, runText)
+		tokens := 0
+		for _, seg := range run {
+			tokens += seg.Tokens
+		}
+		e := ElidedSegment{
+			ID:       id,
+			Lines:    [2]int{run[0].LineStart, run[len(run)-1].LineEnd},
+			Tokens:   tokens,
+			Segments: len(run),
+			Summary:  Summarise(runText, SummaryMaxChars),
+			Text:     runText,
+		}
+		out.Elided = append(out.Elided, e)
+		b.WriteString(FormatPointer(Pointer{
+			ID:      e.ID,
+			Lines:   &[2]int{e.Lines[0], e.Lines[1]},
+			Tokens:  e.Tokens,
+			Summary: e.Summary,
+		}))
+		b.WriteString("\n")
+		run = run[:0]
+	}
+
 	for i, seg := range scores.Segments {
 		if !elide[i] {
+			flushRun()
 			kept = append(kept, seg)
+			b.WriteString(seg.Text)
 			continue
 		}
-		id := store.NextID()
-		store.Put(id, seg.Text)
-		out.Elided = append(out.Elided, ElidedSegment{
-			ID:      id,
-			Lines:   countLines(seg.Text),
-			Tokens:  seg.Tokens,
-			Preview: previewOf(seg.Text),
-			Text:    seg.Text,
-		})
+		run = append(run, seg)
 	}
+	flushRun()
 
 	if len(out.Elided) == 0 {
 		// Nothing to relocate: return the original byte-for-byte. (The kept
@@ -250,17 +473,6 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 		return out, nil
 	}
 
-	var b strings.Builder
-	for _, seg := range kept {
-		b.WriteString(seg.Text)
-	}
-	b.WriteString("\n\n")
-	for i, e := range out.Elided {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(pointerLine(e))
-	}
 	out.CompactText = b.String()
 	return out, nil
 }
@@ -276,40 +488,11 @@ func (p *Pipeline) CompactToolResult(ctx context.Context, toolName, result strin
 		return result
 	}
 	ids := make([]string, 0, len(compacted.Elided))
+	elidedSegments := 0
 	for _, e := range compacted.Elided {
+		elidedSegments += e.Segments
 		ids = append(ids, e.ID)
 	}
 	return fmt.Sprintf("%s\n\n%d segments elided — use the expand tool with the elided ids to retrieve originals (%s).",
-		compacted.CompactText, len(compacted.Elided), strings.Join(ids, ", "))
-}
-
-// pointerLine renders one elided pointer: the exact format the expand tool's
-// description and the tests pin.
-func pointerLine(e ElidedSegment) string {
-	return fmt.Sprintf(`[[elided id=%s lines=%d tokens=%d %q]]`, e.ID, e.Lines, e.Tokens, e.Preview)
-}
-
-// countLines counts the lines in text (a non-empty string always has at
-// least one line; a trailing newline does not start a new line).
-func countLines(text string) int {
-	if text == "" {
-		return 0
-	}
-	return strings.Count(text, "\n") + 1
-}
-
-// previewOf returns the first previewChars characters of text with line
-// breaks and tabs flattened to spaces, so the pointer stays one line.
-func previewOf(text string) string {
-	flat := strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' || r == '\t' {
-			return ' '
-		}
-		return r
-	}, text)
-	runes := []rune(flat)
-	if len(runes) > previewChars {
-		runes = runes[:previewChars]
-	}
-	return string(runes)
+		compacted.CompactText, elidedSegments, strings.Join(ids, ", "))
 }

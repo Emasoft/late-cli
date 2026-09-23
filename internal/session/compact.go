@@ -35,7 +35,12 @@ import (
 //     touched: only Content shrinks.
 //   - Segments are scored against the ongoing task (the last user message);
 //     a segment scoring strictly below the threshold is elided into the
-//     store and replaced by one pointer line.
+//     store, and each run of consecutive elided segments is replaced by one
+//     [[elided …]] pointer line standing exactly where the run stood —
+//     content-addressed (compaction.ContentID with salt "" and the "r"
+//     prefix), carrying the run's [first, last] line range and a 120-char
+//     escaped summary. compaction.Reconstruct over the rewritten message
+//     and the store is the byte-for-byte inverse of the rewrite.
 //   - Fail-open: a scorer error that still answers every requested id (the
 //     pipeline's contract — unscoreable items come back as keep-scores)
 //     does not stop the walk: those scores are used, the scorer's errors
@@ -69,11 +74,6 @@ const (
 	// a giant scoring request.
 	maxTaskChars = 500
 
-	// elidePreviewChars is how many characters of an elided segment's
-	// original text are shown inside its pointer line, so the agent can guess
-	// whether the segment is worth expanding without paying for it.
-	elidePreviewChars = 60
-
 	// keepScoreFallback is the defensive fail-open score for a segment whose
 	// id is missing from the scorer's answer map: fully essential, keep.
 	// (compaction.DecisionClient.ScoreBatch fills every id; this only guards
@@ -94,20 +94,25 @@ type HistoryScorer interface {
 }
 
 // ElideStore is the write side of the elided-original store CompactContext
-// relocates segments into: NextID mints the pointer ids ("elide-<n>") and
-// Put stores each elided segment's original under its id so the expand tool
-// can retrieve it (tool.ExpandStore reads it back). One store is one id
-// space; production wiring backs it with the compaction pipeline's store so
-// tool-output and history pointers never collide.
+// relocates runs into: Put stores each elided run's original text under the
+// pointer's id so the expand tool can retrieve it (tool.ExpandStore reads it
+// back). New pointers are content-addressed (compaction.ContentID,
+// "r:<8hex>" — same run text, same id, same record), so Put is idempotent:
+// an existing id keeps its first record. NextID remains only for legacy
+// "elide-<n>" ids minted by older builds; new code never calls it. One store
+// is one id space; production wiring backs it with the compaction pipeline's
+// store so tool-output and history pointers share it.
 type ElideStore interface {
 	NextID() string
 	Put(id, text string)
 }
 
 // CompactStore is the in-memory original-text store backing history
-// compaction: CompactContext Puts every elided segment's original under the
-// id minted by NextID, and the expand tool Gets it back — it satisfies
-// tool.ExpandStore directly. Safe for concurrent use.
+// compaction: CompactContext Puts every elided run's original under its
+// content id, and the expand tool Gets it back — it satisfies
+// tool.ExpandStore directly. Put is idempotent (an existing id keeps its
+// first record); NextID mints legacy "elide-<n>" ids only. Safe for
+// concurrent use.
 type CompactStore struct {
 	mu        sync.Mutex
 	originals map[string]string
@@ -119,7 +124,7 @@ func NewCompactStore() *CompactStore {
 	return &CompactStore{originals: make(map[string]string)}
 }
 
-// NextID mints the next elide-pointer id ("elide-<n>", 1-based).
+// NextID mints the next legacy elide-pointer id ("elide-<n>", 1-based).
 func (s *CompactStore) NextID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,12 +132,17 @@ func (s *CompactStore) NextID() string {
 	return fmt.Sprintf("elide-%d", s.next)
 }
 
-// Put stores text under id, minted by NextID.
+// Put stores text under id. Idempotent: an existing id keeps its first
+// record (content ids hash the text, so two runs with the same id carry the
+// same text anyway).
 func (s *CompactStore) Put(id, text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.originals == nil {
 		s.originals = make(map[string]string)
+	}
+	if _, exists := s.originals[id]; exists {
+		return
 	}
 	s.originals[id] = text
 }
@@ -144,6 +154,13 @@ func (s *CompactStore) Get(id string) (string, bool) {
 	defer s.mu.Unlock()
 	text, ok := s.originals[id]
 	return text, ok
+}
+
+// Len reports how many records the store holds (tests and diagnostics).
+func (s *CompactStore) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.originals)
 }
 
 // The expand tool reads history-elided originals straight from this store.
@@ -284,45 +301,73 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		scored++
 		report.MessagesScored++
 
+		// Reference flush_run pattern: consecutive below-threshold segments
+		// group into ONE run sharing a single record and pointer; kept
+		// segments flush the pending run and keep their exact text in place.
+		// Pointer lines stand exactly where the runs stood, so
+		// compaction.Reconstruct of the compacted text (with the store)
+		// restores the original byte for byte. Pointers are content
+		// addressed: id = ContentID(runText, salt="", "r"). The salt is
+		// empty deliberately — content addressing is per-text, and the
+		// history walk has no stable origin ref to namespace it with; the
+		// same run text always maps to the same id.
 		var (
-			kept     []compaction.Segment
-			pointers []string
-			stored   int
+			pointers   []string
+			stored     int
+			elidedSegs int
+			b          strings.Builder
+			run        []compaction.Segment
 		)
+		flushRun := func() {
+			if len(run) == 0 {
+				return
+			}
+			var text strings.Builder
+			for _, seg := range run {
+				text.WriteString(seg.Text)
+			}
+			runText := text.String()
+			id := compaction.ContentID(runText, "", "r")
+			tokens := 0
+			for _, seg := range run {
+				tokens += seg.Tokens
+			}
+			pointer := compaction.FormatPointer(compaction.Pointer{
+				ID:      id,
+				Lines:   &[2]int{run[0].LineStart, run[len(run)-1].LineEnd},
+				Tokens:  tokens,
+				Summary: compaction.Summarise(runText, compaction.SummaryMaxChars),
+			})
+			pointers = append(pointers, pointer)
+			stored += len(runText)
+			elidedSegs += len(run)
+			if !opts.ShadowOnly {
+				store.Put(id, runText)
+			}
+			b.WriteString(pointer)
+			b.WriteString("\n")
+			run = run[:0]
+		}
 		for _, seg := range segs {
 			score, ok := scores[seg.ID]
 			if !ok {
 				score = keepScoreFallback
 			}
 			if score >= opts.Threshold {
-				kept = append(kept, seg)
+				flushRun()
+				b.WriteString(seg.Text)
 				continue
 			}
-			id := store.NextID()
-			pointers = append(pointers, elidePointerLine(id, seg))
-			stored += len(seg.Text)
-			if !opts.ShadowOnly {
-				store.Put(id, seg.Text)
-			}
+			run = append(run, seg)
 		}
+		flushRun()
 		if len(pointers) == 0 {
 			continue
 		}
-
-		// Kept segments keep their exact text (each span includes its
-		// trailing blank-line separator, so concatenation reproduces the
-		// original minus the elided spans), then one pointer line per elided
-		// segment — the same shape CompactToolOutput produces.
-		var b strings.Builder
-		for _, seg := range kept {
-			b.WriteString(seg.Text)
-		}
-		b.WriteString("\n\n")
-		b.WriteString(strings.Join(pointers, "\n"))
 		compacted := b.String()
 
 		report.MessagesCompacted++
-		report.SegmentsElided += len(pointers)
+		report.SegmentsElided += elidedSegs
 		report.StoreSize += stored
 		// Only Content.Text changes, so the per-message token delta is the
 		// text delta — exact for both the mutating and the shadow run.
@@ -419,36 +464,4 @@ func historyMessageTokens(history []client.ChatMessage) int {
 		total += common.EstimateMessageTokens(msg)
 	}
 	return total
-}
-
-// elidePointerLine renders the [[elided …]] pointer that replaces an elided
-// segment — the exact format the expand tool's description and the
-// compaction pipeline pin.
-func elidePointerLine(id string, seg compaction.Segment) string {
-	return fmt.Sprintf(`[[elided id=%s lines=%d tokens=%d %q]]`, id, countLines(seg.Text), seg.Tokens, previewOf(seg.Text))
-}
-
-// countLines counts the lines in text (a non-empty string always has at
-// least one line; a trailing newline does not start a new line).
-func countLines(text string) int {
-	if text == "" {
-		return 0
-	}
-	return strings.Count(text, "\n") + 1
-}
-
-// previewOf returns the first elidePreviewChars characters of text with line
-// breaks and tabs flattened to spaces, so the pointer stays one line.
-func previewOf(text string) string {
-	flat := strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' || r == '\t' {
-			return ' '
-		}
-		return r
-	}, text)
-	runes := []rune(flat)
-	if len(runes) > elidePreviewChars {
-		runes = runes[:elidePreviewChars]
-	}
-	return string(runes)
 }

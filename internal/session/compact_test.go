@@ -305,7 +305,10 @@ func TestCompactContextElidesToolResultWithStoreRoundTrip(t *testing.T) {
 	fixture := defaultFixture()
 	s := newCompactSession(fixture)
 	segs := fixtureSegments(t, fixture)
-	store := NewCompactStore()
+	// The production store type (compaction.Store, as main() wires it): it
+	// satisfies ElideStore, backs the expand tool, and works with
+	// compaction.Reconstruct.
+	store := compaction.NewStore()
 	scorer := elideFirstScorer(segs)
 
 	report, err := s.CompactContext(context.Background(), scorer, store, CompactionOptions{})
@@ -313,10 +316,19 @@ func TestCompactContextElidesToolResultWithStoreRoundTrip(t *testing.T) {
 		t.Fatalf("CompactContext() error = %v", err)
 	}
 
-	// The tool result at index 5 is the second rewritten message (index 4
-	// minted elide-1), so its elided opening segment is elide-2.
+	// The elided opening segment of the tool result at index 5 is stored
+	// under its content id (salt "" — history compaction is per-text), and
+	// the pointer stands where the run stood.
 	segs5 := segs[5]
-	want := segs5[1].Text + segs5[2].Text + "\n\n" + elidePointerLine("elide-2", segs5[0])
+	runText := segs5[0].Text
+	id := compaction.ContentID(runText, "", "r")
+	pointer := compaction.FormatPointer(compaction.Pointer{
+		ID:      id,
+		Lines:   &[2]int{segs5[0].LineStart, segs5[0].LineEnd},
+		Tokens:  segs5[0].Tokens,
+		Summary: compaction.Summarise(runText, compaction.SummaryMaxChars),
+	})
+	want := pointer + "\n" + segs5[1].Text + segs5[2].Text
 	if got := s.History[5].Content.Text; got != want {
 		t.Fatalf("compacted tool result mismatch:\n got %q\nwant %q", truncateRunes(got, 200), truncateRunes(want, 200))
 	}
@@ -324,21 +336,36 @@ func TestCompactContextElidesToolResultWithStoreRoundTrip(t *testing.T) {
 		t.Errorf("SegmentsElided = %d, want %d", report.SegmentsElided, len(segs))
 	}
 
-	original, ok := store.Get("elide-2")
+	original, ok := store.Get(id)
 	if !ok {
-		t.Fatal("store.Get(elide-2) miss: the elided original was not stored")
+		t.Fatalf("store.Get(%s) miss: the elided original was not stored", id)
 	}
 	if original != segs5[0].Text {
 		t.Fatalf("store round trip mismatch:\n got %q\nwant %q", truncateRunes(original, 120), truncateRunes(segs5[0].Text, 120))
 	}
 
-	// The expand tool reads the same store.
-	expanded, xerr := tool.ExpandTool{Store: store}.Execute(context.Background(), json.RawMessage(`{"id":"elide-2"}`))
+	// The expand tool reads the same store — content id or a whole pointer
+	// line, both resolve.
+	expanded, xerr := tool.ExpandTool{Store: store}.Execute(context.Background(), json.RawMessage(`{"id":"`+id+`"}`))
 	if xerr != nil {
-		t.Fatalf("expand(elide-2) error = %v", xerr)
+		t.Fatalf("expand(%s) error = %v", id, xerr)
 	}
 	if expanded != segs5[0].Text {
 		t.Error("expand tool did not return the stored original")
+	}
+	expanded, xerr = tool.ExpandTool{Store: store}.Execute(context.Background(), json.RawMessage(`{"id":`+mustJSON(t, pointer)+`}`))
+	if xerr != nil {
+		t.Fatalf("expand(pointer line) error = %v", xerr)
+	}
+	if expanded != segs5[0].Text {
+		t.Error("expand tool did not parse the pointer line down to its id")
+	}
+
+	// The byte-for-byte inverse: reconstructing the compacted message with
+	// the store restores the original content.
+	if restored := compaction.Reconstruct(s.History[5].Content.Text, store); restored != fixture[5].Content.Text {
+		t.Errorf("Reconstruct(compacted message) is not byte-for-byte:\n got %q\nwant %q",
+			truncateRunes(restored, 200), truncateRunes(fixture[5].Content.Text, 200))
 	}
 
 	// The derived task is the last user message's content, truncated to
@@ -457,11 +484,11 @@ func TestCompactContextShadowModeDoesNotMutate(t *testing.T) {
 	if gotShadow.MessagesCompacted == 0 || gotShadow.TokensSaved <= 0 {
 		t.Fatalf("shadow report not populated: %+v", gotShadow)
 	}
-	// Shadow stores nothing; the mutating run does.
-	if _, ok := storeS.Get("elide-1"); ok {
+	// Shadow stores nothing; the mutating run stores under content ids.
+	if storeS.Len() != 0 {
 		t.Error("the shadow run must not store originals")
 	}
-	if _, ok := storeM.Get("elide-1"); !ok {
+	if storeM.Len() == 0 {
 		t.Error("the mutating run must store originals")
 	}
 	// The mutating run really did rewrite history.
@@ -822,8 +849,8 @@ func TestCompactContextThresholdIsExclusive(t *testing.T) {
 		if report.MessagesCompacted != 1 || report.SegmentsElided != 1 {
 			t.Fatalf("expected one elision just below the threshold, got %+v", report)
 		}
-		if !strings.Contains(s.History[2].Content.Text, "[[elided id=elide-1 ") {
-			t.Error("expected the segment just below the threshold to be elided")
+		if !strings.Contains(s.History[2].Content.Text, "[[elided id=r:") {
+			t.Error("expected the segment just below the threshold to be elided under a content id")
 		}
 	})
 }
@@ -865,6 +892,94 @@ func TestCompactContextFailSafes(t *testing.T) {
 			t.Errorf("nil store: expected no elisions, got %+v", report)
 		}
 	})
+}
+
+// (Step 11) History round trip: a tool-result message carrying quotes,
+// backslashes, and newlines compacts into in-place pointers under content
+// ids, and compaction.Reconstruct restores the original content byte for
+// byte. Legacy ids keep expanding: the counter still mints elide-N ids and
+// the store resolves them.
+func TestCompactContextReconstructRoundTrip(t *testing.T) {
+	para := func(marker string, n int) string { return marker + strings.Repeat(" "+marker+"-filler", n) }
+	content := strings.Join([]string{
+		para(`keeper one "quoted" \ with backslashes`, 20),
+		"secret one starts \"with quotes\" and \\ a backslash\nsecret one line two\n" + para("s-one-tail", 12),
+		para("keeper two", 20),
+		"secret two \\ odd first line\n" + para("s-two-tail", 12),
+		para("keeper three", 20),
+	}, "\n\n")
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("question"), 1),
+		cmpStamped(cmpAssistant("short"), 2),
+		cmpStamped(cmpTool(content), 3), // the only compactable candidate
+	}
+	segs := compaction.SegmentSegments(content, minCompactChars)
+	if len(segs) != 5 {
+		t.Fatalf("SegmentSegments() = %d segments, want 5", len(segs))
+	}
+
+	// Score the exact segment texts (the stub keys by text): the two secret
+	// paragraphs elide, everything else stays.
+	scorer := &stubScorer{
+		scores: map[string]float64{
+			segs[1].Text: 0.05,
+			segs[3].Text: 0.05,
+		},
+		fallback: 0.9,
+	}
+	store := compaction.NewStore()
+	s := newCompactSession(fixture)
+
+	report, err := s.CompactContext(context.Background(), scorer, store, CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+	if report.MessagesCompacted != 1 || report.SegmentsElided != 2 {
+		t.Fatalf("report = %+v, want one compacted message with 2 elided segments", report)
+	}
+	if report.StoreSize != len(segs[1].Text)+len(segs[3].Text) {
+		t.Errorf("StoreSize = %d, want the two run originals' size", report.StoreSize)
+	}
+
+	compacted := s.History[3].Content.Text
+	if strings.Contains(compacted, "secret one line two") || strings.Contains(compacted, "s-two-tail") {
+		t.Errorf("compacted message leaked an elided run's body:\n%s", compacted)
+	}
+	for _, keeper := range []string{segs[0].Text, segs[2].Text, segs[4].Text} {
+		if !strings.Contains(compacted, keeper) {
+			t.Errorf("compacted message lost a kept segment:\n%s", compacted)
+		}
+	}
+
+	// Two pointers, each naming its run's content id (salt "").
+	pointers := compaction.FindPointers(compacted)
+	if len(pointers) != 2 {
+		t.Fatalf("FindPointers(compacted) = %d pointers, want 2", len(pointers))
+	}
+	for i, p := range pointers {
+		if want := compaction.ContentID(segs[2*i+1].Text, "", "r"); p.ID != want {
+			t.Errorf("pointer[%d].ID = %q, want the content id %q", i, p.ID, want)
+		}
+		if p.Lines == nil || *p.Lines != [2]int{segs[2*i+1].LineStart, segs[2*i+1].LineEnd} {
+			t.Errorf("pointer[%d] lines = %v, want the segment's line span", i, p.Lines)
+		}
+	}
+
+	// THE guarantee: reconstruct is the byte-for-byte inverse of the walk.
+	if restored := compaction.Reconstruct(compacted, store); restored != content {
+		t.Errorf("Reconstruct(compacted) is not byte-for-byte:\n got %q\nwant %q", restored, content)
+	}
+
+	// Legacy ids keep working: the counter still mints elide-N and Put/Get
+	// round-trips them (backward compatibility for old pointers).
+	if got := store.NextID(); got != "elide-1" {
+		t.Errorf("NextID() = %q, want the legacy elide-1", got)
+	}
+	store.Put("elide-1", "legacy original")
+	if text, ok := store.Get("elide-1"); !ok || text != "legacy original" {
+		t.Errorf("Get(elide-1) = (%q, %v), want the legacy original", text, ok)
+	}
 }
 
 // CompactStore mints sequential elide ids and round-trips originals; ids
