@@ -27,7 +27,8 @@ const previewChars = 60
 // ID/Tokens/Lines/Preview describe the pointer that replaced the segment;
 // Text is the original that was stored for the expand tool.
 type ElidedSegment struct {
-	// ID is the store key ("elide-<n>", a per-pipeline counter).
+	// ID is the store key ("elide-<n>", a per-store counter shared by
+	// tool-output and history compaction).
 	ID string
 	// Lines is the line count of the stored original text.
 	Lines int
@@ -54,9 +55,15 @@ type CompactResult struct {
 // Store holds the original text of elided segments, keyed by elide id, so
 // the expand tool can retrieve what compaction removed. It is safe for
 // concurrent use: the root agent and every subagent share one store.
+//
+// The store owns the elide-id counter: the session's CompactContext shares
+// the pipeline's elide-id space with the expand tool through this one store
+// (NextID/Put), so tool-output and history pointers can never collide —
+// "elide-<n>" always names exactly one original.
 type Store struct {
 	mu        sync.Mutex
 	originals map[string]string
+	next      int
 }
 
 // NewStore returns an empty original-text store.
@@ -77,9 +84,24 @@ func (s *Store) Get(id string) (string, bool) {
 	return text, ok
 }
 
-// put records id → original. Only the pipeline writes: ids are minted by the
-// pipeline's counter so they stay unique across agents.
-func (s *Store) put(id, text string) {
+// NextID mints the next elide-pointer id ("elide-<n>", 1-based). The
+// session's CompactContext shares the pipeline's elide-id space with the
+// expand tool through this counter, so history and tool-output pointers
+// minted into one store never collide. A nil store returns "".
+func (s *Store) NextID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	return fmt.Sprintf("elide-%d", s.next)
+}
+
+// Put stores text under id (minted by NextID) — the exported write side the
+// session's CompactContext uses to relocate elided history segments, next to
+// the pipeline's own tool-output relocation. A nil store is a no-op.
+func (s *Store) Put(id, text string) {
 	if s == nil {
 		return
 	}
@@ -121,14 +143,6 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 	return p.reloc, p.threshold
 }
 
-// nextElideID mints the next per-pipeline elide id ("elide-<n>").
-func (p *Pipeline) nextElideID() string {
-	p.relocMu.Lock()
-	defer p.relocMu.Unlock()
-	p.nextElide++
-	return fmt.Sprintf("elide-%d", p.nextElide)
-}
-
 // CompactToolOutput scores one tool output and, when relocation is armed,
 // relocates every segment scoring strictly below the threshold: the
 // segment's original goes into the armed store and its slot in the result is
@@ -160,8 +174,8 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 			score = keepScore // defensive; ScoreToolOutput fills every id
 		}
 		if score < threshold {
-			id := p.nextElideID()
-			store.put(id, seg.Text)
+			id := store.NextID()
+			store.Put(id, seg.Text)
 			out.Elided = append(out.Elided, ElidedSegment{
 				ID:      id,
 				Lines:   countLines(seg.Text),

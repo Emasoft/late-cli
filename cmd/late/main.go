@@ -421,6 +421,10 @@ func main() {
 	if _, compactionWarning := appconfig.ResolveCompactionThreshold(appConfig); compactionWarning != "" {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionWarning)
 	}
+	// Same warn-and-fall-back pattern for the auto-compaction threshold.
+	if _, _, autocompactWarning := appconfig.ResolveAutocompact(appConfig); autocompactWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", autocompactWarning)
+	}
 	enabledTools := make(map[string]bool)
 	if appConfig != nil {
 		for toolName, enabled := range appConfig.EnabledTools {
@@ -634,6 +638,13 @@ func main() {
 			*compactionThresholdReq, compaction.DefaultRelocationThreshold)
 	}
 
+	// The TUI's /jev-compact-context command and auto-trigger reuse this
+	// pipeline (its scoring client) and elide store; both stay nil when
+	// compaction is off or no backend resolved, which disables them.
+	var (
+		compactionPipeline *compaction.Pipeline
+		compactionStore    *compaction.Store
+	)
 	if compactionMode != appconfig.CompactionModeOff {
 		backend, backendErr := compaction.ResolveBackendEnv("")
 		if backendErr != nil {
@@ -668,11 +679,13 @@ func main() {
 				// the main registry before any spawn: subagents inherit it
 				// (and the same store) from the parent registry.
 				sess.Registry.Register(tool.ExpandTool{Store: store})
+				compactionStore = store
 			}
 			// Shared by the root agent and every subagent: ExecuteToolCalls
 			// consults it for both (shadow mode scores and logs without
 			// changing results).
 			executor.SetToolResultCompactor(pipeline)
+			compactionPipeline = pipeline
 		}
 	}
 
@@ -768,6 +781,22 @@ func main() {
 			}
 		}
 		model.CommandHandler = pluginManager.HandleCommand
+	}
+
+	// History compaction for /jev-compact-context + the auto-trigger: the
+	// session's CompactContext shares the pipeline's scoring client and its
+	// elide-id space (the same store the expand tool reads). Shadow mode
+	// reports without mutating; enabled mode persists the compacted history.
+	if compactionPipeline != nil {
+		if compactionStore == nil {
+			// Shadow mode: the history walk still mints pointer ids for its
+			// honest report, so it needs a store even though nothing is
+			// applied; a fresh one keeps those ids out of the (absent)
+			// expand tool's id space.
+			compactionStore = compaction.NewStore()
+		}
+		model.Compactor = historyCompactionRunner(sess, compactionPipeline.HistoryScorer(), compactionStore,
+			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold)
 	}
 
 	// Register plugin slash commands + theme catalog so plugin commands fire
@@ -1049,6 +1078,33 @@ func effectiveSubagentBudget(timeoutOverride *time.Duration, globalBudget time.D
 		return 0 // explicit per-spawn unlimited suppresses the global budget
 	}
 	return globalBudget
+}
+
+// historyCompactionRunner adapts the live session for the TUI's
+// /jev-compact-context command and auto-trigger: each call runs one
+// session.CompactContext pass — scoring history segments against the ongoing
+// task with the pipeline's decision client and relocating low scorers into
+// the shared elide store — and persists the mutated history the same way the
+// orchestrator's own SaveHistory call sites do. Shadow runs (compaction-mode
+// "shadow") compute the honest would-save report without touching history,
+// so they skip persistence. threshold mirrors the pipeline's elision
+// threshold so both compaction paths make the same keep/elide calls.
+func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer, store session.ElideStore, shadow bool, threshold float64) func(context.Context) (session.CompactionReport, error) {
+	return func(ctx context.Context) (session.CompactionReport, error) {
+		report, err := sess.CompactContext(ctx, scorer, store, session.CompactionOptions{
+			Threshold:  threshold,
+			ShadowOnly: shadow,
+		})
+		if !shadow {
+			// The walk mutated (or partially mutated — a mid-walk scorer
+			// failure leaves consistent pointers and stored originals)
+			// history: persist it even when err != nil.
+			if saveErr := session.SaveHistory(sess.HistoryPath, sess.History); saveErr != nil {
+				return report, errors.Join(err, fmt.Errorf("saving compacted history: %w", saveErr))
+			}
+		}
+		return report, err
+	}
 }
 
 // deriveEffectiveSessionID derives this run's session ID from the FINAL

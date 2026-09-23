@@ -205,6 +205,7 @@ export OPENAI_MODEL="model-name"
 * **Native Context-Aware Search:** High-performance codebase search with globster filtering that respects `.gitignore` and `.llmignore`.
 * **Agent Skills & MCP Support:** Natively consume external Model Context Protocol (MCP) servers and third-party Agent Skills with zero configuration overhead.
 * **Context Compaction with an Expand Tool (staged: shadow → enabled):** Oversized tool outputs are segmented and scored; low-scoring segments can be elided into pointers with the original text retrievable via the `expand` tool (see the Quickstart).
+* **Full-History Compaction (`/jev-compact-context` + autocompact):** One command — or an automatic trigger at a configurable context-usage percent (`jev-autocompact`, `jev-autocompact-percent`) — scores the whole conversation after a frozen prefix and elides low-scoring segments into pointers, originals retrievable via the `expand` tool (see the Quickstart).
 * **Git Worktree Support:** Run independent, parallel agent instances across multiple branches simultaneously with zero context bleeding.
 
 ---

@@ -64,7 +64,7 @@ func TestPipeline_EnableRelocationThresholdBoundary(t *testing.T) {
 	}
 	e := got.Elided[0]
 	if e.ID != "elide-1" {
-		t.Errorf("elided id = %q, want elide-1 (per-pipeline counter)", e.ID)
+		t.Errorf("elided id = %q, want elide-1 (per-store counter)", e.ID)
 	}
 	if e.Text != fillerSpan {
 		t.Errorf("elided text = %q, want the filler segment span %q", e.Text, fillerSpan)
@@ -281,7 +281,7 @@ func TestPipeline_RelocationShadowLogDecisions(t *testing.T) {
 	})
 }
 
-// TestPipeline_ElideIDsIncrementAcrossCalls: the per-pipeline counter never
+// TestPipeline_ElideIDsIncrementAcrossCalls: the per-store counter never
 // reuses an id, so the store can hold originals from many tool results.
 func TestPipeline_ElideIDsIncrementAcrossCalls(t *testing.T) {
 	d := newDecisionsServer(t, echoHandler) // seg-N scores 0.01*N: all below 0.35
@@ -378,11 +378,11 @@ func TestStore_GetRoundTripAndMisses(t *testing.T) {
 	if _, ok := s.Get("elide-1"); ok {
 		t.Error("empty store must report a miss")
 	}
-	s.put("elide-1", "original text")
+	s.Put("elide-1", "original text")
 	if text, ok := s.Get("elide-1"); !ok || text != "original text" {
 		t.Errorf("Get(elide-1) = (%q, %v), want the stored original", text, ok)
 	}
-	s.put("elide-1", "replaced")
+	s.Put("elide-1", "replaced")
 	if text, _ := s.Get("elide-1"); text != "replaced" {
 		t.Errorf("Get(elide-1) = %q, want the replaced original", text)
 	}
@@ -398,7 +398,7 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			id := fmt.Sprintf("elide-%d", n)
-			s.put(id, strings.Repeat("x", n))
+			s.Put(id, strings.Repeat("x", n))
 			if text, ok := s.Get(id); !ok || len(text) != n {
 				t.Errorf("Get(%s) = (%d chars, %v), want %d chars", id, len(text), ok, n)
 			}
