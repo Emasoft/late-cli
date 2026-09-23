@@ -18,13 +18,13 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 		"suppress-thinking-words", "save-subagent-histories", "enable-sqz",
 		"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues",
 		"enable-images",
-		"use-tools", "enable-bash", "enable-subagents",
+		"use-tools", "enable-bash", "enable-subagents", "check-compaction",
 	}
 	for _, name := range bools {
 		def := name == "use-tools" || name == "enable-bash" || name == "enable-subagents"
 		fs.Bool(name, def, "usage of "+name)
 	}
-	strs := []string{"system-prompt", "system-prompt-file", "append-system-prompt", "theme", "prompt", "logit-bias", "subagent-logit-bias", "compaction-mode"}
+	strs := []string{"system-prompt", "system-prompt-file", "append-system-prompt", "theme", "prompt", "logit-bias", "subagent-logit-bias", "compaction-mode", "replay-shadow"}
 	for _, name := range strs {
 		fs.String(name, "", "usage of "+name)
 	}

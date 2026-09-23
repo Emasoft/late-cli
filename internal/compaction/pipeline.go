@@ -100,6 +100,17 @@ func (p *Pipeline) noteAuthFailure(reason string) {
 	}
 }
 
+// DisableAuth is noteAuthFailure's exported form, for the Step 16 startup
+// probe: the probe scores on its own throwaway client, so a typed auth
+// rejection there would otherwise reach the live pipeline's client only on
+// its first real scoring call. Calling this with the probe's reason applies
+// the exact same session-disable + one-warning policy a live rejection takes
+// (the reference's JevAuthError policy), before the first tool call can burn
+// a doomed request. A nil pipeline is a no-op.
+func (p *Pipeline) DisableAuth(reason string) {
+	p.noteAuthFailure(reason)
+}
+
 // authDisabled reports whether scoring was disabled by an auth rejection,
 // together with the reason recorded when it happened.
 func (p *Pipeline) authDisabled() (bool, string) {

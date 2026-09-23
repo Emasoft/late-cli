@@ -130,6 +130,7 @@ func main() {
 	compactionModeReq := flag.String("compaction-mode", "", "Tool-output compaction stage: off, shadow (score + shadow log only), or enabled (also relocate low-scoring segments; adds the expand tool). Overrides config.json compaction-mode. Default: shadow.")
 	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled.")
 	replayShadowReq := flag.String("replay-shadow", "", "Replay the default shadow log at the given comma-separated thresholds (e.g. 0.10,0.35,0.50): print the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, then exit. Read-only; the TUI does not start.")
+	checkCompactionReq := flag.Bool("check-compaction", false, "Run the compaction preflight against the resolved System One backend — real requests checking (1) decisions answers and parse, (2) the gate relocates something from a real tool output, (3) a pointer expands back byte for byte — print the per-stage report and exit (0 pass, 1 fail; the TUI does not start). Pairs with -compaction-mode.")
 
 	flag.Usage = func() {
 		writeHelp(os.Stderr, flag.CommandLine)
@@ -596,6 +597,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionModeWarning)
 	}
 
+	// -check-compaction: run the compaction preflight (Step 16) against the
+	// backend THIS run would resolve and exit — the TUI never starts. The
+	// mode resolution above is deliberately shared with the normal startup
+	// path (the check must vet exactly the backend the session would use),
+	// and -compaction-mode pairs with the flag, so an invalid mode warns
+	// here the same way it would in a real run. The check itself exercises
+	// scoring, the gate, and expansion — a superset of what shadow mode does
+	// — so it applies in every mode: it is the "would have caught the
+	// too-small local backend before integration" tool.
+	if *checkCompactionReq {
+		os.Exit(runCompactionCheck())
+	}
+
 	// Elision threshold: segments scoring strictly below it are relocated
 	// out of oversized tool results when compaction-mode is enabled
 	// (default per the upstream repo's own shadow-log replay data).
@@ -627,6 +641,10 @@ func main() {
 		compactionPipeline  *compaction.Pipeline
 		compactionStore     *compaction.Store
 		compactionShadowLog *compaction.ShadowLog
+		// compactionBackend is the resolved backend behind the pipeline,
+		// captured for the Step 16 startup probe; nil when compaction is
+		// off or no backend resolved (no probe without a pipeline).
+		compactionBackend *compaction.ResolvedBackend
 	)
 	if compactionMode != appconfig.CompactionModeOff {
 		backend, backendErr := compaction.ResolveBackendEnv("")
@@ -647,6 +665,7 @@ func main() {
 		// every decisions call would burn retries and fail-open, so this run
 		// proceeds with compaction off instead (the warning above explains).
 		if backendErr == nil {
+			compactionBackend = &backend
 			shadowLog, shadowErr := compaction.NewShadowLog()
 			if shadowErr != nil {
 				// Logging is best-effort: scoring (and relocation) still
@@ -905,6 +924,39 @@ func main() {
 		}
 	}()
 
+	// Startup compaction probe (Step 16): one cheap ScoreBatch with a single
+	// small item against the resolved backend, in its own goroutine so the
+	// first paint never waits for the backend. A failure never tears the
+	// pipeline down — scoring is fail-open by contract and shadow mode is
+	// harmless — it warns once on stderr, surfaces the reason in the status
+	// bar, and, ONLY for a typed auth rejection, disables the session's
+	// scoring through the same path a live 401 takes (the probe's client is
+	// a throwaway, so without this the live pipeline would learn on its
+	// first real scoring call against a backend that can only say 401). The
+	// probe is deliberately NOT logged as a shadow decision: it is not a
+	// scoring decision, and one probe line per launch would pollute the
+	// replay ledger.
+	if compactionPipeline != nil && compactionBackend != nil {
+		probeBackend := *compactionBackend
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), compactionProbeTimeout)
+			defer cancel()
+			if err := compaction.ProbeBackend(ctx, probeBackend, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: compaction backend probe failed (%v); scoring fails open this session\n", err)
+				p.Send(tui.BootstrapStatusMsg{
+					Text:    "compaction: backend probe failed — scoring fails open",
+					Warning: true,
+				})
+				var ce *compaction.Error
+				if errors.As(err, &ce) && ce.Kind == compaction.KindAuth {
+					compactionPipeline.DisableAuth(ce.Error())
+				}
+				return
+			}
+			p.Send(tui.BootstrapStatusMsg{Text: "compaction: backend probe OK", Active: false})
+		}()
+	}
+
 	if *enableSubagentsReq {
 		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string) (string, error) {
 			var currentSubagentClient *client.Client
@@ -956,6 +1008,50 @@ func main() {
 		fmt.Printf("Unspecified error: %v", err)
 		os.Exit(1)
 	}
+}
+
+// compactionCheckTimeout bounds the whole -check-compaction preflight (three
+// stages of real requests against the backend, one attempt each) and
+// compactionProbeTimeout bounds the light startup probe. Generous enough for
+// a slow local gateway, short enough that a dead endpoint cannot hang the
+// flag or the startup path.
+const (
+	compactionCheckTimeout = 90 * time.Second
+	compactionProbeTimeout = 30 * time.Second
+)
+
+// runCompactionCheck runs the compaction preflight against the backend the
+// normal startup path resolves — the same compaction.ResolveBackendEnv("")
+// call the pipeline wiring makes — and returns the process exit code: 0 when
+// every stage passes, 1 otherwise. A missing backend or key is stage 0's
+// failure: the report then says what to configure instead of starting a run
+// that cannot score anything.
+func runCompactionCheck() int {
+	backend, backendErr := compaction.ResolveBackendEnv("")
+	if backendErr != nil {
+		fmt.Print(compaction.FormatCheckReport(noBackendCheckResults(backendErr), false))
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), compactionCheckTimeout)
+	defer cancel()
+	results, ok := compaction.RunPreflight(ctx, backend, "", nil)
+	fmt.Print(compaction.FormatCheckReport(results, ok))
+	if !ok {
+		return 1
+	}
+	return 0
+}
+
+// noBackendCheckResults builds the stage-0 failure report for a run with no
+// resolved compaction backend: the three real stages cannot run without one,
+// and the detail carries the guidance plus the resolver's typed reason (which
+// backend was tried and what each was missing).
+func noBackendCheckResults(backendErr error) []compaction.CheckResult {
+	return []compaction.CheckResult{{
+		Stage:  compaction.CheckStageBackend,
+		OK:     false,
+		Detail: fmt.Sprintf("no compaction backend configured (set the provider key or run with -compaction-mode pointing at a gateway): %v", backendErr),
+	}}
 }
 
 // openCompactionStore opens the persistent elided-record store at the
