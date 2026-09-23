@@ -9,6 +9,7 @@ import (
 	"late/internal/common"
 	"late/internal/config"
 	"late/internal/git"
+	"late/internal/session"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -50,6 +51,20 @@ type pluginCommandResultMsg struct {
 	output  string
 	handled bool
 	err     error
+}
+
+// compactionUnavailableStatus is the status shown when /jev-compact-context
+// fires with no compaction pipeline wired (compaction-mode off, or the
+// System One backend never resolved, so there is no scorer to run).
+const compactionUnavailableStatus = "compaction unavailable — enable compaction-mode first"
+
+// compactionResultMsg carries the outcome of one full-history context
+// compaction run (/jev-compact-context or the auto-trigger). The run
+// executes off the TUI update loop — network scoring can take seconds — so
+// the report is delivered back as a message.
+type compactionResultMsg struct {
+	report session.CompactionReport
+	err    error
 }
 
 // messageHookResultMsg carries the outcome of asynchronously running a
@@ -378,6 +393,44 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m = m.finishSubmit(msg.target, msg.input)
+		return m, nil
+	}
+	if msg, ok := msg.(compactionResultMsg); ok {
+		// Exactly one compaction run may be in flight (Model.CompactionRunning
+		// guards both the manual command and the auto-trigger); it just ended.
+		m.CompactionRunning = false
+		if !msg.report.ShadowOnly {
+			// The walk rewrote (possibly partially, on a mid-walk scorer
+			// failure) the root session's history: invalidate the root
+			// state's render and token caches so the transcript re-renders
+			// from the compacted messages and the context bar reflects the
+			// new size — the same bookkeeping the rewind path does.
+			if rootState, ok := m.AgentStates[m.Root.ID()]; ok {
+				rootState.Transcript.generation++
+				rootState.Transcript.dirty = true
+				rootState.RenderedHistory = nil
+				rootState.LastTotalContent = ""
+				rootState.CachedHistoryLen = 0
+				rootState.CachedHistoryTokens = 0
+				rootState.CumulativeTokenCount = common.CalculateHistoryTokens(
+					m.Root.History(),
+					m.Root.SystemPrompt(),
+					m.Root.ToolDefinitions(),
+				)
+			}
+		}
+		// The status lands on whichever agent the user is looking at; the
+		// compaction itself always targets the root session.
+		s := m.GetAgentState(m.Focused.ID())
+		switch {
+		case msg.err != nil:
+			s.StatusText = fmt.Sprintf("compaction failed: %v", msg.err)
+		case msg.report.ShadowOnly:
+			s.StatusText = fmt.Sprintf("shadow report: would save ~%d tokens (enable compaction-mode to apply)", msg.report.TokensSaved)
+		default:
+			s.StatusText = fmt.Sprintf("compacted: saved ~%d tokens (%d segments elided)", msg.report.TokensSaved, msg.report.SegmentsElided)
+		}
+		m.updateViewport()
 		return m, nil
 	}
 
@@ -1092,6 +1145,30 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.updateLayout()
 				return m, nil
 			}
+			if cmd == "/jev-compact-context" {
+				m.Input.Reset()
+				m.Input.SetValue("")
+				m.ShowAutocomplete = false
+				m.AutocompleteItems = nil
+				m.AutocompleteIndex = 0
+				// Compaction needs the pipeline's scorer and store; without
+				// them (compaction-mode off / no backend) there is nothing
+				// to run.
+				if m.Compactor == nil {
+					focusedState.StatusText = compactionUnavailableStatus
+					m.updateViewport()
+					return m, nil
+				}
+				if m.CompactionRunning {
+					focusedState.StatusText = "compaction already running"
+					m.updateViewport()
+					return m, nil
+				}
+				m.CompactionRunning = true
+				focusedState.StatusText = "compacting context..."
+				m.updateViewport()
+				return m, m.startCompaction()
+			}
 			if cmd == "/model" {
 				m.Input.Reset()
 				m.Input.SetValue("")
@@ -1165,6 +1242,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					state.CachedHistoryLen = 0
 					state.CachedHistoryTokens = 0
 					state.LastTotalContent = ""
+					// A fresh conversation re-arms the JEV auto-compaction
+					// trigger for every agent.
+					state.AutocompactDisarmed = false
 				}
 				m.LastFocusedID = ""
 				m.Viewport.GotoTop()
@@ -1499,6 +1579,10 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		// the retried attempt actually produced a response; it is returned
 		// after the event switch below.
 		var restoredToast tea.Cmd
+		// autoCompactCmd fires when the focused agent's usage update crosses
+		// the JEV auto-compaction threshold (see maybeJevAutoCompact); it is
+		// returned after the event switch below.
+		var autoCompactCmd tea.Cmd
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
@@ -1550,6 +1634,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			// Presentation is coalesced by the frame clock.
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
+			}
+			// JEV auto-compaction trigger — the same flow as
+			// /jev-compact-context, fired when the focused agent's just-updated
+			// usage crosses the configured share of the context window.
+			if event.ID == m.Focused.ID() {
+				autoCompactCmd = m.maybeJevAutoCompact(s)
 			}
 		case common.StatusEvent:
 			switch event.Status {
@@ -1690,7 +1780,13 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		}
 
 		if restoredToast != nil {
+			if autoCompactCmd != nil {
+				return m, tea.Batch(restoredToast, autoCompactCmd)
+			}
 			return m, restoredToast
+		}
+		if autoCompactCmd != nil {
+			return m, autoCompactCmd
 		}
 
 	case ConfirmRequestMsg:
@@ -1703,6 +1799,70 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// startCompaction returns the tea.Cmd that runs one full-history compaction
+// pass off the TUI update loop (network scoring can take seconds) and
+// delivers the outcome as a compactionResultMsg. The caller must have set
+// Model.CompactionRunning — the shared in-flight guard — beforehand; a nil
+// Compactor (compaction unavailable) yields a nil command.
+func (m *Model) startCompaction() tea.Cmd {
+	runner := m.Compactor
+	if runner == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		report, err := runner(context.Background())
+		return compactionResultMsg{report: report, err: err}
+	}
+}
+
+// autocompactRearmPoints is how far below the trigger percentage usage must
+// fall before the JEV auto-compaction trigger re-arms: after one crossing
+// fires, the agent stays disarmed until its usage drops under
+// (percent-9)% — typically because a compaction just shrank the history —
+// or /new starts a fresh conversation.
+const autocompactRearmPoints = 9
+
+// maybeJevAutoCompact returns the tea.Cmd that runs one full-history
+// compaction pass when the focused agent's usage has crossed the configured
+// percentage (config jev-autocompact + jev-autocompact-percent, default 99)
+// of the context window — the same m.Focused.MaxTokens() source the info
+// bar's context bar uses. The run is guarded by Model.CompactionRunning and
+// fires once per crossing: the agent is disarmed until usage falls below
+// the re-arm level or a new session starts. Without a known context size
+// (MaxTokens() <= 0) there is no threshold to cross, so the trigger skips
+// silently.
+func (m *Model) maybeJevAutoCompact(s *AppState) tea.Cmd {
+	if !m.JevAutocompact || m.Compactor == nil || m.CompactionRunning {
+		return nil
+	}
+	maxTokens := m.Focused.MaxTokens()
+	if maxTokens <= 0 {
+		// Unknown context size (client.ContextSize -1, or unlimited): the
+		// threshold is undefined — skip silently.
+		return nil
+	}
+	percent := m.JevAutocompactPercent
+	if percent <= 0 || percent > 100 {
+		percent = config.DefaultJevAutocompactPercent
+	}
+	if s.AutocompactDisarmed {
+		// Re-arm once usage falls below (percent-9)% again. A percent
+		// below the re-arm margin resolves to a negative level, which
+		// usage (always >= 0) can never cross: the trigger stays disarmed.
+		if s.CumulativeTokenCount < maxTokens*(percent-autocompactRearmPoints)/100 {
+			s.AutocompactDisarmed = false
+		}
+		return nil
+	}
+	if s.CumulativeTokenCount < maxTokens*percent/100 {
+		return nil
+	}
+	m.CompactionRunning = true
+	s.AutocompactDisarmed = true
+	s.StatusText = "compacting context..."
+	return m.startCompaction()
 }
 
 // submitMessage runs the full "user pressed Enter" pipeline for a message:

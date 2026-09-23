@@ -1121,3 +1121,129 @@ func TestConfig_PermissionModeJSONRoundTrip(t *testing.T) {
 		t.Fatalf("empty config should not marshal a permission-mode key, got %s", emptyData)
 	}
 }
+
+// TestResolveAutocompact mirrors TestResolveCompactionThreshold: the switch
+// is a plain boolean (absent = disabled) and the percentage validates 1-100,
+// with 0 (unset) meaning the default and anything else warning and falling
+// back to the default.
+func TestResolveAutocompact(t *testing.T) {
+	cases := []struct {
+		name             string
+		cfg              *Config
+		wantEnabled      bool
+		wantPercent      int
+		wantWarningParts []string
+	}{
+		{
+			name:        "nil config uses defaults",
+			cfg:         nil,
+			wantEnabled: false,
+			wantPercent: DefaultJevAutocompactPercent,
+		},
+		{
+			name:        "unset uses defaults",
+			cfg:         &Config{},
+			wantEnabled: false,
+			wantPercent: DefaultJevAutocompactPercent,
+		},
+		{
+			name:        "enabled with default percent",
+			cfg:         &Config{JevAutocompact: true},
+			wantEnabled: true,
+			wantPercent: DefaultJevAutocompactPercent,
+		},
+		{
+			name:        "valid percent honored",
+			cfg:         &Config{JevAutocompact: true, JevAutocompactPercent: 90},
+			wantEnabled: true,
+			wantPercent: 90,
+		},
+		{
+			name:        "one is valid",
+			cfg:         &Config{JevAutocompactPercent: 1},
+			wantEnabled: false,
+			wantPercent: 1,
+		},
+		{
+			name:        "hundred is valid",
+			cfg:         &Config{JevAutocompactPercent: 100},
+			wantEnabled: false,
+			wantPercent: 100,
+		},
+		{
+			name:             "negative percent invalid",
+			cfg:              &Config{JevAutocompact: true, JevAutocompactPercent: -5},
+			wantEnabled:      true,
+			wantPercent:      DefaultJevAutocompactPercent,
+			wantWarningParts: []string{"invalid", "-5"},
+		},
+		{
+			name:             "over hundred percent invalid",
+			cfg:              &Config{JevAutocompactPercent: 250},
+			wantEnabled:      false,
+			wantPercent:      DefaultJevAutocompactPercent,
+			wantWarningParts: []string{"invalid", "250"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotEnabled, gotPercent, warning := ResolveAutocompact(tc.cfg)
+			if gotEnabled != tc.wantEnabled {
+				t.Fatalf("ResolveAutocompact() enabled = %v, want %v", gotEnabled, tc.wantEnabled)
+			}
+			if gotPercent != tc.wantPercent {
+				t.Fatalf("ResolveAutocompact() percent = %d, want %d", gotPercent, tc.wantPercent)
+			}
+			if len(tc.wantWarningParts) == 0 {
+				if warning != "" {
+					t.Fatalf("warning = %q, want empty", warning)
+				}
+				return
+			}
+			if warning == "" {
+				t.Fatal("warning is empty, want a warning")
+			}
+			for _, substring := range tc.wantWarningParts {
+				if !strings.Contains(warning, substring) {
+					t.Fatalf("warning = %q, want it to contain %q", warning, substring)
+				}
+			}
+		})
+	}
+}
+
+func TestConfig_AutocompactJSONRoundTrip(t *testing.T) {
+	original := Config{JevAutocompact: true, JevAutocompactPercent: 90}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	var decoded Config
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !decoded.JevAutocompact {
+		t.Fatal("JevAutocompact after round trip = false, want true")
+	}
+	if decoded.JevAutocompactPercent != 90 {
+		t.Fatalf("JevAutocompactPercent after round trip = %d, want 90", decoded.JevAutocompactPercent)
+	}
+
+	// Zero values must not emit keys (omitempty), keeping config.json clean
+	// for users who never touched the new settings.
+	emptyData, err := json.Marshal(Config{})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(emptyData, &raw); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	for _, key := range []string{"jev-autocompact", "jev-autocompact-percent"} {
+		if _, ok := raw[key]; ok {
+			t.Fatalf("empty config should not marshal a %s key, got %s", key, emptyData)
+		}
+	}
+}

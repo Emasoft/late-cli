@@ -291,7 +291,7 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		// text delta — exact for both the mutating and the shadow run.
 		report.TokensAfter -= common.EstimateTokenCount(msg.Content.Text) - common.EstimateTokenCount(compacted)
 		if !opts.ShadowOnly {
-			// In-place content swap: Role, ToolCalls, ToolCallID, Timestamp
+			// In-place content swap: Role, ToolCalls, ToolCallID
 			// and ReasoningContent are preserved; only Content shrinks.
 			msg.Content = client.TextContent(compacted)
 		}

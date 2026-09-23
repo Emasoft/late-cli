@@ -20,10 +20,12 @@ import (
 // All helpers are cmp-prefixed to stay clear of the history_sanitize_test.go
 // fixture helpers in this package.
 
-// cmpStamped stamps a fixture message with a fixed, distinct RFC3339
-// timestamp (timestamps must survive compaction untouched).
-func cmpStamped(msg client.ChatMessage, n int) client.ChatMessage {
-	msg.Timestamp = fmt.Sprintf("2024-05-06T07:00:%02dZ", n)
+// cmpStamped marks fixture message n. On the source branch it stamped the
+// message with a fixed RFC3339 timestamp (timestamps must survive compaction
+// untouched); the receive-time Timestamp field itself belongs to the excluded
+// timestamps feature, so here it is an identity marker kept so the fixture
+// call sites keep their per-message indices.
+func cmpStamped(msg client.ChatMessage, _ int) client.ChatMessage {
 	return msg
 }
 
@@ -471,25 +473,9 @@ func TestCompactContextFailOpenMidWalk(t *testing.T) {
 }
 
 // (h) Timestamps survive compaction untouched — on compacted and frozen
-// messages alike.
-func TestCompactContextPreservesTimestamps(t *testing.T) {
-	fixture := defaultFixture()
-	s := newCompactSession(fixture)
-	segs := fixtureSegments(t, fixture)
-
-	if _, err := s.CompactContext(context.Background(), elideFirstScorer(segs), NewCompactStore(), CompactionOptions{}); err != nil {
-		t.Fatalf("CompactContext() error = %v", err)
-	}
-	for i := range fixture {
-		if s.History[i].Timestamp != fixture[i].Timestamp {
-			t.Errorf("message %d Timestamp changed: got %q, want %q", i, s.History[i].Timestamp, fixture[i].Timestamp)
-		}
-	}
-	// The check above is not vacuous: message 4 really was rewritten.
-	if !strings.Contains(s.History[4].Content.Text, "[[elided id=") {
-		t.Fatal("expected message 4 to be compacted")
-	}
-}
+// messages alike. (The receive-time Timestamp field belongs to the excluded
+// timestamps feature, so that assertion lives with it; compaction's
+// rewrite path preserves everything except the compacted content.)
 
 // (i) Short histories are no-ops: nothing eligible, nothing rewritten, a
 // zero report.
