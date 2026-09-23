@@ -46,6 +46,15 @@ const (
 	EntryTypeHit = "hit"
 )
 
+// DecisionKindAdmit and DecisionKindRetrieve are the ShadowEntry.Kind
+// decision classes (the reference shadow.py DecisionKind): "admit" — the
+// per-segment elision decisions the scoring pipeline records — and
+// "retrieve" — the store read side's injected/skipped decisions (Step 17).
+const (
+	DecisionKindAdmit    = "admit"
+	DecisionKindRetrieve = "retrieve"
+)
+
 // ShadowEntry is one JSONL line in the shadow log: a single scored segment
 // at a single decision point — an outcome line (Type "expand"/"hit") naming
 // the record or segment it attributes to via ItemID — or, with Type
@@ -63,10 +72,17 @@ type ShadowEntry struct {
 	// lines predate the field).
 	Type string `json:"type,omitempty"`
 	// Action is the machine-readable action carried by non-decision entries
-	// ("tripwire" on Type "tripwire"). Empty on per-segment decisions,
-	// whose Decision field carries the action. Additive: older logs simply
+	// ("tripwire" on Type "tripwire") and by kind=retrieve decisions
+	// ("injected"/"skipped"). Admit decisions leave it empty — their
+	// Decision field carries the action. Additive: older logs simply
 	// lack the field.
 	Action string `json:"action,omitempty"`
+	// Kind is the decision class: "admit" for the per-segment elision
+	// decisions the pipeline makes, "retrieve" for the store read side's
+	// decisions (Step 17). Empty on legacy lines (written before the field
+	// existed); readers treat empty as "admit". Additive: older logs simply
+	// lack the field.
+	Kind string `json:"kind,omitempty"`
 	// Threshold is the score floor the decision was made against — the gate
 	// floor in force at decision time (the protected-kind floor for
 	// protected kinds, else the relocation threshold). Stats,
@@ -90,6 +106,20 @@ type ShadowEntry struct {
 // tripwire overrides, and run summaries are not.
 func (e ShadowEntry) isDecision() bool {
 	return e.Type == "" || e.Type == EntryTypeDecision
+}
+
+// isElideDecision reports whether the entry is a per-segment ELISION
+// decision — the kind the replay table, the Stats elide counters, and the
+// false-negative ledger are built on. Retrieve decisions (Kind "retrieve")
+// are decisions too, but their score means "relevant to the task right
+// now", not "essential enough to keep": counting them as elides would pollute
+// the false-negative rate with records the read side skipped on purpose and
+// would replay injected/skipped through kept/elided vocabulary. The Go
+// table models the elide axis only (the reference's _counterfactual maps
+// retrieve kinds onto injected/skipped — a separate axis here). Empty Kind
+// is admit: every legacy line behaves exactly as before this field existed.
+func (e ShadowEntry) isElideDecision() bool {
+	return e.isDecision() && e.Kind != DecisionKindRetrieve
 }
 
 // RunSummary is the per-run totals of one history-compaction pass — the
@@ -307,11 +337,12 @@ func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 	seen := make(map[string]bool)
 	elidedSeen := make(map[string]bool)
 	for _, e := range entries {
-		if !e.isDecision() {
-			// Non-decision entries (history-run summaries, tripwire records,
-			// expand/hit outcomes) are not per-segment decisions: counting
-			// them would inflate Entries/TokensTotal and mint a "" unique
-			// segment.
+		if !e.isElideDecision() {
+			// Non-elide entries — history-run summaries, tripwire records,
+			// expand/hit outcomes, and kind=retrieve decisions — are not
+			// elision decisions: counting them would inflate
+			// Entries/TokensTotal and mint a "" unique segment (or, for
+			// retrieve decisions, replay "skipped" as "elided").
 			continue
 		}
 		report.Entries++
@@ -364,7 +395,10 @@ func (l *ShadowLog) Stats() (Stats, error) {
 	hit := make(map[string]bool)
 	for _, e := range entries {
 		switch {
-		case e.isDecision():
+		case e.isElideDecision():
+			// Elide decisions only: retrieve decisions (Step 17) carry a
+			// relevance score with injected/skipped actions — they are
+			// tracked through the raw log, not through the elide counters.
 			st.Decisions++
 			if e.Threshold > 0 && e.Score < e.Threshold {
 				st.ElidedDecisions++
@@ -397,7 +431,7 @@ func (l *ShadowLog) FalseNegativeRate() (float64, error) {
 	}
 	elided := make(map[string]bool)
 	for _, e := range entries {
-		if e.isDecision() && e.SegmentID != "" && elidedAtOwnThreshold(e) {
+		if e.isElideDecision() && e.SegmentID != "" && elidedAtOwnThreshold(e) {
 			elided[e.SegmentID] = true
 		}
 	}
@@ -434,7 +468,7 @@ func stillMissedIDs(entries []ShadowEntry, elided func(ShadowEntry) bool) map[st
 	}
 	missed := make(map[string]bool)
 	for i, e := range entries {
-		if !e.isDecision() || e.SegmentID == "" || !elided(e) {
+		if !e.isElideDecision() || e.SegmentID == "" || !elided(e) {
 			continue
 		}
 		if j, ok := lastExpandAt[e.SegmentID]; ok && j > i {
@@ -481,7 +515,9 @@ func (l *ShadowLog) ReplayTable(thresholds []float64) ([]ReplayRow, error) {
 	for _, th := range thresholds {
 		row := ReplayRow{Threshold: th}
 		for _, e := range entries {
-			if !e.isDecision() {
+			if !e.isElideDecision() {
+				// See isElideDecision: the table replays the elide axis;
+				// retrieve decisions and outcomes never count.
 				continue
 			}
 			if e.Score < th {

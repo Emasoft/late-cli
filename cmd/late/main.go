@@ -597,6 +597,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionModeWarning)
 	}
 
+	// Retrieval read side (Step 17): compaction-retrieval scores the record
+	// store's digest against the current task before every stream request
+	// and stages the top-k relevant records into the outgoing request's work
+	// area (ephemeral — never the frozen prefix, never persisted). Resolved
+	// with the same warn-on-invalid pattern as the other compaction knobs;
+	// the warning fires for the inert combinations (mode not "enabled",
+	// where the store never fills).
+	compactionRetrieval, compactionRetrievalWarning := appconfig.ResolveCompactionRetrieval(appConfig)
+	if compactionRetrievalWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionRetrievalWarning)
+	}
+
 	// -check-compaction: run the compaction preflight (Step 16) against the
 	// backend THIS run would resolve and exit — the TUI never starts. The
 	// mode resolution above is deliberately shared with the normal startup
@@ -826,6 +838,29 @@ func main() {
 			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog)
 	}
 
+	// Retrieval hooks (Step 17): BaseOrchestrator runs the hook at every
+	// turn start — right before that turn's stream request — so each agent
+	// (root and every subagent, which each own a session) stages retrieved
+	// context into its own request's work area. The hook owns its errors:
+	// a failed retrieval warns once and the turn proceeds without it; the
+	// next turns retry, so one flaky scoring round never disables the
+	// feature for the session.
+	var retrievalWarnOnce sync.Once
+	var retrievalHookFor func(s *session.Session) func(context.Context)
+	if compactionRetrieval && compactionPipeline != nil {
+		retrievalHookFor = func(s *session.Session) func(context.Context) {
+			return func(ctx context.Context) {
+				if _, err := s.InjectRetrieved(ctx, compactionPipeline, compactionStore,
+					compaction.DefaultRetrieveK, compaction.DefaultRetrieveBudgetTokens, compaction.DefaultRetrieveThreshold); err != nil {
+					retrievalWarnOnce.Do(func() {
+						fmt.Fprintf(os.Stderr, "Warning: compaction retrieval skipped (%v); later turns retry\n", err)
+					})
+				}
+			}
+		}
+		rootAgent.SetRetrievalHook(retrievalHookFor(sess))
+	}
+
 	// Register plugin slash commands + theme catalog so plugin commands fire
 	// when the user presses Enter.
 	if pluginManager != nil && pluginManager.Count() > 0 {
@@ -986,6 +1021,15 @@ func main() {
 				return "", err
 			}
 			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
+
+			// Retrieval read side (Step 17): children get the same per-turn
+			// hook as the root agent — the work-area injection is per-agent
+			// session, while the record store and pipeline are shared.
+			if retrievalHookFor != nil {
+				if bo, ok := child.(*orchestrator.BaseOrchestrator); ok {
+					bo.SetRetrievalHook(retrievalHookFor(bo.Session()))
+				}
+			}
 
 			res, err := child.Execute("")
 			if err != nil {

@@ -238,6 +238,7 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 				Score:     score,
 				Decision:  decision,
 				Threshold: floor,
+				Kind:      DecisionKindAdmit,
 			}); aerr != nil {
 				out.Errors = append(out.Errors, fmt.Errorf("shadow log append for %s: %w", s.ID, aerr))
 			}
