@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
@@ -268,6 +269,21 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 				m.TodoScrollOffset = maxOffset
 				return m, nil
 			}
+			// Typing must never be silently trapped while the pane holds
+			// focus: the first printable, non-nav key releases focus and —
+			// with no early return — falls through below so the same key
+			// reaches the chat input. j/k/g/G stay nav keys while focused
+			// (the switch above consumed them); every other printable
+			// character both unfocuses and types. bubbletea v2 populates
+			// Key.Text only for printable characters (the exact bytes the
+			// textarea inserts), so esc/ctrl/alt/pgup-style keystrokes never
+			// match here and keep the pane focused.
+			if press, ok := keyMsg.(tea.KeyPressMsg); ok &&
+				press.Mod&(tea.ModCtrl|tea.ModAlt|tea.ModMeta|tea.ModHyper|tea.ModSuper) == 0 {
+				if runes := []rune(press.Text); len(runes) == 1 && !unicode.IsControl(runes[0]) {
+					m.TodoPaneFocused = false
+				}
+			}
 		}
 
 		if wheelMsg, ok := msg.(tea.MouseWheelMsg); ok {
@@ -285,6 +301,14 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 
 		if clickMsg, ok := msg.(tea.MouseClickMsg); ok {
 			mouse := clickMsg.Mouse()
+			// A left click outside the pane releases its focus but must not
+			// eat the click: no early return, so the click keeps its normal
+			// downstream work (transcript selection/copy, input placement).
+			if mouse.Button == tea.MouseLeft &&
+				m.TodoPaneFocused &&
+				mouse.X < m.Width-todoPaneWidth {
+				m.TodoPaneFocused = false
+			}
 			if mouse.Button == tea.MouseLeft &&
 				mouse.X >= m.Width-todoPaneWidth &&
 				mouse.Y >= 0 && mouse.Y < m.Viewport.Height() {
