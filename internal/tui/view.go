@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"late/internal/common"
+	"late/internal/config"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -97,6 +98,11 @@ func (m Model) buildScreen() tea.View {
 		content += "\n" + aStr
 	}
 	content += "\n" + iStr + "\n" + sStr
+	// Info bar sits below the status bar (one extra footer row, reserved by
+	// updateLayout via infoBarHeight). Empty while the file picker is open.
+	if infoStr := m.infoBarView(); infoStr != "" {
+		content += "\n" + infoStr
+	}
 
 	v := tea.NewView(sanitizeVTE(content, m.Width))
 	v.AltScreen = true
@@ -360,7 +366,7 @@ func (m *Model) renderMinimalEqualizerAt(now time.Time) string {
 
 		// Gentle incommensurate harmonic (golden ratio 1.618) creates organic, non-repeating crests
 		// Low amplitude ensures it never causes erratic snap or jitter
-		w2 := 0.35 * math.Sin(t*0.93 + float64(i)*0.55 + 1.2)
+		w2 := 0.35 * math.Sin(t*0.93+float64(i)*0.55+1.2)
 
 		// Breathing envelope gives gentle natural cadence
 		swell := 0.88 + 0.20*math.Sin(t*0.38+float64(i)*0.25)
@@ -715,6 +721,191 @@ func (m *Model) statusBarView() string {
 
 	content := lipgloss.JoinHorizontal(lipgloss.Left, parts...)
 	return statusBarBaseStyle.Width(w).Render(" " + content + " ")
+}
+
+// agentTypeForID maps an orchestrator ID to the agent type used by
+// config.AgentModels lookups: the root agent ("main") maps to "orchestrator"
+// and "<type>-subagent-<n>" (the NextChildID scheme) maps to "<type>".
+// Unrecognized IDs return "" (no config lookup possible).
+func agentTypeForID(id string) string {
+	if id == "" || id == common.MainAgentID {
+		return "orchestrator"
+	}
+	if idx := strings.Index(id, "-subagent-"); idx > 0 {
+		return id[:idx]
+	}
+	return ""
+}
+
+// focusedModelInfo resolves the provider/profile reference and model name
+// shown for the focused agent. An explicit config.AgentModels entry for the
+// focused agent's type wins (ModelSetting.Reference is the stable ID the
+// /model picker stores); otherwise the orchestrator model surfaced by
+// main.go (ModelName, kept current by the picker) is used. For a subagent
+// without its own entry, SubagentInfo names the subagent backend when it is
+// a single model (it is a comma-joined "type:model" list only when several
+// subagent types have explicit entries).
+func (m *Model) focusedModelInfo() (ref, name string) {
+	agentType := agentTypeForID(m.Focused.ID())
+	if agentType != "" && m.AppConfig != nil {
+		if setting, ok := m.AppConfig.GetModelForAgent(agentType); ok {
+			return setting.Reference(), setting.Model
+		}
+	}
+	name = m.ModelName
+	if agentType != "orchestrator" && m.SubagentInfo != "" &&
+		!strings.Contains(m.SubagentInfo, ":") && !strings.Contains(m.SubagentInfo, ",") {
+		name = m.SubagentInfo
+	}
+	if name == "" {
+		name = "default"
+	}
+	return "", name
+}
+
+// runningSubagentCount counts non-root agent states that are actively doing
+// work (thinking, streaming, or stopping). Approximation: subagents waiting
+// for tool confirmation are not counted as running, and StateContextWarning
+// is a preflight notice on an otherwise idle agent, so neither counts.
+func (m *Model) runningSubagentCount() int {
+	rootID := ""
+	if m.Root != nil {
+		rootID = m.Root.ID()
+	}
+	n := 0
+	for id, s := range m.AgentStates {
+		if id == rootID || id == common.MainAgentID {
+			continue
+		}
+		switch s.State {
+		case StateThinking, StateStreaming, StateStopping:
+			n++
+		}
+	}
+	return n
+}
+
+// compactionHeadroomTokens returns how many tokens remain before the context
+// reaches the compaction threshold (maxTokens * thresholdPct / 100), clamped
+// at zero. Unknown or unlimited context (maxTokens <= 0) yields 0; callers
+// omit the segment in that case.
+func compactionHeadroomTokens(current, maxTokens, thresholdPct int) int {
+	if maxTokens <= 0 {
+		return 0
+	}
+	if thresholdPct <= 0 {
+		thresholdPct = config.DefaultCompactionThresholdPercent
+	}
+	if thresholdPct > 100 {
+		thresholdPct = 100
+	}
+	headroom := (maxTokens*thresholdPct)/100 - current
+	if headroom < 0 {
+		return 0
+	}
+	return headroom
+}
+
+// formatUptime renders coarse session uptime for the info bar: 42s, 12m,
+// 3h5m, 2d4h.
+func formatUptime(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	if days > 0 {
+		if hours > 0 {
+			return fmt.Sprintf("%dd%dh", days, hours)
+		}
+		return fmt.Sprintf("%dd", days)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dh", hours)
+}
+
+// infoBarView renders the optional single-row info footer toggled by
+// /infobar and persisted as config show-info-bar. It reuses the status bar
+// base style family and renders the following " · "-separated segments:
+//
+//	late <version> · <project folder> · <provider/profile ref · model> ·
+//	ctx <context bar> · subagents: N running · skills: N (~T tok) ·
+//	~N tokens to threshold · up <elapsed>
+//
+// Data sources and approximations:
+//   - "used" tokens: the focused agent's AppState.CumulativeTokenCount — the
+//     session-total estimate the status bar context bar uses (not
+//     client.Usage, which only reflects the last turn).
+//   - context max: the focused agent's MaxTokens() (client.ContextSize();
+//     -1 = unknown, 0 = unlimited — the headroom segment is omitted then).
+//   - skills: SkillsInfo, estimated once at startup from skill instructions.
+//
+// The row is truncated (never wrapped) to the window width and padded to it
+// so the background stays opaque, mirroring renderActivityAt.
+func (m *Model) infoBarView() string {
+	if !m.ShowInfoBar || m.ShowFilePicker {
+		return ""
+	}
+	w := max(m.Width, 1)
+
+	brandStyle := lipgloss.NewStyle().Foreground(primaryColor).Background(appBgColor).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
+	valueStyle := lipgloss.NewStyle().Foreground(subtextColor).Background(appBgColor)
+	sep := labelStyle.Render(" · ")
+
+	var parts []string
+	parts = append(parts,
+		brandStyle.Render("late ")+valueStyle.Render("v"+common.Version),
+	)
+	if m.CWD != "" {
+		parts = append(parts, valueStyle.Render(filepath.Base(m.CWD)))
+	}
+	if ref, name := m.focusedModelInfo(); ref != "" {
+		parts = append(parts, valueStyle.Render(ref+" · "+name))
+	} else {
+		parts = append(parts, valueStyle.Render(name))
+	}
+
+	s := m.GetAgentState(m.Focused.ID())
+	// Same source the status bar context bar uses (m.Focused.MaxTokens() is
+	// client.ContextSize(): -1 unknown, 0 unlimited).
+	maxTokens := m.Focused.MaxTokens()
+	parts = append(parts, labelStyle.Render("ctx ")+m.renderContextBar(s.CumulativeTokenCount, maxTokens))
+
+	parts = append(parts,
+		labelStyle.Render("subagents: ")+valueStyle.Render(fmt.Sprintf("%d running", m.runningSubagentCount())),
+	)
+
+	if m.SkillsInfo.Count > 0 {
+		parts = append(parts, labelStyle.Render("skills: ")+
+			valueStyle.Render(fmt.Sprintf("%d (~%s tok)", m.SkillsInfo.Count, m.formatTokenCount(m.SkillsInfo.Tokens))))
+	}
+
+	if maxTokens > 0 {
+		thresholdPct, _ := config.ResolveCompactionThreshold(m.AppConfig)
+		headroom := compactionHeadroomTokens(s.CumulativeTokenCount, maxTokens, thresholdPct)
+		parts = append(parts, valueStyle.Render(fmt.Sprintf("~%s tokens to threshold", m.formatTokenCount(headroom))))
+	}
+
+	uptime := "0s"
+	if !s.CreatedAt.IsZero() {
+		uptime = formatUptime(time.Since(s.CreatedAt))
+	}
+	parts = append(parts, labelStyle.Render("up ")+valueStyle.Render(uptime))
+
+	row := strings.Join(parts, sep)
+	truncated := ansi.Truncate(row, max(1, w), "…")
+	rw := ansi.StringWidth(truncated)
+	if rw < w {
+		truncated += lipgloss.NewStyle().Background(appBgColor).Render(strings.Repeat(" ", w-rw))
+	}
+	return truncated
 }
 
 func (m *Model) updateViewport() {
