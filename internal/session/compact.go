@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -35,10 +36,14 @@ import (
 //   - Segments are scored against the ongoing task (the last user message);
 //     a segment scoring strictly below the threshold is elided into the
 //     store and replaced by one pointer line.
-//   - Fail-open: a scorer error stops the walk; messages already rewritten
-//     stay rewritten (their pointers and stored originals are valid) and the
-//     returned error reports how far the walk got. Compaction never breaks
-//     a session.
+//   - Fail-open: a scorer error that still answers every requested id (the
+//     pipeline's contract — unscoreable items come back as keep-scores)
+//     does not stop the walk: those scores are used, the scorer's errors
+//     accumulate and surface at the end via errors.Join. The walk stops
+//     mid-flight only when the scorer returns no usable scores for a
+//     message; messages already rewritten stay rewritten (their pointers
+//     and stored originals are valid) and the returned error reports how
+//     far the walk got. Compaction never breaks a session.
 //   - Shadow mode (compaction-mode "shadow") runs the full scoring walk and
 //     computes the honest would-save report without mutating history.
 //
@@ -79,8 +84,11 @@ const (
 // HistoryScorer scores one batch of segments against an ongoing task. It is
 // satisfied by compaction.DecisionClient (the pipeline's scoring client);
 // tests inject map-based stubs. Like the pipeline's contract, an error
-// return means the batch could not be scored — CompactContext stops the walk
-// rather than eliding on unreliable answers.
+// return that still carries a score for every requested id is the fail-open
+// shape (unscoreable items answered as keep-scores): CompactContext keeps
+// walking with those scores and surfaces the errors at the end. An error
+// with scores missing means the batch could not be scored — CompactContext
+// stops the walk rather than eliding on unusable answers.
 type HistoryScorer interface {
 	ScoreBatch(ctx context.Context, task string, items map[string]compaction.Item) (map[string]float64, error)
 }
@@ -167,6 +175,10 @@ type CompactionReport struct {
 	// MessagesScanned is the number of history messages the walk examined —
 	// everything after the frozen prefix.
 	MessagesScanned int
+	// MessagesScored is the number of messages whose segments were actually
+	// scored, including fail-open-scored ones (a scorer error answered with
+	// a complete keep-score map still counts the message as scored).
+	MessagesScored int
 	// MessagesCompacted is the number of messages actually rewritten (or
 	// would-be rewritten in shadow mode).
 	MessagesCompacted int
@@ -192,9 +204,12 @@ type CompactionReport struct {
 // receives the elided originals. A nil store leaves relocation disarmed —
 // like the pipeline with relocation off, nothing is elided, because a
 // pointer whose original cannot be stored must never enter history. The
-// returned error is non-nil only when the scorer failed mid-walk (fail-open:
-// the report still covers everything completed, and already-rewritten
-// messages stay rewritten); persistence is the caller's job (SaveHistory).
+// returned error is non-nil when the scorer reported failures: a walk that
+// completed on fail-open scores joins those scorer errors at the end, and a
+// walk that had to stop (no usable scores for a message) reports how far it
+// got. The report covers everything completed either way, and
+// already-rewritten messages stay rewritten; persistence is the caller's job
+// (SaveHistory).
 func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, store ElideStore, opts CompactionOptions) (CompactionReport, error) {
 	var report CompactionReport
 	if scorer == nil {
@@ -224,6 +239,7 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 
 	task := compactionTask(s.History)
 	scored := 0
+	var walkErrs []error
 
 	for i := frozen; i < len(s.History); i++ {
 		msg := &s.History[i]
@@ -240,12 +256,22 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		}
 		scores, err := scorer.ScoreBatch(ctx, task, items)
 		if err != nil {
-			// Fail-open mid-walk: stop the walk. Messages already rewritten
-			// stay rewritten — their pointers and stored originals are valid
-			// — and the error says how far the walk got.
-			return report, fmt.Errorf("context compaction stopped after %d messages: %w", scored, err)
+			if !scoresComplete(items, scores) {
+				// Wholesale failure: the scorer returned no usable scores
+				// for this message. Fail-open mid-walk: stop the walk.
+				// Messages already rewritten stay rewritten — their pointers
+				// and stored originals are valid — and the error says how
+				// far the walk got.
+				return report, fmt.Errorf("context compaction stopped after %d messages: %w", scored, err)
+			}
+			// Fail-open complete: every requested id came back (the
+			// pipeline's contract — unscoreable items are answered with
+			// keep-scores), so the scores are usable. Keep the walk going;
+			// the scorer's errors surface at the end.
+			walkErrs = append(walkErrs, err)
 		}
 		scored++
+		report.MessagesScored++
 
 		var (
 			kept     []compaction.Segment
@@ -298,7 +324,23 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	}
 
 	report.TokensSaved = report.TokensBefore - report.TokensAfter
-	return report, nil
+	// Fail-open scorer errors accumulated along the walk surface here; a
+	// clean walk returns a nil error.
+	return report, errors.Join(walkErrs...)
+}
+
+// scoresComplete reports whether scores answers every id in items — the
+// pipeline's fail-open contract shape (compaction.DecisionClient.ScoreBatch
+// fills every id, unscoreable items with keep-scores, even when it also
+// reports errors). A missing id means the scorer had nothing usable for that
+// segment.
+func scoresComplete(items map[string]compaction.Item, scores map[string]float64) bool {
+	for id := range items {
+		if _, ok := scores[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // frozenPrefix computes how many leading history messages are never
