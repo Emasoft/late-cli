@@ -1058,6 +1058,10 @@ func (o *BaseOrchestrator) Rewind(index int) error {
 		return fmt.Errorf("invalid history index")
 	}
 	o.sess.History = o.sess.History[:index]
+	// The frozen prefix never outlives the history it froze: the compaction
+	// high-water mark clamps to the truncated length, and the metadata write
+	// below persists the clamp.
+	o.sess.ClampCompactionHighWater(index)
 	if o.sess.HistoryPath != "" {
 		if err := session.SaveHistory(o.sess.HistoryPath, o.sess.History); err != nil {
 			return err

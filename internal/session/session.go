@@ -34,6 +34,16 @@ type Session struct {
 	// user — can kill a hung tool without killing the whole agent run.
 	// See inflight.go.
 	inFlightToolCancel atomic.Pointer[context.CancelFunc]
+
+	// compactionHighWater is the history compaction high-water mark: the
+	// monotonic message index below which the frozen prefix ends. The
+	// compactor (compact.go) never re-scores or rewrites a message with a
+	// smaller index, so previously frozen bytes — the prompt-cache anchor —
+	// never change between runs. It is guarded by compactionMu the same way
+	// client guards clientMu; it round-trips through SessionMeta
+	// (GenerateSessionMeta) so it survives save/reload.
+	compactionHighWater int
+	compactionMu        sync.Mutex
 }
 
 func New(c *client.Client, historyPath string, history []client.ChatMessage, systemPrompt string, useTools bool) *Session {
@@ -99,6 +109,73 @@ func (s *Session) UpdateSubagentSeq(seq int) error {
 		return err
 	}
 	return nil
+}
+
+// CompactionHighWater returns the history compaction high-water mark: the
+// monotonic message index below which the frozen prefix ends (compact.go).
+func (s *Session) CompactionHighWater() int {
+	s.compactionMu.Lock()
+	defer s.compactionMu.Unlock()
+	return s.compactionHighWater
+}
+
+// SetCompactionHighWater sets the in-memory high-water mark without
+// persisting. The resume path (cmd/late) restores the persisted mark into a
+// freshly constructed session with it, the reset paths (StartNewConversation)
+// zero it with it, and tests use it to pin frozen-prefix behavior.
+// Negative values clamp to zero.
+func (s *Session) SetCompactionHighWater(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.compactionMu.Lock()
+	defer s.compactionMu.Unlock()
+	s.compactionHighWater = n
+}
+
+// UpdateCompactionHighWater durably advances the high-water mark to n —
+// monotonic: a value at or below the current mark is a no-op — and persists
+// it through the session meta sidecar, mirroring UpdateSubagentSeq:
+// in-memory sessions (no history path) and subagent sessions (no sidecar)
+// keep the mark in memory only, and a failed metadata write rolls the
+// in-memory advance back so memory and disk never disagree.
+func (s *Session) UpdateCompactionHighWater(n int) error {
+	s.compactionMu.Lock()
+	if n <= s.compactionHighWater {
+		s.compactionMu.Unlock()
+		return nil
+	}
+	previous := s.compactionHighWater
+	s.compactionHighWater = n
+	s.compactionMu.Unlock()
+
+	if s.skipMetadata || s.HistoryPath == "" {
+		return nil
+	}
+	if err := s.UpdateSessionMetadata(); err != nil {
+		s.compactionMu.Lock()
+		s.compactionHighWater = previous
+		s.compactionMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// ClampCompactionHighWater lowers the in-memory high-water mark to at most
+// maxIndex — the reset-path hook (rewind, pop, new conversation): the frozen
+// prefix never outlives the history it froze, or a stale mark would freeze
+// messages that no longer exist. The caller's own metadata write
+// (UpdateSessionMetadata) persists the clamp; in-memory sessions need no
+// persistence at all.
+func (s *Session) ClampCompactionHighWater(maxIndex int) {
+	if maxIndex < 0 {
+		maxIndex = 0
+	}
+	s.compactionMu.Lock()
+	defer s.compactionMu.Unlock()
+	if s.compactionHighWater > maxIndex {
+		s.compactionHighWater = maxIndex
+	}
 }
 
 // ExecuteTool executes a tool call and returns the response as a string.
@@ -189,6 +266,10 @@ func (s *Session) PopLastUserMessage() (bool, error) {
 		return false, nil
 	}
 	s.History = s.History[:len(s.History)-1]
+	// The frozen prefix never outlives the history it froze: the high-water
+	// mark clamps to the truncated length, and the metadata write below
+	// persists the clamp.
+	s.ClampCompactionHighWater(len(s.History))
 
 	// Popping the first-and-only message empties the history. saveAndNotify()
 	// treats empty history as "nothing to persist" (its empty-guard exists so
@@ -416,6 +497,7 @@ func (s *Session) GenerateSessionMeta() SessionMeta {
 		SubagentSeq:           s.subagentSeq,
 		SaveSubagentHistories: s.saveSubagentHistories,
 		WorkingDir:            s.workingDir,
+		CompactionHighWater:   s.CompactionHighWater(),
 	}
 }
 
@@ -454,6 +536,10 @@ func (s *Session) StartNewConversation() error {
 	sessionID := fmt.Sprintf("session-%s-%09d", now.Format("20060102-150405"), now.Nanosecond())
 	s.HistoryPath = filepath.Join(dir, sessionID+".json")
 	s.History = []client.ChatMessage{}
+	// A fresh conversation has no frozen prefix: the compaction high-water
+	// mark resets with the history (the sidecar of the preserved old
+	// conversation keeps its own mark for when it is resumed).
+	s.SetCompactionHighWater(0)
 	return nil
 }
 

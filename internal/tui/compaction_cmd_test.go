@@ -194,6 +194,14 @@ func TestCompactionResultStatuses(t *testing.T) {
 }
 
 func TestJevCompactContextEndToEnd(t *testing.T) {
+	// A completing mutating run persists the compaction high-water mark
+	// through the session meta sidecar — sandbox SessionDir so this test
+	// never writes into the real user sessions directory.
+	sessionDir := t.TempDir()
+	originalSessionDir := session.SessionDir
+	session.SessionDir = func() (string, error) { return sessionDir, nil }
+	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+
 	sess := session.New(nil, filepath.Join(t.TempDir(), "history.json"), []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("Please analyze this build log.")},
 		{Role: "assistant", Content: client.TextContent(strings.Repeat("verbose analysis ", 200))},

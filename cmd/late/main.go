@@ -582,6 +582,11 @@ func main() {
 		if loadedSessionMeta.WorkingDir != "" {
 			sess.SetWorkingDir(loadedSessionMeta.WorkingDir)
 		}
+		// Restore the compaction high-water mark so the frozen prefix stays
+		// append-only across restarts: resumed sessions never re-score or
+		// rewrite messages a previous run already froze. Legacy sidecars
+		// without the field carry zero — the count-based prefix then applies.
+		sess.SetCompactionHighWater(loadedSessionMeta.CompactionHighWater)
 	} else {
 		sess.SetSubagentMetadata(0, &saveSubagentHistories)
 	}
