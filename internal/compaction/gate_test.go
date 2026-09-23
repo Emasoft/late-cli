@@ -200,7 +200,7 @@ func TestPipeline_TripwireMaxElideFraction(t *testing.T) {
 		if len(got.Elided) != 0 {
 			t.Errorf("Elided = %v, want empty after the tripwire", got.Elided)
 		}
-		if _, ok := store.Get("elide-1"); ok {
+		if store.Len() != 0 {
 			t.Error("store must stay empty after the tripwire")
 		}
 
@@ -251,8 +251,10 @@ func TestPipeline_TripwireMaxElideFraction(t *testing.T) {
 		if got.Tripwire != "" {
 			t.Errorf("Tripwire = %q, want empty", got.Tripwire)
 		}
-		if len(got.Elided) != 3 {
-			t.Errorf("Elided = %d segments, want all 3", len(got.Elided))
+		// All three segments are consecutive: one run, one pointer, three
+		// grouped segments.
+		if len(got.Elided) != 1 || got.Elided[0].Segments != 3 {
+			t.Errorf("Elided = %+v, want one run grouping all 3 segments", got.Elided)
 		}
 	})
 }
@@ -313,7 +315,7 @@ func TestPipeline_MinGateTokensSkipsScoring(t *testing.T) {
 	if requests != 0 {
 		t.Errorf("got %d scoring requests, want 0 below MinGateTokens", requests)
 	}
-	if _, ok := store.Get("elide-1"); ok {
+	if store.Len() != 0 {
 		t.Error("store must stay empty below MinGateTokens")
 	}
 	report, err := shadow.Replay(0.35)
@@ -340,7 +342,8 @@ func TestPipeline_MinGateTokensSkipsScoring(t *testing.T) {
 	if got.Tripwire != "" {
 		t.Errorf("Tripwire = %q, want empty", got.Tripwire)
 	}
-	if _, ok := store.Get("elide-1"); !ok {
+	// The single-segment output is one run stored under its content id.
+	if _, ok := store.Get(ContentID(output, "Bash", "r")); !ok {
 		t.Error("store must hold the elided original once the token gate is disabled")
 	}
 }

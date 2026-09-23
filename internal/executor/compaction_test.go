@@ -164,9 +164,13 @@ func TestExecuteToolCalls_CompactionEnabledRelocatesAndExpandRetrieves(t *testin
 	}
 
 	dumped := callTool(t, sess, "call_1", "large_dump", "{}")
-	if !strings.Contains(dumped, "[[elided id=elide-1 lines=") ||
-		!strings.Contains(dumped, "[[elided id=elide-2 lines=") {
-		t.Errorf("history tool result missing elided pointers:\n%s", dumped)
+	// Four non-adjacent paragraphs score below the threshold: four runs, four
+	// content-addressed pointers (r:<8hex>) with line ranges.
+	if got := strings.Count(dumped, "[[elided id=r:"); got != 4 {
+		t.Errorf("history tool result carries %d content-id pointers, want 4:\n%s", got, dumped)
+	}
+	if !strings.Contains(dumped, " lines=") {
+		t.Errorf("history tool result pointers missing the line ranges:\n%s", dumped)
 	}
 	if !strings.Contains(dumped, "PARA-1-SECRET") || !strings.Contains(dumped, "PARA-3-SECRET") {
 		t.Errorf("history tool result lost a high-scoring segment:\n%s", dumped)
@@ -178,20 +182,47 @@ func TestExecuteToolCalls_CompactionEnabledRelocatesAndExpandRetrieves(t *testin
 		t.Errorf("history tool result missing the expand trailer:\n%s", dumped)
 	}
 
+	// The elided original sits in the store under its content id — derived
+	// exactly as the pipeline does: ContentID(runText, salt=toolName, "r").
+	segs := compaction.SegmentSegments(output, 0)
+	seg2ID := compaction.ContentID(segs[1].Text, "large_dump", "r")
+	if _, ok := store.Get(seg2ID); !ok {
+		t.Errorf("store must hold seg-2 under its content id %s", seg2ID)
+	}
+
 	// The expand tool retrieves the elided original from the shared store —
 	// and its own result must not be re-compacted (no new scoring requests).
 	before := hits(t, counter)
-	expanded := callTool(t, sess, "call_2", "expand", `{"id":"elide-1"}`)
+	expanded := callTool(t, sess, "call_2", "expand", `{"id":"`+seg2ID+`"}`)
 	if hits(t, counter) != before {
 		t.Errorf("expand result was re-compacted: %d new scoring requests", hits(t, counter)-before)
 	}
-	// elide-1 is seg-2: paragraph 2 plus its trailing blank-line separator.
-	want := compaction.SegmentSegments(output, 0)[1].Text
+	// seg-2 is paragraph 2 plus its trailing blank-line separator.
+	want := segs[1].Text
 	if expanded != want {
-		t.Errorf("expand(elide-1) = %q, want the stored original %q", truncateForTest(expanded), truncateForTest(want))
+		t.Errorf("expand(%s) = %q, want the stored original %q", seg2ID, truncateForTest(expanded), truncateForTest(want))
 	}
 
-	// Unknown ids produce the documented error result.
+	// The byte-for-byte inverse: reconstructing the history result (trailer
+	// stripped) restores the tool's raw output. evenBelowOddAbove elides the
+	// even segments: seg-2, seg-4, seg-6, seg-8 — none adjacent, so four
+	// single-segment runs in segment order.
+	ids := []string{
+		compaction.ContentID(segs[1].Text, "large_dump", "r"),
+		compaction.ContentID(segs[3].Text, "large_dump", "r"),
+		compaction.ContentID(segs[5].Text, "large_dump", "r"),
+		compaction.ContentID(segs[7].Text, "large_dump", "r"),
+	}
+	trailer := "\n\n4 segments elided — use the expand tool with the elided ids to retrieve originals (" + strings.Join(ids, ", ") + ")."
+	compacted := strings.TrimSuffix(dumped, trailer)
+	if compacted == dumped {
+		t.Fatalf("history result missing the expand trailer with the elided ids:\n%s", dumped)
+	}
+	if restored := compaction.Reconstruct(compacted, store); restored != output {
+		t.Errorf("Reconstruct(history result) is not byte-for-byte:\n got %q\nwant %q", truncateForTest(restored), truncateForTest(output))
+	}
+
+	// Unknown ids produce the documented error result — legacy id shapes too.
 	unknown := callTool(t, sess, "call_3", "expand", `{"id":"elide-999"}`)
 	if !strings.Contains(unknown, "unknown elided id") {
 		t.Errorf("expand(unknown id) = %q, want the unknown-id error result", unknown)
@@ -280,7 +311,7 @@ func TestExecuteToolCalls_CompactionFailOpenAndSmallResults(t *testing.T) {
 	if got != output {
 		t.Errorf("fail-open must keep the original result, got:\n%s", truncateForTest(got))
 	}
-	if _, ok := store.Get("elide-1"); ok {
+	if store.Len() != 0 {
 		t.Error("fail-open must not store elided originals")
 	}
 
