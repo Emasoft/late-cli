@@ -81,6 +81,11 @@ const (
 // only, never change agent behavior.
 const DefaultCompactionMode = CompactionModeShadow
 
+// DefaultJevAutocompactPercent is the context-usage percentage at which the
+// JEV auto-compaction trigger fires when config.json does not set
+// jev-autocompact-percent (or sets an invalid value).
+const DefaultJevAutocompactPercent = 99
+
 // Config represents the application configuration.
 type Config struct {
 	EnabledTools        map[string]bool `json:"enabled_tools"`
@@ -140,6 +145,17 @@ type Config struct {
 	// warn and fall back to DefaultCompactionMode (see
 	// ResolveCompactionMode).
 	CompactionMode string `json:"compaction-mode,omitempty"`
+
+	// JevAutocompact enables the automatic full-history context compaction
+	// (the /jev-compact-context flow): when the focused agent's context
+	// usage crosses JevAutocompactPercent of the context window, the TUI
+	// runs one compaction pass. Default false.
+	JevAutocompact bool `json:"jev-autocompact,omitempty"`
+
+	// JevAutocompactPercent is that threshold percentage. 0 (unset) means
+	// DefaultJevAutocompactPercent; values outside 1-100 are invalid and
+	// resolve back to the default with a warning (see ResolveAutocompact).
+	JevAutocompactPercent int `json:"jev-autocompact-percent,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -392,6 +408,29 @@ func ResolveCompactionMode(cfg *Config) (mode string, warning string) {
 	return DefaultCompactionMode,
 		fmt.Sprintf("ignoring invalid config.json compaction-mode %q; using %q",
 			cfg.CompactionMode, DefaultCompactionMode)
+}
+
+// ResolveAutocompact returns the effective JEV auto-compaction switch and
+// threshold percentage, mirroring ResolveCompactionThreshold's invalid-value
+// pattern: percent 0 (unset) means DefaultJevAutocompactPercent, values in
+// 1-100 are honored as-is, and anything else falls back to the default with
+// a warning. The switch is a plain boolean: absent (false) means the
+// auto-trigger never fires.
+func ResolveAutocompact(cfg *Config) (enabled bool, percent int, warning string) {
+	if cfg == nil {
+		return false, DefaultJevAutocompactPercent, ""
+	}
+	percent = DefaultJevAutocompactPercent
+	switch {
+	case cfg.JevAutocompactPercent >= 1 && cfg.JevAutocompactPercent <= 100:
+		percent = cfg.JevAutocompactPercent
+	case cfg.JevAutocompactPercent == 0:
+		// Unset: keep the default.
+	default:
+		warning = fmt.Sprintf("ignoring invalid config.json jev-autocompact-percent %d; using %d",
+			cfg.JevAutocompactPercent, DefaultJevAutocompactPercent)
+	}
+	return cfg.JevAutocompact, percent, warning
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

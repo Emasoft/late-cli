@@ -20,14 +20,14 @@ type Pipeline struct {
 	// now is the clock for shadow-log timestamps; a var solely for tests.
 	now func() time.Time
 
-	// Relocation state (stage 2). relocMu guards the armed store, the
-	// elision threshold, and the per-pipeline elide-id counter: one pipeline
-	// is shared by the root agent and every subagent, whose tool calls run
-	// concurrently.
+	// Relocation state (stage 2). relocMu guards the armed store and the
+	// elision threshold: one pipeline is shared by the root agent and every
+	// subagent, whose tool calls run concurrently. The elide-id counter
+	// lives in the Store itself so the session's history compaction shares
+	// the same id space (Store.NextID).
 	relocMu   sync.Mutex
 	reloc     *Store
 	threshold float64
-	nextElide int
 }
 
 // PipelineOptions tunes the pipeline; zero values are production defaults.
@@ -55,6 +55,18 @@ func NewPipeline(backend ResolvedBackend, apiKey string, shadow *ShadowLog, opts
 		max = DefaultMaxSegChars
 	}
 	return &Pipeline{client: c, shadow: shadow, maxSegChars: max, now: time.Now}
+}
+
+// HistoryScorer exposes the pipeline's decision client as the scorer for
+// full-history compaction: session.CompactContext scores history segments
+// against the ongoing task with the same client — and the same retry and
+// fail-open contract — the tool-output path uses. A nil pipeline yields nil;
+// callers treat that as "compaction unavailable".
+func (p *Pipeline) HistoryScorer() *DecisionClient {
+	if p == nil {
+		return nil
+	}
+	return p.client
 }
 
 // SegmentScores is the result of scoring one tool output.

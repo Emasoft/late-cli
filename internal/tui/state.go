@@ -6,6 +6,7 @@ import (
 	"late/internal/common"
 	"late/internal/config"
 	"late/internal/git"
+	"late/internal/session"
 	"strings"
 	"time"
 
@@ -65,6 +66,7 @@ var AvailableCommands = []CommandDef{
 	{Name: "/compose", Description: "Compose a message with an editor"},
 	{Name: "/help", Description: "Show help and shortcuts"},
 	{Name: "/infobar", Description: "Toggle the info bar footer"},
+	{Name: "/jev-compact-context", Description: "Compact the conversation context with Jev"},
 	{Name: "/log", Description: "View git commit log"},
 	{Name: "/model", Description: "Select AI model for agents"},
 	{Name: "/new", Description: "Start fresh conversation"},
@@ -162,7 +164,22 @@ type AppState struct {
 	// status as a silent safety net; recovery is announced separately by
 	// the dedicated RecoveryEvent. Empty means the agent is not retrying.
 	RetryVerb string
+
+	// AutocompactDisarmed records that the JEV auto-compaction trigger
+	// already fired for this agent's current crossing of the threshold. It
+	// re-arms (clears) once usage falls below (percent-9)% of the context
+	// window — typically right after a compaction shrank the history — or
+	// when /new starts a fresh conversation.
+	AutocompactDisarmed bool
 }
+
+// CompactionRunner runs one full-history context-compaction pass on the
+// session behind the TUI: session.CompactContext with the compaction
+// pipeline's scoring client and the shared elide store, persisting the
+// mutated history when the run mutates (shadow runs only report).
+// cmd/late/main.go wires the live session; tests inject stubs. A nil
+// Model.Compactor means compaction is unavailable.
+type CompactionRunner func(ctx context.Context) (session.CompactionReport, error)
 
 // SkillsInfo summarizes the agent skills discovered at startup (user +
 // project skills directories, the same source executor.RegisterTools uses to
@@ -224,6 +241,24 @@ type Model struct {
 	// every rendered transcript block that carries a message timestamp is
 	// prefixed with its [HH:MM:SS] render of the recorded receive time.
 	ShowTimestamps bool
+
+	// JEV history compaction (the /jev-compact-context command and the
+	// auto-trigger). Compactor is nil when compaction is unavailable —
+	// compaction-mode off, or no System One backend resolved — and the
+	// command then reports the unavailable status instead of running.
+	Compactor CompactionRunner
+
+	// JevAutocompact enables the auto-trigger; JevAutocompactPercent is the
+	// context-usage percentage that fires it (config jev-autocompact +
+	// jev-autocompact-percent, resolved via config.ResolveAutocompact in
+	// NewModel).
+	JevAutocompact        bool
+	JevAutocompactPercent int
+
+	// CompactionRunning is the shared in-flight guard: exactly one
+	// CompactContext run (manual command or auto-trigger) may execute at a
+	// time. Set when the run is dispatched, cleared by compactionResultMsg.
+	CompactionRunning bool
 
 	// Double-click copy & Toast tracking
 	LastClickX      int
