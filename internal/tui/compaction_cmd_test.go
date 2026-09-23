@@ -137,7 +137,7 @@ func TestJevCompactContextCommandDispatchesRun(t *testing.T) {
 	if done.CompactionRunning {
 		t.Fatal("the result message must clear the in-flight guard")
 	}
-	if got := done.GetAgentState(done.Focused.ID()).StatusText; got != "compacted: saved ~25 tokens (2 segments elided)" {
+	if got := done.GetAgentState(done.Focused.ID()).StatusText; got != "compacted: saved ~25 tokens, 2 segments elided (scored 0/0 messages)" {
 		t.Fatalf("StatusText = %q, want the saved report", got)
 	}
 	if runs != 1 {
@@ -153,13 +153,26 @@ func TestCompactionResultStatuses(t *testing.T) {
 	}{
 		{
 			name: "shadow run",
-			msg:  compactionResultMsg{report: session.CompactionReport{ShadowOnly: true, TokensSaved: 500, SegmentsElided: 7}},
-			want: "shadow report: would save ~500 tokens (enable compaction-mode to apply)",
+			msg: compactionResultMsg{report: session.CompactionReport{
+				ShadowOnly: true, TokensSaved: 500, SegmentsElided: 7,
+				MessagesScanned: 8, MessagesScored: 8,
+			}},
+			want: "shadow report: would save ~500 tokens, 7 segments elided (scored 8/8 messages; enable compaction-mode to apply)",
 		},
 		{
 			name: "scorer failure",
 			msg:  compactionResultMsg{err: fmt.Errorf("scorer down")},
-			want: "compaction failed: scorer down",
+			want: "compaction failed after scoring 0/0 messages: scorer down",
+		},
+		{
+			// A mid-walk wholesale failure: the status says how far the
+			// scoring got before it stopped (the honesty requirement).
+			name: "scorer failure mid-walk",
+			msg: compactionResultMsg{
+				report: session.CompactionReport{MessagesScanned: 12, MessagesScored: 5},
+				err:    fmt.Errorf("scorer down"),
+			},
+			want: "compaction failed after scoring 5/12 messages: scorer down",
 		},
 	}
 	for _, tc := range cases {
@@ -211,8 +224,9 @@ func TestJevCompactContextEndToEnd(t *testing.T) {
 
 	updated, _ := m.Update(result)
 	next := updated.(Model)
-	want := fmt.Sprintf("compacted: saved ~%d tokens (%d segments elided)",
-		result.report.TokensSaved, result.report.SegmentsElided)
+	want := fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)",
+		result.report.TokensSaved, result.report.SegmentsElided,
+		result.report.MessagesScored, result.report.MessagesScanned)
 	if got := next.GetAgentState(next.Focused.ID()).StatusText; got != want {
 		t.Fatalf("StatusText = %q, want %q", got, want)
 	}

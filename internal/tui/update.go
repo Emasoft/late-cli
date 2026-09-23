@@ -448,11 +448,16 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 		s := m.GetAgentState(m.Focused.ID())
 		switch {
 		case msg.err != nil:
-			s.StatusText = fmt.Sprintf("compaction failed: %v", msg.err)
+			s.StatusText = fmt.Sprintf("compaction failed after scoring %d/%d messages: %v",
+				msg.report.MessagesScored, msg.report.MessagesScanned, msg.err)
 		case msg.report.ShadowOnly:
-			s.StatusText = fmt.Sprintf("shadow report: would save ~%d tokens (enable compaction-mode to apply)", msg.report.TokensSaved)
+			s.StatusText = fmt.Sprintf("shadow report: would save ~%d tokens, %d segments elided (scored %d/%d messages; enable compaction-mode to apply)",
+				msg.report.TokensSaved, msg.report.SegmentsElided,
+				msg.report.MessagesScored, msg.report.MessagesScanned)
 		default:
-			s.StatusText = fmt.Sprintf("compacted: saved ~%d tokens (%d segments elided)", msg.report.TokensSaved, msg.report.SegmentsElided)
+			s.StatusText = fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)",
+				msg.report.TokensSaved, msg.report.SegmentsElided,
+				msg.report.MessagesScored, msg.report.MessagesScanned)
 		}
 		m.updateViewport()
 		return m, nil
