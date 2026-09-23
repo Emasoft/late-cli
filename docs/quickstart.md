@@ -179,6 +179,22 @@ Late can keep oversized tool outputs out of the orchestrator's context. Pick a s
 
 Scoring is fail-open: any backend error keeps the original tool output. Segments below `--compaction-threshold` (default `0.35`) are elided; `compaction-threshold-percent` in `config.json` sets the context level the info bar reports headroom for.
 
+### Full-History Compaction (`/jev-compact-context`)
+
+`/jev-compact-context` in the TUI compacts the whole conversation, not just tool outputs: every message after a frozen prefix (the first quarter of the history, so the system prompt and earliest exchanges stay byte-identical for prompt caching) is segmented and Jev-scored against the ongoing task. Low-scoring segments are replaced in place with `[[elided …]]` pointer lines and their originals move to the store, where the `expand` tool retrieves them on demand; user messages are never compacted. The command requires `compaction-mode` ≠ `off`; under `shadow` it runs report-only, showing what a real run would save without touching history.
+
+### Auto-Compaction (`jev-autocompact`)
+
+```json
+{
+  "jev-autocompact": true,
+  "jev-autocompact-percent": 99
+}
+```
+
+* `jev-autocompact` (bool, default `false`) — when enabled and the context usage crosses the percent, the same compaction runs automatically.
+* `jev-autocompact-percent` (default `99`, valid range 1–100) — the context-usage percentage that fires it. The trigger runs once per crossing and re-arms after compaction shrinks usage back down (or when `/new` starts a fresh conversation).
+
 ---
 
 ## Tool Approval
