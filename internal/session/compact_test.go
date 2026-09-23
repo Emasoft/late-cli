@@ -1431,3 +1431,70 @@ func TestCompactionHighWaterResetPaths(t *testing.T) {
 		}
 	})
 }
+
+// authScorer stands in for a decision backend that rejected the API key: it
+// returns the typed compaction auth error wrapped exactly the way
+// compaction.DecisionClient.ScoreBatch wraps one (an errors.Join of
+// *ItemScoreError values around a *compaction.Error) alongside a complete
+// fail-open score map — the shape the poisoned client synthesizes.
+type authScorer struct {
+	calls int
+}
+
+func (a *authScorer) ScoreBatch(_ context.Context, _ string, items map[string]compaction.Item) (map[string]float64, error) {
+	a.calls++
+	scores := make(map[string]float64, len(items))
+	errs := make([]error, 0, len(items))
+	for id := range items {
+		scores[id] = keepScoreFallback
+		errs = append(errs, &compaction.ItemScoreError{
+			ItemID: id,
+			Err: &compaction.Error{
+				Kind:   compaction.KindAuth,
+				Status: 401,
+				Op:     "score-batch",
+				Err:    errors.New("bad or missing API key"),
+			},
+		})
+	}
+	return scores, errors.Join(errs...)
+}
+
+// TestCompactContextAuthErrorStopsWalk: a typed auth failure (the reference's
+// JevAuthError — 401/403, a bad or missing API key) ends the walk on the
+// first message: no later message can score either, so the walk must not
+// fire one doomed scorer call per message. The error keeps the typed class
+// for the caller, and the report says how far the walk got.
+func TestCompactContextAuthErrorStopsWalk(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	scorer := &authScorer{}
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err == nil {
+		t.Fatal("CompactContext() error = nil, want the typed auth error")
+	}
+
+	// The walk stopped on the first candidate (index 4, after the 3-message
+	// frozen prefix): exactly one scorer call, nothing scored, nothing
+	// rewritten, nothing advanced.
+	if scorer.calls != 1 {
+		t.Errorf("scorer calls = %d, want 1 (auth stops the walk immediately)", scorer.calls)
+	}
+	if report.MessagesScored != 0 {
+		t.Errorf("MessagesScored = %d, want 0", report.MessagesScored)
+	}
+	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 {
+		t.Errorf("an aborted walk must rewrite nothing, got %+v", report)
+	}
+	if !strings.Contains(err.Error(), "stopped after 0 messages") {
+		t.Errorf("error %v should say the walk stopped after 0 messages", err)
+	}
+	var ae *compaction.Error
+	if !errors.As(err, &ae) || ae.Kind != compaction.KindAuth {
+		t.Errorf("error = %v, want a *compaction.Error of KindAuth through the join", err)
+	}
+	if s.CompactionHighWater() != 0 {
+		t.Errorf("CompactionHighWater = %d, want 0 (a mid-walk abort must not advance the mark)", s.CompactionHighWater())
+	}
+}
