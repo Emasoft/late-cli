@@ -575,6 +575,20 @@ func (m *Model) statusBarView() string {
 
 	var leftItems []string
 
+	// Breadcrumb path from the root down to the focused agent. Computed before
+	// the left-section segments are assembled: the focused-agent label below is
+	// suppressed when the full chain renders (the breadcrumbs already name the
+	// focused agent) and the breadcrumb block reuses the same parts.
+	var pathParts []string
+	curr := m.Focused
+	for curr != nil {
+		pathParts = append([]string{curr.ID()}, pathParts...)
+		curr = curr.Parent()
+	}
+	if len(pathParts) <= 1 && m.Focused != nil && m.Root != nil && m.Focused.ID() != m.Root.ID() {
+		pathParts = []string{m.Root.ID(), m.Focused.ID()}
+	}
+
 	// State (far left)
 	var statePart string
 	statusText := s.StatusText
@@ -595,6 +609,23 @@ func (m *Model) statusBarView() string {
 	}
 	leftItems = append(leftItems, statePart)
 
+	// Focused agent label: always name the focused agent. The root agent has no
+	// breadcrumb chain, so without this the status bar showed no agent name or
+	// type at all for the orchestrator. A focused subagent is covered by its
+	// breadcrumb chain instead (no duplicate label).
+	if m.Focused != nil && len(pathParts) <= 1 {
+		id := m.Focused.ID()
+		isRoot := m.Focused == m.Root || (m.Root != nil && id == m.Root.ID())
+		label := agentTypeForID(id)
+		if isRoot || label == "orchestrator" || id == common.MainAgentID || id == "main" {
+			label = "orchestrator"
+		} else if label == "" {
+			label = id
+		}
+		focusedAgentPart := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Background(appBgColor).Render(label)
+		leftItems = append(leftItems, focusedAgentPart)
+	}
+
 	// Branch or CWD (whisper-muted, unobtrusive context)
 	if m.ShowCWD {
 		if m.GitBranch != "" {
@@ -610,16 +641,8 @@ func (m *Model) statusBarView() string {
 		}
 	}
 
-	// Breadcrumbs (on the left, shown when focused on a subagent)
-	var pathParts []string
-	curr := m.Focused
-	for curr != nil {
-		pathParts = append([]string{curr.ID()}, pathParts...)
-		curr = curr.Parent()
-	}
-	if len(pathParts) <= 1 && m.Focused != nil && m.Root != nil && m.Focused.ID() != m.Root.ID() {
-		pathParts = []string{m.Root.ID(), m.Focused.ID()}
-	}
+	// Breadcrumbs (on the left, shown when focused on a subagent); the path
+	// parts are computed above alongside the focused-agent label.
 	if len(pathParts) > 1 {
 		var styledParts []string
 		for i, id := range pathParts {
