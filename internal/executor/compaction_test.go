@@ -226,6 +226,89 @@ func TestExecuteToolCalls_CompactionEnabledRelocatesAndExpandRetrieves(t *testin
 	}
 }
 
+// TestExecuteToolCalls_CompactionFileBackedStoreSurvivesReopen is the Step
+// 12 end-to-end: enabled mode with the store backed by a real JSONL file.
+// The elided original is retrievable in-session, carries its full record
+// metadata (tool origin, kind, segment ids, summary, tokens), and — the gap
+// this step closes — is still retrievable from a freshly reopened store,
+// so [[elided …]] pointers in a persisted session no longer dangle after a
+// restart.
+func TestExecuteToolCalls_CompactionFileBackedStoreSurvivesReopen(t *testing.T) {
+	srv, _ := stubDecisionsServer(t, evenBelowOddAbove)
+	storePath := filepath.Join(t.TempDir(), "compaction-store.jsonl")
+	store, err := compaction.OpenStore(storePath)
+	if err != nil {
+		t.Fatalf("OpenStore() error = %v", err)
+	}
+	pipeline := compaction.NewPipeline(
+		compaction.ResolvedBackend{Backend: compaction.Backend{Name: "test", URL: srv.URL, Model: "jev-latest"}, APIKey: "k"},
+		"k", nil, compaction.PipelineOptions{})
+	pipeline.EnableRelocation(store, 0.35)
+	SetToolResultCompactor(pipeline)
+	t.Cleanup(func() { SetToolResultCompactor(nil) })
+
+	sess := newCompactionSession(t, store)
+	output := largeDumpOutput(8)
+	callTool(t, sess, "call_1", "large_dump", "{}")
+
+	segs := compaction.SegmentSegments(output, 0)
+	seg2ID := compaction.ContentID(segs[1].Text, "large_dump", "r")
+
+	// The record carries the pipeline's metadata, not just the text.
+	rec, ok := store.GetRecord(seg2ID)
+	if !ok {
+		t.Fatalf("store must hold a record for %s", seg2ID)
+	}
+	if rec.Kind != compaction.RecordKindElidedSegment {
+		t.Errorf("Kind = %q, want %q", rec.Kind, compaction.RecordKindElidedSegment)
+	}
+	if rec.Origin != (compaction.Origin{Source: "tool:large_dump", Ref: "", Turn: 0}) {
+		t.Errorf("Origin = %+v, want {tool:large_dump  0}", rec.Origin)
+	}
+	if len(rec.SegmentIDs) != 1 || rec.SegmentIDs[0] != "seg-2" {
+		t.Errorf("SegmentIDs = %v, want [seg-2]", rec.SegmentIDs)
+	}
+	if rec.Tokens != segs[1].Tokens {
+		t.Errorf("Tokens = %d, want %d", rec.Tokens, segs[1].Tokens)
+	}
+	if want := compaction.Summarise(segs[1].Text, compaction.SummaryMaxChars); rec.Summary != want {
+		t.Errorf("Summary = %q, want the pointer summary %q", rec.Summary, want)
+	}
+
+	// Touch the expand counter the way the expand path will (Step 13).
+	if !store.Touch(seg2ID, true, false) {
+		t.Fatal("Touch on a stored record must report found")
+	}
+
+	// REOPEN — the restart/resume case every in-memory build failed: the
+	// persisted record must resolve for both the raw read side and the
+	// expand tool wired against the reopened store.
+	reopened, err := compaction.OpenStore(storePath)
+	if err != nil {
+		t.Fatalf("reopen OpenStore() error = %v", err)
+	}
+	if text, ok := reopened.Get(seg2ID); !ok || text != segs[1].Text {
+		t.Errorf("reopened Get(%s) = (%q, %v), want the stored original", seg2ID, truncateForTest(text), ok)
+	}
+	rec2, ok := reopened.GetRecord(seg2ID)
+	if !ok {
+		t.Fatalf("reopened store must hold the record for %s", seg2ID)
+	}
+	if rec2.ExpandCount != 1 {
+		t.Errorf("reopened ExpandCount = %d, want 1 (the touch survives reload)", rec2.ExpandCount)
+	}
+	if rec2.Origin != rec.Origin || rec2.Kind != rec.Kind || rec2.Tokens != rec.Tokens || rec2.Summary != rec.Summary ||
+		len(rec2.SegmentIDs) != 1 || rec2.SegmentIDs[0] != "seg-2" {
+		t.Errorf("reopened record = %+v, want the original metadata %+v", rec2, rec)
+	}
+
+	sess2 := newCompactionSession(t, reopened)
+	expanded := callTool(t, sess2, "call_3", "expand", `{"id":"`+seg2ID+`"}`)
+	if expanded != segs[1].Text {
+		t.Errorf("expand after reopen = %q, want the stored original %q", truncateForTest(expanded), truncateForTest(segs[1].Text))
+	}
+}
+
 // TestExecuteToolCalls_CompactionShadowMode: shadow mode scores and logs but
 // the history result is byte-identical to the tool's output.
 func TestExecuteToolCalls_CompactionShadowMode(t *testing.T) {

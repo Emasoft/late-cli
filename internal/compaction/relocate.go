@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"late/internal/common"
 )
@@ -224,81 +223,6 @@ type CompactResult struct {
 	Tripwire string
 }
 
-// Store holds the original text of elided runs, keyed by pointer id, so the
-// expand tool can retrieve what compaction removed. It is safe for
-// concurrent use: the root agent and every subagent share one store.
-//
-// Ids are content-addressed for runs produced by this pipeline
-// (ContentID, "r:<8hex>"); the legacy counter (NextID, "elide-<n>") remains
-// only so pointers minted by older builds still resolve. Put is idempotent:
-// storing under an id that already exists keeps the first record — two
-// compactions of identical text share one record instead of duplicating it,
-// and legacy ids, being unique per NextID call, never collide anyway.
-type Store struct {
-	mu        sync.Mutex
-	originals map[string]string
-	next      int
-}
-
-// NewStore returns an empty original-text store.
-func NewStore() *Store {
-	return &Store{originals: make(map[string]string)}
-}
-
-// Get returns the original text stored for id. A nil store — or an unknown
-// id — reports ( "", false ); the expand tool turns the miss into an
-// "unknown elided id" error result.
-func (s *Store) Get(id string) (string, bool) {
-	if s == nil {
-		return "", false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	text, ok := s.originals[id]
-	return text, ok
-}
-
-// Put stores text under id. Idempotent: an existing id keeps its first
-// record (see the Store doc). A nil store is a no-op.
-func (s *Store) Put(id, text string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.originals == nil {
-		s.originals = make(map[string]string)
-	}
-	if _, exists := s.originals[id]; exists {
-		return
-	}
-	s.originals[id] = text
-}
-
-// Len reports how many records the store holds (tests and diagnostics).
-func (s *Store) Len() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.originals)
-}
-
-// NextID mints the next legacy elide-pointer id ("elide-<n>", 1-based).
-// New pointers are content-addressed and never mint ids; the counter exists
-// only so pre-content-id stores keep minting distinct legacy keys. A nil
-// store returns "".
-func (s *Store) NextID() string {
-	if s == nil {
-		return ""
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.next++
-	return fmt.Sprintf("elide-%d", s.next)
-}
-
 // EnableRelocation arms stage 2 on the pipeline: from now on
 // CompactToolOutput elides segments whose score is strictly below threshold
 // into store and replaces each run of them with [[elided …]] pointers.
@@ -424,22 +348,38 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 			return
 		}
 		var text strings.Builder
+		segIDs := make([]string, 0, len(run))
 		for _, seg := range run {
 			text.WriteString(seg.Text)
+			segIDs = append(segIDs, seg.ID)
 		}
 		runText := text.String()
 		id := ContentID(runText, toolName, contentIDPrefix)
-		store.Put(id, runText)
 		tokens := 0
 		for _, seg := range run {
 			tokens += seg.Tokens
 		}
+		summary := Summarise(runText, SummaryMaxChars)
+		// The record carries what the reference attaches to every stored
+		// run (store.py Record): its origin — "tool:<name>", the only
+		// surface this path knows — token count, pointer summary, and the
+		// contributing segment ids the outcomes ledger attributes back to.
+		// Turn stays 0: turn plumbing does not exist yet.
+		store.PutRecord(Record{
+			ID:         id,
+			Text:       runText,
+			Kind:       RecordKindElidedSegment,
+			Origin:     Origin{Source: OriginSourceToolPrefix + toolName},
+			Tokens:     tokens,
+			Summary:    summary,
+			SegmentIDs: segIDs,
+		})
 		e := ElidedSegment{
 			ID:       id,
 			Lines:    [2]int{run[0].LineStart, run[len(run)-1].LineEnd},
 			Tokens:   tokens,
 			Segments: len(run),
-			Summary:  Summarise(runText, SummaryMaxChars),
+			Summary:  summary,
 			Text:     runText,
 		}
 		out.Elided = append(out.Elided, e)
