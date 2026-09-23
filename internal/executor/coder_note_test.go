@@ -18,6 +18,9 @@ import (
 // way RegisterTools does (as *tool.ShellTool).
 func harnessSession(t *testing.T) *session.Session {
 	t.Helper()
+	// These tests add tool results to history, which persists the session
+	// meta sidecar into the global sessions dir — redirect it to a temp dir.
+	isolateSessionDir(t)
 	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
 	histPath := filepath.Join(t.TempDir(), "history.json")
 	sess := session.New(c, histPath, nil, "", true)

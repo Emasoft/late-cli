@@ -28,6 +28,13 @@ import (
 // returns, i.e. the only sends that ever waited were the guaranteed-delivery
 // terminal ones.
 func TestBaseOrchestrator_ExecuteDoesNotDeadlockWhenEventConsumerStalls(t *testing.T) {
+	// Execute completes a full turn, whose commit persists the .meta.json
+	// sidecar into the global sessions dir — redirect it to the temp dir.
+	tmpDir := t.TempDir()
+	originalSessionDir := session.SessionDir
+	session.SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+
 	const chunkCount = 150
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -47,7 +54,6 @@ func TestBaseOrchestrator_ExecuteDoesNotDeadlockWhenEventConsumerStalls(t *testi
 	}))
 	defer ts.Close()
 
-	tmpDir := t.TempDir()
 	historyPath := filepath.Join(tmpDir, "session.json")
 	initial := []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("goal")},

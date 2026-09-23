@@ -110,6 +110,9 @@ func evenBelowOddAbove(ref string) float64 {
 // registered, mirroring main()'s enabled-mode wiring.
 func newCompactionSession(t *testing.T, store *compaction.Store) *session.Session {
 	t.Helper()
+	// callTool commits tool results to history, which persists the session
+	// meta sidecar into the global sessions dir — redirect it to a temp dir.
+	isolateSessionDir(t)
 	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
 	sess := session.New(c, filepath.Join(t.TempDir(), "history.json"), nil, "", true)
 	sess.Registry.Register(largeDumpTool{output: largeDumpOutput(8)})
