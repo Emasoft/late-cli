@@ -27,9 +27,25 @@ import (
 //
 // Invariants (the upstream jev-compaction design):
 //
-//   - Frozen prefix: the first max(1, len(history)/4) messages are never
-//     compacted, so the prompt-cache anchor — the system prompt at index 0
-//     plus the earliest exchanges — stays byte-identical across compactions.
+//   - Frozen prefix: the work walk starts at index max(high-water mark,
+//     max(1, len(history)/4)) and never below it, so the prompt-cache
+//     anchor — the system prompt at index 0 plus the earliest exchanges —
+//     stays byte-identical across compactions. The high-water mark is the
+//     per-session, monotonic message index every completed mutating walk
+//     has covered; it persists in the session meta sidecar
+//     (CompactionHighWater), so the prefix is append-only across runs AND
+//     restarts: it never shrinks, and messages below it are never scored or
+//     rewritten. A walk that would mutate a message below the mark (a stale
+//     mark over a shrunken history) fails loudly with ErrFrozenPrefix and
+//     changes nothing — the reference's FrozenPrefixError analog.
+//   - Pointer-bearing messages are final: any message whose content carries
+//     an [[elided …]] pointer (compaction.FindPointers) is skipped
+//     entirely — never re-segmented, never re-scored, never rewritten — so
+//     an earlier run's pointers cannot be nested or invalidated.
+//   - Only a completing mutating walk advances the high-water mark (to the
+//     history length it covered): shadow runs mutate nothing and report
+//     only, mid-walk scorer aborts leave the mark where it was, and a
+//     failed mark persistence rolls the in-memory advance back.
 //   - User messages are never compacted; assistant and tool-result contents
 //     are. Assistant ToolCalls are structurally required and are never
 //     touched: only Content shrinks.
@@ -55,6 +71,14 @@ import (
 // The scorer and the store are passed in (dependency injection): the session
 // never constructs the compaction pipeline — the TUI/main holds it and hands
 // CompactContext its scoring client and original-text store.
+//
+// ErrFrozenPrefix is the fail-loud sentinel for a frozen-prefix violation:
+// a walk asked to score or rewrite a message below the persisted high-water
+// mark. Like the reference's FrozenPrefixError it fires before anything is
+// changed — a violating run leaves the history, the store, and the mark
+// exactly as they were.
+var ErrFrozenPrefix = errors.New("compaction: would mutate the frozen prefix")
+
 const (
 	// minCompactChars is the content size above which a post-frozen-prefix
 	// assistant or tool-result message becomes a compaction candidate. It is
@@ -242,9 +266,12 @@ type CompactionReport struct {
 // returned error is non-nil when the scorer reported failures: a walk that
 // completed on fail-open scores joins those scorer errors at the end, and a
 // walk that had to stop (no usable scores for a message) reports how far it
-// got. The report covers everything completed either way, and
-// already-rewritten messages stay rewritten; persistence is the caller's job
-// (SaveHistory).
+// got. A walk that would mutate a message below the persisted high-water
+// mark fails with ErrFrozenPrefix before changing anything. The report covers
+// everything completed either way, and already-rewritten messages stay
+// rewritten; history persistence is the caller's job (SaveHistory), while a
+// completing mutating run persists the advanced high-water mark itself
+// (SessionMeta.CompactionHighWater).
 func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, store ElideStore, opts CompactionOptions) (CompactionReport, error) {
 	var report CompactionReport
 	if scorer == nil {
@@ -260,7 +287,22 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	}
 	report.ShadowOnly = opts.ShadowOnly
 
-	frozen := frozenPrefix(len(s.History), opts.FrozenPercent)
+	// The frozen prefix is append-only: it starts at the persisted high-water
+	// mark — every completed mutating walk covered the history below it, so
+	// those bytes are the prompt-cache anchor — and only grows to the
+	// count-based floor, never shrinks.
+	mark := s.CompactionHighWater()
+	if mark > len(s.History) {
+		// The mark outlives the history it froze (a stale sidecar over a
+		// truncated history). Any progress would rewrite below-mark
+		// messages; fail loudly and change nothing — the reference's
+		// FrozenPrefixError analog.
+		return report, fmt.Errorf("compaction: high-water mark %d is beyond the %d-message history: %w", mark, len(s.History), ErrFrozenPrefix)
+	}
+	frozen := max(mark, frozenPrefix(len(s.History), opts.FrozenPercent))
+	// startLen is the history length this walk covers: a completing walk
+	// advances the mark to it (never mid-walk, never in shadow mode).
+	startLen := len(s.History)
 	report.MessagesScanned = len(s.History) - frozen
 
 	report.TokensBefore = historyMessageTokens(s.History)
@@ -283,7 +325,19 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	var walkErrs []error
 
 	for i := frozen; i < len(s.History); i++ {
+		// Unreachable while frozen >= mark holds (it is how frozen is
+		// computed); fail loudly rather than silently mutate the anchor if
+		// that computation ever regresses.
+		if i < mark {
+			return report, fmt.Errorf("compaction: message %d sits below the high-water mark %d: %w", i, mark, ErrFrozenPrefix)
+		}
 		msg := &s.History[i]
+		// Already-elided messages are final: their pointers stand in history
+		// and their originals live in the store. Re-scoring one would let a
+		// pointer line become segment text and nest new pointers.
+		if len(compaction.FindPointers(msg.Content.Text)) > 0 {
+			continue
+		}
 		if !compactableContent(msg) {
 			continue
 		}
@@ -412,6 +466,18 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	}
 
 	report.TokensSaved = report.TokensBefore - report.TokensAfter
+	// The walk reached the end of history: a mutating run freezes everything
+	// it covered by advancing the mark to the run-start length and persisting
+	// it (shadow runs mutate nothing and report only; a mid-walk abort
+	// returned above without advancing). A failed persistence rolls the
+	// in-memory advance back and surfaces here — the next run re-walks the
+	// uncovered tail, where pointer-bearing messages are skipped, so nothing
+	// is ever rewritten twice.
+	if !opts.ShadowOnly && startLen > mark {
+		if err := s.UpdateCompactionHighWater(startLen); err != nil {
+			walkErrs = append(walkErrs, fmt.Errorf("persisting compaction high-water mark: %w", err))
+		}
+	}
 	// Fail-open scorer errors accumulated along the walk surface here; a
 	// clean walk returns a nil error.
 	return report, errors.Join(walkErrs...)

@@ -1080,3 +1080,354 @@ func TestCompactStoreRoundTrip(t *testing.T) {
 		t.Error("Get(elide-999) = hit; want a miss")
 	}
 }
+
+// --- Step 14: frozen-prefix high-water mark ----------------------------------
+
+// (Step 14a) Two consecutive runs on a growing history: the second run
+// rewrites NOTHING below the first run's high-water mark — the frozen prefix
+// is append-only, the prompt-cache anchor never moves — and only the new
+// messages are candidates.
+func TestCompactContextHighWaterFreezesAcrossRuns(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+
+	first, err := s.CompactContext(context.Background(), elideFirstScorer(segs), NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("first CompactContext() error = %v", err)
+	}
+	if got, want := s.CompactionHighWater(), len(fixture); got != want {
+		t.Fatalf("high-water after the first run = %d, want %d", got, want)
+	}
+	afterFirst := mustJSON(t, s.History)
+	if first.MessagesCompacted != len(segs) {
+		t.Fatalf("first run MessagesCompacted = %d, want %d", first.MessagesCompacted, len(segs))
+	}
+
+	// Grow the history: a fresh question answered with two compactable
+	// messages. Everything below the mark must stay exactly as run 1 left it.
+	growth := []client.ChatMessage{
+		cmpStamped(cmpUser("Second question"), 12),
+		cmpStamped(cmpAssistant(cmpLongText("eps", 3)), 13),              // new candidate
+		cmpStamped(cmpToolResult("call_13", cmpLongText("zeta", 3)), 14), // new candidate
+		cmpStamped(cmpAssistant("A short new answer."), 15),
+	}
+	s.History = append(s.History, growth...)
+	full := append(append([]client.ChatMessage{}, fixture...), growth...)
+	scorer2 := elideFirstScorer(fixtureSegments(t, full))
+
+	second, err := s.CompactContext(context.Background(), scorer2, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("second CompactContext() error = %v", err)
+	}
+
+	// The walk starts at the mark (12), not at the count-based prefix
+	// (16/4 = 4): only the four new messages were examined.
+	if second.MessagesScanned != len(growth) {
+		t.Errorf("second run MessagesScanned = %d, want %d (the walk starts at the mark)", second.MessagesScanned, len(growth))
+	}
+	// Nothing below the mark was rewritten — the first run's bytes stand.
+	if got, want := mustJSON(t, s.History[:len(fixture)]), afterFirst; got != want {
+		t.Errorf("the second run rewrote the frozen prefix:\n got %s\nwant %s", truncateRunes(got, 300), truncateRunes(want, 300))
+	}
+	// Only the two new candidates reached the scorer.
+	if scorer2.calls != 2 {
+		t.Errorf("second run scorer calls = %d, want 2 (the new candidates only)", scorer2.calls)
+	}
+	if second.MessagesScored != 2 || second.MessagesCompacted != 2 || second.SegmentsElided != 2 {
+		t.Errorf("second run report = %+v, want the two new candidates scored and rewritten", second)
+	}
+	for _, idx := range []int{13, 14} {
+		if !strings.Contains(s.History[idx].Content.Text, "[[elided id=") {
+			t.Errorf("the new candidate at index %d was not compacted", idx)
+		}
+	}
+	// The mark advanced to the length the second walk covered.
+	if got, want := s.CompactionHighWater(), len(full); got != want {
+		t.Errorf("high-water after the second run = %d, want %d", got, want)
+	}
+}
+
+// (Step 14a) The mark survives save/reload: a completed run persists it
+// through the session meta sidecar, a session rebuilt the way the resume
+// path does (history from disk, mark from the sidecar) starts its next walk
+// at the persisted mark, and its own advance persists again.
+func TestCompactContextHighWaterPersistsAcrossSaveReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldSessionDir := SessionDir
+	SessionDir = func() (string, error) { return tmpDir, nil }
+	defer func() { SessionDir = oldSessionDir }()
+
+	historyPath := filepath.Join(tmpDir, "session-hw.json")
+	fixture := defaultFixture()
+	s := New(nil, historyPath, cloneHistory(fixture), "", false)
+
+	if _, err := s.CompactContext(context.Background(), elideFirstScorer(fixtureSegments(t, fixture)), NewCompactStore(), CompactionOptions{}); err != nil {
+		t.Fatalf("first CompactContext() error = %v", err)
+	}
+	if got, want := s.CompactionHighWater(), len(fixture); got != want {
+		t.Fatalf("in-memory high-water = %d, want %d", got, want)
+	}
+	// History persistence stays the caller's job (the production runner
+	// saves right after the run) — save so the reload below sees the
+	// compacted history the mark describes.
+	if err := SaveHistory(historyPath, s.History); err != nil {
+		t.Fatalf("SaveHistory() error = %v", err)
+	}
+	meta, err := LoadSessionMeta("session-hw")
+	if err != nil || meta == nil {
+		t.Fatalf("LoadSessionMeta(session-hw) = (%v, %v)", meta, err)
+	}
+	if meta.CompactionHighWater != len(fixture) {
+		t.Fatalf("persisted CompactionHighWater = %d, want %d", meta.CompactionHighWater, len(fixture))
+	}
+
+	// Reload the way cmd/late resumes: history from disk, mark from the
+	// sidecar — then grow and compact again.
+	reloaded, err := LoadHistory(historyPath)
+	if err != nil {
+		t.Fatalf("LoadHistory() error = %v", err)
+	}
+	resumed := New(nil, historyPath, reloaded, "", false)
+	resumed.SetCompactionHighWater(meta.CompactionHighWater)
+
+	growth := []client.ChatMessage{
+		cmpStamped(cmpUser("Second question"), 12),
+		cmpStamped(cmpAssistant(cmpLongText("eps", 3)), 13),
+	}
+	for _, msg := range growth {
+		if err := resumed.AddMessage(msg); err != nil {
+			t.Fatalf("AddMessage() error = %v", err)
+		}
+	}
+	full := append(append([]client.ChatMessage{}, fixture...), growth...)
+	scorer2 := elideFirstScorer(fixtureSegments(t, full))
+
+	second, err := resumed.CompactContext(context.Background(), scorer2, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("second CompactContext() error = %v", err)
+	}
+	if second.MessagesScanned != len(growth) {
+		t.Errorf("second run MessagesScanned = %d, want %d (the resumed mark froze the old history)", second.MessagesScanned, len(growth))
+	}
+	if scorer2.calls != 1 {
+		t.Errorf("second run scorer calls = %d, want 1 (the new candidate only)", scorer2.calls)
+	}
+	if got, want := resumed.CompactionHighWater(), len(full); got != want {
+		t.Errorf("high-water after the resumed run = %d, want %d", got, want)
+	}
+	meta, err = LoadSessionMeta("session-hw")
+	if err != nil || meta == nil {
+		t.Fatalf("LoadSessionMeta(session-hw) after the resumed run = (%v, %v)", meta, err)
+	}
+	if meta.CompactionHighWater != len(full) {
+		t.Errorf("persisted CompactionHighWater after the resumed run = %d, want %d", meta.CompactionHighWater, len(full))
+	}
+}
+
+// (Step 14b) A stale mark over a shrunken history: the persisted mark
+// outlives the history it froze (the sidecar was written when the history
+// held 12 messages; the history file now holds 6). The only way to make
+// progress would be to rewrite below-mark messages, so the run fails loudly
+// with ErrFrozenPrefix and changes nothing — the reference's
+// FrozenPrefixError analog.
+func TestCompactContextFrozenPrefixViolationFailsLoud(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	s.SetCompactionHighWater(len(fixture))
+	s.History = s.History[:6]
+	snapshot := mustJSON(t, s.History)
+
+	report, err := s.CompactContext(context.Background(), elideFirstScorer(fixtureSegments(t, fixture)), NewCompactStore(), CompactionOptions{})
+	if !errors.Is(err, ErrFrozenPrefix) {
+		t.Fatalf("CompactContext() error = %v, want ErrFrozenPrefix", err)
+	}
+	if !strings.Contains(err.Error(), "high-water mark 12") || !strings.Contains(err.Error(), "6-message") {
+		t.Errorf("error %q does not name the stale mark and the shrunken history", err)
+	}
+	if got := mustJSON(t, s.History); got != snapshot {
+		t.Errorf("the violating run mutated history:\n got %s", truncateRunes(got, 300))
+	}
+	if got := s.CompactionHighWater(); got != len(fixture) {
+		t.Errorf("the violating run moved the mark to %d, want %d", got, len(fixture))
+	}
+	if report.MessagesScanned != 0 || report.MessagesScored != 0 || report.MessagesCompacted != 0 || report.SegmentsElided != 0 {
+		t.Errorf("the violating run reported work: %+v", report)
+	}
+}
+
+// (Step 14c) A pointer-bearing message is never re-scored: loaded with a
+// zero mark (e.g. a sidecar from before the high-water mark existed), a tool
+// result that already carries a final [[elided …]] pointer sits in the work
+// area — and must be skipped entirely (never re-segmented, never re-scored,
+// never rewritten), while the fresh candidate below it compacts as usual.
+func TestCompactContextNeverRescoresPointerBearingMessages(t *testing.T) {
+	pointer := compaction.FormatPointer(compaction.Pointer{
+		ID:      compaction.ContentID("the earlier run's elided original", "", "r"),
+		Lines:   &[2]int{1, 4},
+		Tokens:  12,
+		Summary: "earlier run's elided output",
+	})
+	pointerBearing := cmpLongText("kept", 3) + "\n" + pointer + "\n" + cmpLongText("tail", 3)
+	if n := len(compaction.FindPointers(pointerBearing)); n != 1 {
+		t.Fatalf("fixture sanity: FindPointers found %d pointers, want 1", n)
+	}
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("question"), 1),
+		cmpStamped(cmpTool(pointerBearing), 2),               // pointer-bearing candidate
+		cmpStamped(cmpAssistant(cmpLongText("fresh", 3)), 3), // control candidate
+		cmpStamped(cmpUser("follow-up"), 4),
+		cmpStamped(cmpAssistant("short"), 5),
+	}
+	s := newCompactSession(fixture)
+	store := NewCompactStore()
+	scorer := &stubScorer{fallback: 0.1} // everything scored would be elided
+
+	report, err := s.CompactContext(context.Background(), scorer, store, CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+
+	// Only the control candidate was scored — the pointer-bearing message,
+	// large and post-prefix as it is, never reached the scorer.
+	if scorer.calls != 1 {
+		t.Errorf("scorer calls = %d, want 1 (the pointer-bearing message must never be re-scored)", scorer.calls)
+	}
+	if got, want := s.History[2].Content.Text, pointerBearing; got != want {
+		t.Errorf("the pointer-bearing message was rewritten:\n got %q\nwant %q", truncateRunes(got, 200), truncateRunes(want, 200))
+	}
+	if !strings.Contains(s.History[3].Content.Text, "[[elided id=") {
+		t.Error("the control candidate was not compacted")
+	}
+	if report.MessagesScored != 1 || report.MessagesCompacted != 1 {
+		t.Errorf("report = %+v, want only the control candidate scored and rewritten", report)
+	}
+	// The store holds only the control's elided run: the fixture pointer's
+	// original was never re-stored.
+	if store.Len() != 1 {
+		t.Errorf("store holds %d records, want 1 (the control's run)", store.Len())
+	}
+	// A completing mutating run still advances the mark.
+	if got, want := s.CompactionHighWater(), len(fixture); got != want {
+		t.Errorf("high-water = %d, want %d", got, want)
+	}
+}
+
+// (Step 14d) Shadow runs report only: nothing was rewritten, so the mark
+// stays where it was and the next mutating run still walks the whole work
+// area.
+func TestCompactContextShadowDoesNotAdvanceHighWater(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+
+	report, err := s.CompactContext(context.Background(), elideFirstScorer(segs), NewCompactStore(), CompactionOptions{ShadowOnly: true})
+	if err != nil {
+		t.Fatalf("shadow CompactContext() error = %v", err)
+	}
+	if report.TokensSaved <= 0 || report.MessagesCompacted == 0 {
+		t.Fatalf("shadow report not populated: %+v", report)
+	}
+	if got := s.CompactionHighWater(); got != 0 {
+		t.Fatalf("shadow run advanced the high-water mark to %d, want 0", got)
+	}
+	if got, want := mustJSON(t, s.History), mustJSON(t, fixture); got != want {
+		t.Fatal("shadow run mutated history")
+	}
+
+	second, err := s.CompactContext(context.Background(), elideFirstScorer(segs), NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("mutating CompactContext() error = %v", err)
+	}
+	if second.MessagesScanned != len(fixture)-3 {
+		t.Errorf("mutating run MessagesScanned = %d, want %d (the shadow run froze nothing)", second.MessagesScanned, len(fixture)-3)
+	}
+	if got, want := s.CompactionHighWater(), len(fixture); got != want {
+		t.Errorf("mutating run high-water = %d, want %d", got, want)
+	}
+}
+
+// (Step 14d) A mid-walk abort (wholesale scorer failure) does not advance
+// the mark: the walk never reached the end of history.
+func TestCompactContextMidWalkAbortKeepsHighWater(t *testing.T) {
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("first question"), 1),
+		cmpStamped(cmpAssistant("first answer"), 2),
+		cmpStamped(cmpAssistant(cmpLongText("c1", 3)), 3),
+		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),
+		cmpStamped(cmpAssistant(cmpLongText("c3", 3)), 5),
+	}
+	s := newCompactSession(fixture)
+	scorer := elideFirstScorer(fixtureSegments(t, fixture))
+	scorer.err = errors.New("scorer down")
+	scorer.errOnCall = 3 // wholesale failure on the third candidate
+
+	if _, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{}); err == nil {
+		t.Fatal("CompactContext() error = nil, want the mid-walk failure")
+	}
+	if got := s.CompactionHighWater(); got != 0 {
+		t.Errorf("high-water after the abort = %d, want 0", got)
+	}
+}
+
+// (Step 14e) The reset paths adjust the mark: /new zeroes it (a fresh
+// conversation has no frozen prefix) and PopLastUserMessage clamps it to the
+// truncated length (the frozen prefix never outlives the history it froze) —
+// persisted by the pop's own metadata write.
+func TestCompactionHighWaterResetPaths(t *testing.T) {
+	t.Run("/new resets the mark to zero", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		oldSessionDir := SessionDir
+		SessionDir = func() (string, error) { return tmpDir, nil }
+		defer func() { SessionDir = oldSessionDir }()
+
+		s := New(nil, filepath.Join(tmpDir, "session-hw-new.json"), defaultFixture(), "", false)
+		s.SetCompactionHighWater(12)
+		if err := s.StartNewConversation(); err != nil {
+			t.Fatalf("StartNewConversation() error = %v", err)
+		}
+		if got := s.CompactionHighWater(); got != 0 {
+			t.Errorf("high-water after /new = %d, want 0", got)
+		}
+		// The fresh conversation's sidecar records the reset mark.
+		if got := s.GenerateSessionMeta().CompactionHighWater; got != 0 {
+			t.Errorf("fresh session meta CompactionHighWater = %d, want 0", got)
+		}
+	})
+
+	t.Run("PopLastUserMessage clamps and persists the mark", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		oldSessionDir := SessionDir
+		SessionDir = func() (string, error) { return tmpDir, nil }
+		defer func() { SessionDir = oldSessionDir }()
+
+		historyPath := filepath.Join(tmpDir, "session-hw-pop.json")
+		fixture := []client.ChatMessage{
+			cmpStamped(cmpSystem("system prompt"), 0),
+			cmpStamped(cmpAssistant("answer"), 1),
+			cmpStamped(cmpUser("last question"), 2),
+		}
+		if err := SaveHistory(historyPath, fixture); err != nil {
+			t.Fatalf("SaveHistory() error = %v", err)
+		}
+		s := New(nil, historyPath, cloneHistory(fixture), "", false)
+		s.SetCompactionHighWater(len(fixture))
+
+		popped, err := s.PopLastUserMessage()
+		if err != nil || !popped {
+			t.Fatalf("PopLastUserMessage() = (%v, %v), want (true, nil)", popped, err)
+		}
+		if got, want := s.CompactionHighWater(), len(fixture)-1; got != want {
+			t.Errorf("high-water after pop = %d, want %d", got, want)
+		}
+		meta, err := LoadSessionMeta("session-hw-pop")
+		if err != nil || meta == nil {
+			t.Fatalf("LoadSessionMeta(session-hw-pop) = (%v, %v)", meta, err)
+		}
+		if meta.CompactionHighWater != len(fixture)-1 {
+			t.Errorf("persisted CompactionHighWater after pop = %d, want %d", meta.CompactionHighWater, len(fixture)-1)
+		}
+	})
+}
