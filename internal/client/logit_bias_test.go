@@ -254,8 +254,8 @@ func TestLogitBiasPrecedence(t *testing.T) {
 
 	// User overrides via --logit-bias
 	userOverrides := map[string]int{
-		"13428": 50,    // Collision: user override must take precedence over dynamic default
-		"99999": -50,   // Additional user token
+		"13428": 50,  // Collision: user override must take precedence over dynamic default
+		"99999": -50, // Additional user token
 	}
 
 	merged := MergeLogitBiases(dynamicDefaults, userOverrides)

@@ -274,6 +274,10 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 			return
 		}
 
+		if req.OnConnect != nil {
+			req.OnConnect()
+		}
+
 		// lastRead is the last time the response body made real progress (a
 		// full line was consumed). It is seeded here at response time and
 		// updated after every scanned line below — never while blocked inside

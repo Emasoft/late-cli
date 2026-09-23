@@ -14,8 +14,10 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// FrameRate controls screen assembly and Bubble Tea's terminal refresh rate.
-const FrameRate = 120
+// FrameRate controls Bubble Tea's terminal refresh rate and transcript
+// presentation. At 60 FPS, a fast local model can display each token without
+// the visible coalescing caused by a lower presentation cadence.
+const FrameRate = 60
 
 const transcriptFrameInterval = time.Second / FrameRate
 
@@ -36,6 +38,7 @@ type transcriptState struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 }
 
 type transcriptRenderedMsg struct {
@@ -48,6 +51,7 @@ type transcriptRenderedMsg struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 	rows         []string
 	blocks       []RenderBlock
 	cache        map[string][]string
@@ -65,6 +69,7 @@ type transcriptEntry struct {
 	content   string
 	reasoning string
 	labels    []transcriptLabel
+	timestamp string // RFC3339 receive time from the history message; empty for ephemeral/legacy entries
 }
 
 const (
@@ -244,6 +249,7 @@ func (m *Model) applyTranscript(result transcriptRenderedMsg) {
 	t.thinking, t.thinkingLine = result.thinking, result.thinkingLine
 	t.activities = result.activities
 	t.width, t.theme = result.width, result.theme
+	t.timestamps = result.timestamps
 	t.offset = min(t.offset, max(0, len(t.rows)-m.Viewport.Height()))
 	s.RenderBlocks = result.blocks
 	if result.partial {
@@ -263,7 +269,11 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		styles = LateTheme
 	}
 	width := max(1, m.Viewport.Width())
-	if t.width != width || t.theme != string(styles) {
+	// The timestamps flag participates in the render-invalidation checks:
+	// toggling /timestamps must discard cached block rows so prefixes are
+	// added or removed on the next pass.
+	timestampsChanged := t.timestamps != m.ShowTimestamps
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		t.dirty = true
 	}
 	if t.busy || !t.dirty {
@@ -273,10 +283,11 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	t.dirty = false
 	id, generation := m.Focused.ID(), t.generation
 	oldCache := t.cache
-	if t.width != width || t.theme != string(styles) {
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		oldCache = nil
 	}
 	theme := string(styles)
+	showTimestamps := m.ShowTimestamps
 	entries := make([]transcriptEntry, 0, len(m.Focused.History())+3)
 	toolWidth := toolCallWidth(width)
 	toolLabels := func(calls []client.ToolCall, active bool) []transcriptLabel {
@@ -341,7 +352,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			labels = append(labels, item)
 		}
-		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels}
+		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels, timestamp: msg.Timestamp}
 		if len(msg.AttachedFiles) > 0 {
 			names := make([]string, len(msg.AttachedFiles))
 			for j, f := range msg.AttachedFiles {
@@ -354,7 +365,14 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	if (s.State == StateStreaming || s.State == StateThinking) && !s.StreamingState.Completed {
 		active := s.StreamingState
 		if active.Content != "" || active.ReasoningContent != "" || len(active.ToolCalls) > 0 {
-			entries = append(entries, transcriptEntry{active: true, index: len(history), role: "assistant", content: active.Content, reasoning: active.ReasoningContent, labels: toolLabels(active.ToolCalls, true)})
+			labels := toolLabels(active.ToolCalls, true)
+			if s.RetryVerb != "" {
+				labels = append(labels, transcriptLabel{
+					rendered: statusWarningStyle.Render("  ↳ interrupted · retrying..."),
+					activity: "interrupted · retrying...",
+				})
+			}
+			entries = append(entries, transcriptEntry{active: true, index: len(history), role: "assistant", content: active.Content, reasoning: active.ReasoningContent, labels: labels})
 		} else if !hasActiveTool {
 			entries = append(entries, transcriptEntry{index: len(history), role: "thinking", content: "thinking..."})
 		}
@@ -371,6 +389,9 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: "**Context Limit Warning**\n\nOver 90% of the context is used. Press Enter again to proceed, or start a new session."})
 	}
 	if s.Error != nil {
+		if s.StreamingState.Content != "" {
+			entries = append(entries, transcriptEntry{index: len(history), role: "assistant", content: s.StreamingState.Content})
+		}
 		entries = append(entries, transcriptEntry{index: -1, role: "error", content: transcriptError(s.Error)})
 	} else if m.Err != nil {
 		entries = append(entries, transcriptEntry{index: -1, role: "error", content: transcriptError(m.Err)})
@@ -393,6 +414,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	answerStyle := assistantReplyStyle(width)
 	return func() tea.Msg {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
+		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if err != nil {
 				return source
@@ -403,12 +425,42 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			return out
 		}
-		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
+		// Completed Markdown blocks cannot be changed by later stream deltas, so
+		// retain their fully styled output. Only the unfinished tail is parsed on
+		// each update, preserving immediate Markdown without repeatedly rendering
+		// the complete growing response.
+		streamingMarkdown := func(source string) string {
+			complete, tail := splitStreamingMarkdown(source)
+			parts := make([]string, 0, len(complete)+1)
+			for _, block := range complete {
+				key := "stream-markdown:" + block
+				cached, ok := oldCache[key]
+				if !ok {
+					cached = []string{answerStyle.Render(strings.Trim(markdown(block), "\r\n"))}
+				}
+				result.cache[key] = cached
+				parts = append(parts, cached[0])
+			}
+			if text := strings.TrimLeft(tail, "\r\n"); text != "" {
+				parts = append(parts, answerStyle.Render(strings.Trim(markdown(text), "\r\n")))
+			}
+			return strings.Join(parts, "\n")
+		}
 		for _, entry := range entries {
-			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels)
+			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.timestamp)
 			rows, ok := oldCache[key]
 			if !ok {
 				parts := make([]string, 0, 4)
+				// The [HH:MM:SS] prefix is rendered as its own muted row at
+				// the start of user and assistant message blocks, from the
+				// receive time the session recorded when the message was
+				// added. Legacy messages without a timestamp stay unprefixed.
+				prefix := ""
+				if showTimestamps && entry.timestamp != "" {
+					if ts, err := time.Parse(time.RFC3339, entry.timestamp); err == nil {
+						prefix = attachmentStyle.Render("[" + ts.Format("15:04:05") + "]")
+					}
+				}
 				switch entry.role {
 				case "user":
 					text := strings.TrimRight(entry.content, "\r\n")
@@ -423,9 +475,15 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 								block += "\n" + label.rendered
 							}
 						}
+						if prefix != "" {
+							parts = append(parts, prefix)
+						}
 						parts = append(parts, "\n"+userPromptStyle(width).Render(block)+"\n")
 					}
 				case "assistant":
+					if prefix != "" {
+						parts = append(parts, prefix)
+					}
 					if entry.reasoning != "" {
 						header := headerStyle.Render("· thinking")
 						if entry.active && entry.content == "" && len(entry.labels) == 0 {
@@ -437,7 +495,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						if entry.reasoning != "" {
 							parts = append(parts, "")
 						}
-						parts = append(parts, answerStyle.Render(strings.Trim(markdown(entry.content), "\r\n")))
+						if entry.active {
+							parts = append(parts, streamingMarkdown(entry.content))
+						} else {
+							rendered := markdown(entry.content)
+							parts = append(parts, answerStyle.Render(strings.Trim(rendered, "\r\n")))
+						}
 					}
 					if len(entry.labels) > 0 {
 						if len(parts) > 0 && parts[len(parts)-1] != "" {
@@ -515,6 +578,26 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		return result
 	}
+}
+
+// splitStreamingMarkdown returns stable blocks ending at blank lines outside
+// fenced code. Anything after the last safe boundary remains mutable. Keeping
+// an open fence in the tail is important because its closing delimiter changes
+// how the whole block must be rendered.
+func splitStreamingMarkdown(content string) (complete []string, tail string) {
+	inFence := false
+	lastSplit := 0
+	for i := 0; i < len(content); i++ {
+		if (i == 0 || content[i-1] == '\n') && i+3 <= len(content) && content[i:i+3] == "```" {
+			inFence = !inFence
+		}
+		if !inFence && i+1 < len(content) && content[i] == '\n' && content[i+1] == '\n' {
+			complete = append(complete, content[lastSplit:i+2])
+			lastSplit = i + 2
+			i++
+		}
+	}
+	return complete, content[lastSplit:]
 }
 
 func transcriptError(err error) string {

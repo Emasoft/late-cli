@@ -25,15 +25,16 @@ func newHelpTestFlagSet(t *testing.T) *flag.FlagSet {
 		def := name == "use-tools" || name == "enable-bash" || name == "enable-subagents"
 		fs.Bool(name, def, "usage of "+name)
 	}
-	strs := []string{"system-prompt", "system-prompt-file", "append-system-prompt", "theme", "prompt", "logit-bias", "subagent-logit-bias"}
+	strs := []string{"system-prompt", "system-prompt-file", "append-system-prompt", "theme", "prompt", "logit-bias", "subagent-logit-bias", "compaction-mode"}
 	for _, name := range strs {
 		fs.String(name, "", "usage of "+name)
 	}
 	fs.Int("subagent-max-turns", 500, "usage of subagent-max-turns")
 	fs.Int("max-stream-retries", 100, "usage of max-stream-retries")
 	fs.Duration("bash-timeout", 10*time.Minute, "usage of bash-timeout")
-	fs.Duration("subagent-timeout", 30*time.Minute, "usage of subagent-timeout")
+	fs.Duration("subagent-timeout", 24*time.Hour, "usage of subagent-timeout")
 	fs.Int("max-concurrent-llm-requests", 6, "usage of max-concurrent-llm-requests")
+	fs.Float64("compaction-threshold", 0.35, "usage of compaction-threshold")
 	return fs
 }
 

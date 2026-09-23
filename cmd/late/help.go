@@ -23,6 +23,7 @@ var flagGroups = []struct {
 	{"Model & streaming", []string{"logit-bias", "suppress-thinking-words", "max-stream-retries", "max-concurrent-llm-requests"}, ""},
 	{"Subagents", []string{"enable-subagents", "subagent-max-turns", "subagent-timeout", "subagent-logit-bias", "save-subagent-histories"}, ""},
 	{"Tools", []string{"use-tools", "enable-bash", "bash-timeout", "enable-images", "enable-sqz"}, ""},
+	{"Context compaction", []string{"compaction-mode", "compaction-threshold"}, ""},
 	{"Supervision & safety", []string{"ask-for-user-approval", "i-promise-i-have-backups-and-will-not-file-issues", "force-revaluate-dangerous-commands"},
 		"These three flags are mutually exclusive: pass at most one. The default\n  (ask-for-user-approval) can be changed by adding a \"permission-mode\"\n  entry to late's config.json with one of the values above."},
 }

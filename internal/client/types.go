@@ -27,6 +27,10 @@ type ChatMessage struct {
 	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"` // For tool responses
 	AttachedFiles    []string       `json:"-"`                      // Purely for UI display
+	// Timestamp records when the session appended the message to history
+	// (RFC3339). Optional: legacy history entries predate the field and
+	// render without a time prefix in the transcript.
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 type MessageContent struct {
@@ -147,6 +151,7 @@ type ChatCompletionRequest struct {
 	ToolChoice    any              `json:"tool_choice,omitempty"`
 	LogitBias     map[string]int   `json:"logit_bias,omitempty"`
 	ExtraBody     map[string]any   `json:"extra_body,omitempty"`
+	OnConnect     func()           `json:"-"`
 }
 
 type ChatCompletionResponse struct {

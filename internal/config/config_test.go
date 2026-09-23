@@ -982,6 +982,296 @@ func TestResolvePermissionMode(t *testing.T) {
 	}
 }
 
+func TestResolveCompactionThreshold(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         *Config
+		want        int
+		wantWarning []string
+	}{
+		{
+			name: "nil config uses default",
+			cfg:  nil,
+			want: DefaultCompactionThresholdPercent,
+		},
+		{
+			name: "unset uses default",
+			cfg:  &Config{},
+			want: DefaultCompactionThresholdPercent,
+		},
+		{
+			name: "valid value honored",
+			cfg:  &Config{CompactionThresholdPercent: 65},
+			want: 65,
+		},
+		{
+			name: "one is valid",
+			cfg:  &Config{CompactionThresholdPercent: 1},
+			want: 1,
+		},
+		{
+			name: "hundred is valid",
+			cfg:  &Config{CompactionThresholdPercent: 100},
+			want: 100,
+		},
+		{
+			name:        "negative value invalid",
+			cfg:         &Config{CompactionThresholdPercent: -5},
+			want:        DefaultCompactionThresholdPercent,
+			wantWarning: []string{"invalid", "-5"},
+		},
+		{
+			name:        "over hundred invalid",
+			cfg:         &Config{CompactionThresholdPercent: 250},
+			want:        DefaultCompactionThresholdPercent,
+			wantWarning: []string{"invalid", "250"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, warning := ResolveCompactionThreshold(tc.cfg)
+			if got != tc.want {
+				t.Fatalf("ResolveCompactionThreshold() = %d, want %d", got, tc.want)
+			}
+			if len(tc.wantWarning) == 0 {
+				if warning != "" {
+					t.Fatalf("warning = %q, want empty", warning)
+				}
+				return
+			}
+			if warning == "" {
+				t.Fatal("warning is empty, want a warning")
+			}
+			for _, substring := range tc.wantWarning {
+				if !strings.Contains(warning, substring) {
+					t.Fatalf("warning = %q, want it to contain %q", warning, substring)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveCompactionMode mirrors TestResolveCompactionThreshold: the
+// staged rollout modes validate to off|shadow|enabled, empty means the
+// default (shadow), and anything else warns and falls back to the default.
+func TestResolveCompactionMode(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         *Config
+		want        string
+		wantWarning []string
+	}{
+		{
+			name: "nil config uses default",
+			cfg:  nil,
+			want: DefaultCompactionMode,
+		},
+		{
+			name: "unset uses default",
+			cfg:  &Config{},
+			want: DefaultCompactionMode,
+		},
+		{
+			name: "off honored",
+			cfg:  &Config{CompactionMode: CompactionModeOff},
+			want: CompactionModeOff,
+		},
+		{
+			name: "shadow honored",
+			cfg:  &Config{CompactionMode: CompactionModeShadow},
+			want: CompactionModeShadow,
+		},
+		{
+			name: "enabled honored",
+			cfg:  &Config{CompactionMode: CompactionModeEnabled},
+			want: CompactionModeEnabled,
+		},
+		{
+			name:        "invalid value warns and falls back",
+			cfg:         &Config{CompactionMode: "aggressive"},
+			want:        DefaultCompactionMode,
+			wantWarning: []string{"invalid", "aggressive", DefaultCompactionMode},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, warning := ResolveCompactionMode(tc.cfg)
+			if got != tc.want {
+				t.Fatalf("ResolveCompactionMode() = %q, want %q", got, tc.want)
+			}
+			if len(tc.wantWarning) == 0 {
+				if warning != "" {
+					t.Fatalf("warning = %q, want empty", warning)
+				}
+				return
+			}
+			if warning == "" {
+				t.Fatal("warning is empty, want a warning")
+			}
+			for _, substring := range tc.wantWarning {
+				if !strings.Contains(warning, substring) {
+					t.Fatalf("warning = %q, want it to contain %q", warning, substring)
+				}
+			}
+		})
+	}
+
+	for _, valid := range []string{CompactionModeOff, CompactionModeShadow, CompactionModeEnabled} {
+		if !IsValidCompactionMode(valid) {
+			t.Errorf("IsValidCompactionMode(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{"", "Aggressive", "shadow ", "elided"} {
+		if IsValidCompactionMode(invalid) {
+			t.Errorf("IsValidCompactionMode(%q) = true, want false", invalid)
+		}
+	}
+}
+
+// TestLoadConfig_CompactionMode covers the config-file path: valid modes
+// parse through, invalid ones survive loading so ResolveCompactionMode can
+// warn and fall back to the default.
+func TestLoadConfig_CompactionMode(t *testing.T) {
+	t.Run("valid mode parses", func(t *testing.T) {
+		configRoot := t.TempDir()
+		setUserConfigEnv(t, configRoot)
+		configPath := lateConfigPath(t)
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, []byte(`{"enabled_tools": {"bash": true}, "compaction-mode": "enabled"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.CompactionMode != CompactionModeEnabled {
+			t.Fatalf("CompactionMode = %q, want %q", cfg.CompactionMode, CompactionModeEnabled)
+		}
+	})
+
+	t.Run("invalid mode warns via resolver", func(t *testing.T) {
+		configRoot := t.TempDir()
+		setUserConfigEnv(t, configRoot)
+		configPath := lateConfigPath(t)
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, []byte(`{"enabled_tools": {"bash": true}, "compaction-mode": "yolo"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		mode, warning := ResolveCompactionMode(cfg)
+		if mode != DefaultCompactionMode {
+			t.Fatalf("resolved mode = %q, want %q", mode, DefaultCompactionMode)
+		}
+		if !strings.Contains(warning, "yolo") || !strings.Contains(warning, DefaultCompactionMode) {
+			t.Fatalf("warning = %q, want it to name the invalid value and the fallback", warning)
+		}
+	})
+}
+
+// TestConfig_CompactionModeJSONRoundTrip: the field marshals under its
+// config key and stays omitted when unset.
+func TestConfig_CompactionModeJSONRoundTrip(t *testing.T) {
+	original := Config{CompactionMode: CompactionModeEnabled}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var decoded Config
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded.CompactionMode != CompactionModeEnabled {
+		t.Fatalf("CompactionMode after round trip = %q, want %q", decoded.CompactionMode, CompactionModeEnabled)
+	}
+
+	emptyData, err := json.Marshal(Config{})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(emptyData, &raw); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if _, ok := raw["compaction-mode"]; ok {
+		t.Fatalf("empty config should not marshal a compaction-mode key, got %s", emptyData)
+	}
+}
+
+func TestLoadConfig_ParsesInfoBarAndThresholdFields(t *testing.T) {
+	configRoot := t.TempDir()
+	setUserConfigEnv(t, configRoot)
+	configPath := lateConfigPath(t)
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	content := `{
+		"enabled_tools": {"bash": true},
+		"show-info-bar": true,
+		"compaction-threshold-percent": 65
+	}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if !cfg.ShowInfoBar {
+		t.Fatal("ShowInfoBar = false, want true")
+	}
+	if cfg.CompactionThresholdPercent != 65 {
+		t.Fatalf("CompactionThresholdPercent = %d, want 65", cfg.CompactionThresholdPercent)
+	}
+}
+
+func TestConfig_InfoBarAndThresholdJSONRoundTrip(t *testing.T) {
+	original := Config{ShowInfoBar: true, CompactionThresholdPercent: 65}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	var decoded Config
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !decoded.ShowInfoBar {
+		t.Fatal("ShowInfoBar after round trip = false, want true")
+	}
+	if decoded.CompactionThresholdPercent != 65 {
+		t.Fatalf("CompactionThresholdPercent after round trip = %d, want 65", decoded.CompactionThresholdPercent)
+	}
+
+	// Zero values must not emit keys (omitempty), keeping config.json clean
+	// for users who never touched the new settings.
+	emptyData, err := json.Marshal(Config{})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(emptyData, &raw); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	for _, key := range []string{"show-info-bar", "compaction-threshold-percent"} {
+		if _, ok := raw[key]; ok {
+			t.Fatalf("empty config should not marshal a %s key, got %s", key, emptyData)
+		}
+	}
+}
+
 func TestConfig_PermissionModeJSONRoundTrip(t *testing.T) {
 	original := Config{PermissionMode: PermissionModeUnsupervised}
 	data, err := json.Marshal(original)

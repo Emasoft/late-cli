@@ -18,6 +18,7 @@ type mockOrchestrator struct {
 	submitErr       error
 	supportsVision  bool
 	history         []client.ChatMessage
+	queuedMessages  []string
 }
 
 func (m *mockOrchestrator) ID() string { return "mock" }
@@ -36,7 +37,7 @@ func (m *mockOrchestrator) Events() <-chan common.Event              { return ni
 func (m *mockOrchestrator) History() []client.ChatMessage            { return m.history }
 func (m *mockOrchestrator) Context() context.Context                 { return context.Background() }
 func (m *mockOrchestrator) Middlewares() []common.ToolMiddleware     { return nil }
-func (m *mockOrchestrator) SetMiddlewares([]common.ToolMiddleware)    {}
+func (m *mockOrchestrator) SetMiddlewares([]common.ToolMiddleware)   {}
 func (m *mockOrchestrator) Registry() *common.ToolRegistry           { return nil }
 func (m *mockOrchestrator) SystemPrompt() string                     { return "" }
 func (m *mockOrchestrator) ToolDefinitions() []client.ToolDefinition { return nil }
@@ -46,7 +47,14 @@ func (m *mockOrchestrator) SetMaxTurns(int)                          {}
 func (m *mockOrchestrator) RefreshContextSize(context.Context)       {}
 func (m *mockOrchestrator) MaxTokens() int                           { return 100 }
 func (m *mockOrchestrator) SupportsVision() bool                     { return m.supportsVision }
-func (m *mockOrchestrator) QueuedMessages() []string                 { return nil }
+func (m *mockOrchestrator) QueuedMessages() []string {
+	return append([]string(nil), m.queuedMessages...)
+}
+func (m *mockOrchestrator) DrainQueuedMessages() []string {
+	q := m.queuedMessages
+	m.queuedMessages = nil
+	return q
+}
 
 type mockKey struct {
 	code rune

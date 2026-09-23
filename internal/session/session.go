@@ -111,25 +111,36 @@ func (s *Session) ExecuteTool(ctx context.Context, tc client.ToolCall) (string, 
 	return t.Execute(ctx, json.RawMessage(tc.Function.Arguments))
 }
 
+// appendMessage is the single path every Add* helper uses to record a
+// message: it stamps the message's receive time (RFC3339) unless the caller
+// supplied one, appends to history, and persists. The timestamp drives the
+// optional [HH:MM:SS] prefix in the TUI transcript; legacy history entries
+// that predate the field keep an empty Timestamp.
+func (s *Session) appendMessage(msg client.ChatMessage) error {
+	if msg.Timestamp == "" {
+		msg.Timestamp = time.Now().Format(time.RFC3339)
+	}
+	s.History = append(s.History, msg)
+	return s.saveAndNotify()
+}
+
 // AddToolResultMessage adds a tool response message to history.
 func (s *Session) AddToolResultMessage(toolCallID, content string) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:       "tool",
 		ToolCallID: toolCallID,
 		Content:    client.TextContent(content),
 	})
-	return s.saveAndNotify()
 }
 
 // AddAssistantMessageWithTools adds an assistant message with tool calls.
 func (s *Session) AddAssistantMessageWithTools(content string, reasoning string, toolCalls []client.ToolCall) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:             "assistant",
 		Content:          client.TextContent(content),
 		ReasoningContent: reasoning,
 		ToolCalls:        toolCalls,
 	})
-	return s.saveAndNotify()
 }
 
 func (s *Session) GetToolDefinitions() []client.ToolDefinition {
@@ -150,24 +161,23 @@ func (s *Session) GetToolDefinitions() []client.ToolDefinition {
 
 // AddUserMessage adds a user message to history and persists it.
 func (s *Session) AddUserMessage(content string) error {
-	s.History = append(s.History, client.ChatMessage{Role: "user", Content: client.TextContent(content)})
-	return s.saveAndNotify()
+	return s.appendMessage(client.ChatMessage{Role: "user", Content: client.TextContent(content)})
 }
 
-// AddMessage adds an arbitrary message to history and persists it.
+// AddMessage adds an arbitrary message to history and persists it. A caller
+// supplied Timestamp is preserved; otherwise the message is stamped like any
+// other add.
 func (s *Session) AddMessage(msg client.ChatMessage) error {
-	s.History = append(s.History, msg)
-	return s.saveAndNotify()
+	return s.appendMessage(msg)
 }
 
 // AddAssistantMessage adds an assistant message to history and persists it.
 func (s *Session) AddAssistantMessage(content, reasoning string) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:             "assistant",
 		Content:          client.TextContent(content),
 		ReasoningContent: reasoning,
 	})
-	return s.saveAndNotify()
 }
 
 // PopLastUserMessage removes the trailing user message from history and
@@ -245,7 +255,8 @@ func (s *Session) AppendToLastMessage(content, reasoning string) error {
 
 // StartStream initiates a streaming response.
 // It returns a standard Go channel for results and error.
-func (s *Session) StartStream(ctx context.Context, extraBody map[string]any) (<-chan common.StreamResult, <-chan error) {
+// An optional onConnect callback is called once HTTP 200 headers are received.
+func (s *Session) StartStream(ctx context.Context, extraBody map[string]any, onConnect ...func()) (<-chan common.StreamResult, <-chan error) {
 	outCh := make(chan common.StreamResult)
 	errCh := make(chan error, 1)
 
@@ -261,9 +272,15 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any) (<-
 	// intentionally left untouched.
 	messages = append(messages, SanitizeForRequest(s.History)...)
 
+	var onConn func()
+	if len(onConnect) > 0 && onConnect[0] != nil {
+		onConn = onConnect[0]
+	}
+
 	req := client.ChatCompletionRequest{
 		Messages:  messages,
 		ExtraBody: extraBody,
+		OnConnect: onConn,
 	}
 
 	if s.useTools {

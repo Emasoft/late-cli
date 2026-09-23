@@ -161,6 +161,26 @@ When Late creates subagents, each appears in its own tab while it works and disa
 
 ---
 
+## Info Bar & Timestamps
+
+* `/infobar` toggles a single-line footer under the status bar: Late version, project folder, focused model, context usage, running subagents, discovered skills, tokens to the compaction threshold, and session uptime.
+* `/timestamps` toggles `[HH:MM:SS]` prefixes on transcript message blocks.
+* Both toggles persist to `config.json` (`show-info-bar`, `show-timestamps`).
+
+---
+
+## Context Compaction
+
+Late can keep oversized tool outputs out of the orchestrator's context. Pick a stage with `--compaction-mode` (or `compaction-mode` in `config.json`):
+
+* `off` — no scoring, no logging.
+* `shadow` (default) — tool outputs are segmented and Jev-scored, and what *would* be elided is recorded to the shadow log (`~/.local/share/late/compaction-shadow.jsonl`). No behavior change.
+* `enabled` — tool outputs over 4000 characters are segmented and Jev-scored; low-scoring segments are elided into `[[elided …]]` pointers. The `expand` tool retrieves the original text on demand.
+
+Scoring is fail-open: any backend error keeps the original tool output. Segments below `--compaction-threshold` (default `0.35`) are elided; `compaction-threshold-percent` in `config.json` sets the context level the info bar reports headroom for.
+
+---
+
 ## Tool Approval
 
 Potentially destructive commands and file changes require approval unless you have already granted permission for that scope.

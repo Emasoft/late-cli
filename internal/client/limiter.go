@@ -51,6 +51,15 @@ func SetLLMConcurrency(n int) {
 	llmSlots = make(chan struct{}, n)
 }
 
+// AcquireLLMSlot is the exported form of acquireLLMSlot for sibling packages
+// that issue their own provider-visible LLM requests — today
+// internal/compaction's System One scoring client — so compaction/scoring
+// calls share the fleet concurrency bound instead of stampeding the
+// account-level limit in parallel with the agent's own traffic. The return
+// value follows acquireLLMSlot's contract: nil means unlimited or ctx ended
+// while queued (distinguish via ctx.Err()).
+func AcquireLLMSlot(ctx context.Context) func() { return acquireLLMSlot(ctx) }
+
 // acquireLLMSlot blocks until a slot is free or ctx is done. It returns a
 // release func that must be called exactly once when the request finishes;
 // the returned func is nil when the limiter is unlimited or when ctx ended

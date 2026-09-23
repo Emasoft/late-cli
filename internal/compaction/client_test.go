@@ -1,0 +1,621 @@
+package compaction
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"late/internal/client"
+)
+
+// capturedDecisionRequest mirrors the wire request so tests can assert the
+// protocol shape (model, state, per-item noul questions).
+type capturedDecisionRequest struct {
+	Model string `json:"model"`
+	State struct {
+		Task  string               `json:"task"`
+		Items map[string]stateItem `json:"items"`
+	} `json:"state"`
+	Questions map[string]decisionQuestion `json:"questions"`
+}
+
+// capturedRequest is one decoded request plus its auth headers.
+type capturedRequest struct {
+	Req         capturedDecisionRequest
+	Auth        string
+	Title       string
+	ContentType string
+	Path        string
+}
+
+// decisionsServer is a scripted decisions endpoint. Each attempt calls
+// handler with the 1-based attempt number and the decoded request and serves
+// the returned status and body. retryAfter, when non-empty, is set on every
+// non-200 response.
+type decisionsServer struct {
+	srv        *httptest.Server
+	retryAfter string
+	mu         sync.Mutex
+	got        []capturedRequest
+
+	handler func(attempt int, req capturedRequest) (int, string)
+}
+
+func newDecisionsServer(t *testing.T, handler func(attempt int, req capturedRequest) (int, string)) *decisionsServer {
+	t.Helper()
+	d := &decisionsServer{handler: handler}
+	d.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxDecisionResponseBytes))
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var cr capturedRequest
+		if err := json.Unmarshal(body, &cr.Req); err != nil {
+			t.Errorf("decode request body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		cr.Auth = r.Header.Get("Authorization")
+		cr.Title = r.Header.Get("X-Title")
+		cr.ContentType = r.Header.Get("Content-Type")
+		cr.Path = r.URL.Path
+
+		d.mu.Lock()
+		d.got = append(d.got, cr)
+		attempt := len(d.got)
+		d.mu.Unlock()
+
+		status, respBody := handler(attempt, cr)
+		if status != http.StatusOK && d.retryAfter != "" {
+			w.Header().Set("Retry-After", d.retryAfter)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, respBody)
+	}))
+	t.Cleanup(d.srv.Close)
+	return d
+}
+
+func (d *decisionsServer) requests() []capturedRequest {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]capturedRequest(nil), d.got...)
+}
+
+// answersBody builds a decisions response serving each ref its score.
+func answersBody(scores map[string]float64) string {
+	b, err := json.Marshal(map[string]any{"answers": scores, "usage": map[string]any{"input_tokens": 10, "output_tokens": 0}})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// echoHandler answers every request with a score derived from the item id
+// (ids "seg-N" score 0.01*N, kept inside [0,1] so clamping never kicks in),
+// so tests can verify round-tripping.
+func echoHandler(_ int, req capturedRequest) (int, string) {
+	scores := make(map[string]float64, len(req.Req.Questions))
+	for ref := range req.Req.Questions {
+		var n int
+		if _, err := fmt.Sscanf(ref, "seg-%d", &n); err == nil {
+			scores[ref] = float64(n) * 0.01
+		} else {
+			scores[ref] = 0.42
+		}
+	}
+	return http.StatusOK, answersBody(scores)
+}
+
+// fastClient builds a DecisionClient against the given URL with the retry
+// curve shrunk for tests, keeping the production attempt count unless
+// overridden (attempts <= 0 keeps the default of 4).
+func fastClient(url string, attempts int) *DecisionClient {
+	c := NewDecisionClient(ResolvedBackend{Backend: Backend{Name: "test", URL: url, Model: "jev-latest"}}, "test-key")
+	c.baseBackoff = time.Millisecond
+	c.maxBackoff = 2 * time.Millisecond
+	if attempts > 0 {
+		c.maxAttempts = attempts
+	}
+	return c
+}
+
+// TestScoreBatch_BatchesAboveProtocolCeiling: 33 items must split into two
+// requests of ≤32 questions each, with every item scored exactly once.
+func TestScoreBatch_BatchesAboveProtocolCeiling(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := fastClient(d.srv.URL+"/v1/systemone", 0)
+
+	items := make(map[string]Item, 33)
+	for i := 1; i <= 33; i++ {
+		items[fmt.Sprintf("seg-%d", i)] = Item{Text: fmt.Sprintf("paragraph %d", i), Tokens: 10}
+	}
+	scores, err := c.ScoreBatch(context.Background(), "Ship the release", items)
+	if err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+
+	reqs := d.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("got %d requests, want 2 (32-item ceiling)", len(reqs))
+	}
+	seen := map[string]bool{}
+	for i, r := range reqs {
+		if n := len(r.Req.Questions); n > MaxItemsPerRequest {
+			t.Errorf("request %d carried %d questions, want ≤%d", i+1, n, MaxItemsPerRequest)
+		}
+		if r.Req.Model != "jev-latest" {
+			t.Errorf("request %d model = %q, want jev-latest", i+1, r.Req.Model)
+		}
+		for ref := range r.Req.Questions {
+			if seen[ref] {
+				t.Errorf("item %s sent in more than one request", ref)
+			}
+			seen[ref] = true
+			q := r.Req.Questions[ref]
+			if q.Type != "noul" {
+				t.Errorf("item %s question type = %q, want noul", ref, q.Type)
+			}
+			wantPrompt := "Score 0.0-1.0 how essential this segment is for the ongoing task: Ship the release"
+			if q.Prompt != wantPrompt {
+				t.Errorf("item %s question prompt = %q, want %q", ref, q.Prompt, wantPrompt)
+			}
+			if _, ok := r.Req.State.Items[ref]; !ok {
+				t.Errorf("item %s has a question but no state entry", ref)
+			}
+		}
+	}
+	if len(seen) != 33 {
+		t.Errorf("total distinct questions = %d, want 33", len(seen))
+	}
+	if len(scores) != 33 {
+		t.Fatalf("got %d scores, want 33", len(scores))
+	}
+	for i := 1; i <= 33; i++ {
+		ref := fmt.Sprintf("seg-%d", i)
+		if want := float64(i) * 0.01; scores[ref] != want {
+			t.Errorf("scores[%s] = %v, want %v", ref, scores[ref], want)
+		}
+	}
+}
+
+// TestScoreBatch_PacksByTokenBudget: items whose combined tokens exceed the
+// 64k state+questions ceiling split across requests even under 32 items.
+func TestScoreBatch_PacksByTokenBudget(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := fastClient(d.srv.URL, 0)
+
+	// Three 30k-token items: two fit together under 64k, the third must
+	// start a new request.
+	items := map[string]Item{
+		"seg-1": {Text: "one", Tokens: 30_000},
+		"seg-2": {Text: "two", Tokens: 30_000},
+		"seg-3": {Text: "three", Tokens: 30_000},
+	}
+	scores, err := c.ScoreBatch(context.Background(), "task", items)
+	if err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	if got := len(d.requests()); got != 2 {
+		t.Fatalf("got %d requests, want 2 (token-budget packing)", got)
+	}
+	if len(scores) != 3 {
+		t.Errorf("got %d scores, want 3", len(scores))
+	}
+}
+
+// TestScoreBatch_OversizedItemSkipped: an item that cannot fit in any
+// request is skipped with an error and fail-opens to 1.0; the rest still
+// score and the oversized text never reaches the wire.
+func TestScoreBatch_OversizedItemSkipped(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := fastClient(d.srv.URL, 0)
+
+	items := map[string]Item{
+		"seg-1":    {Text: "small", Tokens: 100},
+		"seg-huge": {Text: "huge", Tokens: MaxStateTokens}, // alone busts the budget once overhead is added
+		"seg-2":    {Text: "small too", Tokens: 100},
+	}
+	scores, err := c.ScoreBatch(context.Background(), "task", items)
+	if err == nil {
+		t.Fatal("ScoreBatch() error = nil, want an oversized-item error")
+	}
+	var ise *ItemScoreError
+	if !errors.As(err, &ise) || ise.ItemID != "seg-huge" {
+		t.Fatalf("error = %v, want *ItemScoreError for seg-huge", err)
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("error %q should say the item is too large", err.Error())
+	}
+	if scores["seg-huge"] != keepScore {
+		t.Errorf("oversized item score = %v, want %v (fail-open)", scores["seg-huge"], keepScore)
+	}
+	if scores["seg-1"] != 0.01 || scores["seg-2"] != 0.02 {
+		t.Errorf("small items = %v/%v, want the echoHandler scores 0.01/0.02, not fail-open %v", scores["seg-1"], scores["seg-2"], keepScore)
+	}
+	for i, r := range d.requests() {
+		if _, ok := r.Req.State.Items["seg-huge"]; ok {
+			t.Errorf("request %d carried the oversized item", i+1)
+		}
+	}
+}
+
+// TestScoreBatch_RetryOn429HonorsRetryAfter: a 429 with Retry-After delays
+// the retry by at least the requested amount, and the retry succeeds.
+func TestScoreBatch_RetryOn429HonorsRetryAfter(t *testing.T) {
+	d := newDecisionsServer(t, func(attempt int, req capturedRequest) (int, string) {
+		if attempt == 1 {
+			return http.StatusTooManyRequests, `{"error": {"message": "slow down"}}`
+		}
+		return echoHandler(attempt, req)
+	})
+	// Retry-After is honored as a floor; the local backoff is shrunk to ~0,
+	// so the observed elapsed time proves the header was honored.
+	c := fastClient(d.srv.URL, 0)
+	c.baseBackoff = time.Millisecond
+	c.maxBackoff = time.Millisecond
+	d.retryAfter = "1"
+
+	start := time.Now()
+	scores, err := c.ScoreBatch(context.Background(), "task", map[string]Item{"seg-1": {Text: "x", Tokens: 5}})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	if scores["seg-1"] != 0.01 {
+		t.Errorf("scores[seg-1] = %v, want the echoHandler score 0.01 after the successful retry", scores["seg-1"])
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("retry happened after %v, want ≥ ~1s (Retry-After floor)", elapsed)
+	}
+	if got := len(d.requests()); got != 2 {
+		t.Errorf("got %d requests, want 2 (429 then success)", got)
+	}
+}
+
+// TestScoreBatch_NonRetryableStatusFailsFast: 401 must not be retried; all
+// items fail-open to 1.0 with one recorded error each.
+func TestScoreBatch_NonRetryableStatusFailsFast(t *testing.T) {
+	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
+		return http.StatusUnauthorized, `{"error": {"message": "bad key"}}`
+	})
+	c := fastClient(d.srv.URL, 4)
+
+	items := map[string]Item{
+		"seg-1": {Text: "a", Tokens: 5},
+		"seg-2": {Text: "b", Tokens: 5},
+	}
+	scores, err := c.ScoreBatch(context.Background(), "task", items)
+	if err == nil {
+		t.Fatal("ScoreBatch() error = nil, want a recorded failure")
+	}
+	if got := len(d.requests()); got != 1 {
+		t.Errorf("got %d requests, want 1 (401 is non-retryable)", got)
+	}
+	for ref := range items {
+		if scores[ref] != keepScore {
+			t.Errorf("scores[%s] = %v, want %v (fail-open)", ref, scores[ref], keepScore)
+		}
+	}
+	var itemErrs int
+	for _, e := range strings.Split(err.Error(), "\n") {
+		if strings.Contains(e, "score item \"seg-") {
+			itemErrs++
+		}
+	}
+	if itemErrs != 2 {
+		t.Errorf("error reports %d item failures, want 2 (one per item): %v", itemErrs, err)
+	}
+}
+
+// TestScoreBatch_ProviderOutageFailsOpen: a hard outage retries the full
+// budget and then keeps everything, with one recorded error per item.
+func TestScoreBatch_ProviderOutageFailsOpen(t *testing.T) {
+	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
+		return http.StatusServiceUnavailable, `{"error": {"message": "overloaded"}}`
+	})
+	c := fastClient(d.srv.URL, 4)
+
+	items := map[string]Item{
+		"seg-1": {Text: "a", Tokens: 5},
+		"seg-2": {Text: "b", Tokens: 5},
+	}
+	scores, err := c.ScoreBatch(context.Background(), "task", items)
+	if err == nil {
+		t.Fatal("ScoreBatch() error = nil, want a recorded failure")
+	}
+	if got := len(d.requests()); got != 4 {
+		t.Errorf("got %d requests, want 4 (full attempt budget)", got)
+	}
+	for ref := range items {
+		if scores[ref] != keepScore {
+			t.Errorf("scores[%s] = %v, want %v (fail-open keeps everything on outage)", ref, scores[ref], keepScore)
+		}
+	}
+	for _, ref := range []string{"seg-1", "seg-2"} {
+		if !strings.Contains(err.Error(), fmt.Sprintf("score item %q", ref)) {
+			t.Errorf("error %v missing the failure for %q", err, ref)
+		}
+	}
+}
+
+// TestScoreBatch_AuthAndTitleHeaders asserts Bearer auth and the
+// jev-compaction X-Title marker on every request.
+func TestScoreBatch_AuthAndTitleHeaders(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := fastClient(d.srv.URL, 0)
+
+	if _, err := c.ScoreBatch(context.Background(), "task", map[string]Item{"seg-1": {Text: "x", Tokens: 5}}); err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	for i, r := range d.requests() {
+		if r.Auth != "Bearer test-key" {
+			t.Errorf("request %d Authorization = %q, want %q", i+1, r.Auth, "Bearer test-key")
+		}
+		if r.Title != "jev-compaction" {
+			t.Errorf("request %d X-Title = %q, want %q", i+1, r.Title, "jev-compaction")
+		}
+		if r.ContentType != "application/json" {
+			t.Errorf("request %d Content-Type = %q, want application/json", i+1, r.ContentType)
+		}
+	}
+}
+
+// TestScoreBatch_NoKeySkipsAuthHeader: an empty key must not produce a bare
+// "Bearer " header.
+func TestScoreBatch_NoKeySkipsAuthHeader(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := NewDecisionClient(ResolvedBackend{Backend: Backend{URL: d.srv.URL, Model: "jev-latest"}}, "")
+	c.baseBackoff, c.maxBackoff = time.Millisecond, time.Millisecond
+
+	if _, err := c.ScoreBatch(context.Background(), "task", map[string]Item{"seg-1": {Text: "x", Tokens: 5}}); err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	if r := d.requests()[0]; r.Auth != "" {
+		t.Errorf("Authorization = %q, want no auth header without a key", r.Auth)
+	}
+}
+
+// TestScoreBatch_PerBackendURL asserts each provider's endpoint is hit —
+// typesafe, openrouter, and gateway URL shapes over one test server.
+func TestScoreBatch_PerBackendURL(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	paths := []string{
+		"/v1/systemone",        // typesafe-shaped
+		"/api/alpha/decisions", // openrouter-shaped
+		"/gateway/decisions",   // gateway-shaped
+	}
+	for _, p := range paths {
+		c := fastClient(d.srv.URL+p, 0)
+		if _, err := c.ScoreBatch(context.Background(), "task", map[string]Item{"seg-1": {Text: "x", Tokens: 5}}); err != nil {
+			t.Fatalf("ScoreBatch(%s) error = %v", p, err)
+		}
+	}
+	got := d.requests()
+	if len(got) != len(paths) {
+		t.Fatalf("got %d requests, want %d", len(got), len(paths))
+	}
+	for i, p := range paths {
+		if got[i].Path != p {
+			t.Errorf("request %d hit %q, want %q", i+1, got[i].Path, p)
+		}
+	}
+}
+
+// TestScoreBatch_AnswerParsingLenient: numeric and string-number answers are
+// accepted and clamped into [0,1]; junk answers fail that item only.
+func TestScoreBatch_AnswerParsingLenient(t *testing.T) {
+	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
+		return http.StatusOK, `{"answers": {
+			"seg-num": 0.25,
+			"seg-str": "0.5",
+			"seg-high": 1.7,
+			"seg-low": -0.2,
+			"seg-junk": "banana"
+		}}`
+	})
+	c := fastClient(d.srv.URL, 0)
+
+	items := map[string]Item{
+		"seg-num":  {Text: "a", Tokens: 1},
+		"seg-str":  {Text: "b", Tokens: 1},
+		"seg-high": {Text: "c", Tokens: 1},
+		"seg-low":  {Text: "d", Tokens: 1},
+		"seg-junk": {Text: "e", Tokens: 1},
+	}
+	scores, err := c.ScoreBatch(context.Background(), "task", items)
+	if err == nil {
+		t.Fatal("ScoreBatch() error = nil, want the junk answer recorded as an error")
+	}
+	want := map[string]float64{
+		"seg-num":  0.25,
+		"seg-str":  0.5,
+		"seg-high": 1, // clamped
+		"seg-low":  0, // clamped
+		"seg-junk": 1, // fail-open
+	}
+	for ref, w := range want {
+		if scores[ref] != w {
+			t.Errorf("scores[%s] = %v, want %v", ref, scores[ref], w)
+		}
+	}
+	var junkErr *ItemScoreError
+	if !errors.As(err, &junkErr) || junkErr.ItemID != "seg-junk" {
+		t.Errorf("error = %v, want *ItemScoreError for seg-junk", err)
+	}
+}
+
+// TestScoreBatch_MissingAnswerFailsOpenItemOnly: a response that omits one
+// ref keeps that ref at 1.0 without touching the others.
+func TestScoreBatch_MissingAnswerFailsOpenItemOnly(t *testing.T) {
+	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
+		return http.StatusOK, `{"answers": {"seg-1": 0.3}}`
+	})
+	c := fastClient(d.srv.URL, 0)
+
+	scores, err := c.ScoreBatch(context.Background(), "task", map[string]Item{
+		"seg-1": {Text: "a", Tokens: 1},
+		"seg-2": {Text: "b", Tokens: 1},
+	})
+	if err == nil {
+		t.Fatal("ScoreBatch() error = nil, want the missing answer recorded")
+	}
+	if scores["seg-1"] != 0.3 {
+		t.Errorf("scores[seg-1] = %v, want 0.3", scores["seg-1"])
+	}
+	if scores["seg-2"] != keepScore {
+		t.Errorf("scores[seg-2] = %v, want %v (fail-open)", scores["seg-2"], keepScore)
+	}
+}
+
+// TestScoreBatch_EmptyItems is a no-op.
+func TestScoreBatch_EmptyItems(t *testing.T) {
+	c := fastClient("http://127.0.0.1:1/x", 0)
+	scores, err := c.ScoreBatch(context.Background(), "task", nil)
+	if err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	if len(scores) != 0 {
+		t.Errorf("scores = %v, want empty", scores)
+	}
+}
+
+// TestScoreBatch_EmptyTaskGetsDefault: an empty task still produces a valid
+// question.
+func TestScoreBatch_EmptyTaskGetsDefault(t *testing.T) {
+	d := newDecisionsServer(t, echoHandler)
+	c := fastClient(d.srv.URL, 0)
+	if _, err := c.ScoreBatch(context.Background(), "  ", map[string]Item{"seg-1": {Text: "x", Tokens: 1}}); err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	if got := d.requests()[0].Req.State.Task; got != defaultTask {
+		t.Errorf("state.task = %q, want %q", got, defaultTask)
+	}
+}
+
+// TestIsRetryableDecisionError covers the status/transport matrix: the
+// protocol's retryable set {408,429,500,502,503,504,529} plus transport
+// failures, versus the non-retryable set {400,401,402,403,404,405,422} plus
+// TLS errors and cancellation.
+func TestIsRetryableDecisionError(t *testing.T) {
+	statusErr := func(code int) *DecisionStatusError {
+		return &DecisionStatusError{StatusCode: code, Status: fmt.Sprintf("%d x", code)}
+	}
+	retryable := []error{
+		statusErr(408), statusErr(429), statusErr(500), statusErr(502),
+		statusErr(503), statusErr(504), statusErr(529), statusErr(501),
+		&url.Error{Op: "Post", Err: errors.New("connection refused")},
+		errors.New("decode decisions response: unexpected EOF"),
+	}
+	nonRetryable := []error{
+		statusErr(400), statusErr(401), statusErr(402), statusErr(403),
+		statusErr(404), statusErr(405), statusErr(422), statusErr(409),
+		statusErr(301),
+		&url.Error{Op: "Post", Err: x509.UnknownAuthorityError{}},
+		&url.Error{Op: "Post", Err: fmt.Errorf("tls: handshake failure")},
+		&url.Error{Op: "Post", Err: errors.New(`unsupported protocol scheme "ftp"`)},
+		context.Canceled,
+		fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
+	}
+	for _, err := range retryable {
+		if !isRetryableDecisionError(err) {
+			t.Errorf("isRetryableDecisionError(%v) = false, want true", err)
+		}
+	}
+	for _, err := range nonRetryable {
+		if isRetryableDecisionError(err) {
+			t.Errorf("isRetryableDecisionError(%v) = true, want false", err)
+		}
+	}
+	if isRetryableDecisionError(nil) {
+		t.Error("isRetryableDecisionError(nil) = true, want false")
+	}
+}
+
+// TestDecisionClient_FleetLimiterShared proves the compaction client goes
+// through the exported fleet-limiter wrapper: under a cap of 1, two
+// concurrent ScoreBatch calls must serialize inside the server.
+func TestDecisionClient_FleetLimiterShared(t *testing.T) {
+	// First, the wrapper itself: unlimited → nil, capped → non-nil.
+	client.SetLLMConcurrency(0)
+	if rel := client.AcquireLLMSlot(context.Background()); rel != nil {
+		t.Error("AcquireLLMSlot with unlimited limiter returned non-nil release")
+	}
+	client.SetLLMConcurrency(1)
+	defer client.SetLLMConcurrency(0)
+	rel := client.AcquireLLMSlot(context.Background())
+	if rel == nil {
+		t.Fatal("AcquireLLMSlot with cap 1 returned nil release")
+	}
+	rel()
+
+	var (
+		mu       sync.Mutex
+		inFlight int
+		peak     int
+	)
+	d := newDecisionsServer(t, func(_ int, req capturedRequest) (int, string) {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}()
+		time.Sleep(50 * time.Millisecond)
+		return echoHandler(1, req)
+	})
+	c := fastClient(d.srv.URL, 0)
+	c.limiter = nil // isolate the fleet limiter's effect from the token bucket
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.ScoreBatch(context.Background(), "task", map[string]Item{"seg-1": {Text: "x", Tokens: 1}}); err != nil {
+				t.Errorf("ScoreBatch() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if peak != 1 {
+		t.Errorf("peak concurrent handler runs = %d, want 1 — scoring calls must share the fleet bound", peak)
+	}
+}
+
+// TestParseRetryAfter covers both header forms and the invalid ones.
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 0},
+		{"0", 0},
+		{"-3", 0},
+		{"junk", 0},
+		{"2", 2 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := parseRetryAfter(tc.in); got != tc.want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

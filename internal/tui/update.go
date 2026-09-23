@@ -1092,6 +1092,64 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.updateLayout()
 				return m, nil
 			}
+			if cmd == "/infobar" {
+				m.Input.Reset()
+				m.Input.SetValue("")
+				m.ShowInfoBar = !m.ShowInfoBar
+				m.updateLayout()
+				feedback := "info bar off"
+				if m.ShowInfoBar {
+					feedback = "info bar on"
+				}
+				// Persist best-effort, mirroring the theme-apply SaveConfig
+				// call sites; a save failure keeps the view toggle but is
+				// surfaced as status text.
+				if m.AppConfig != nil {
+					m.AppConfig.ShowInfoBar = m.ShowInfoBar
+					if err := config.SaveConfig(m.AppConfig); err != nil {
+						focusedState.StatusText = "failed to save info bar setting"
+					}
+				}
+				m.ToastMessage = feedback
+				m.ToastWarning = false
+				m.ToastExpireTime = time.Now().UnixMilli() + 3000
+				clearCmd := tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+					return clearToastMsg{}
+				})
+				m.updateViewport()
+				return m, clearCmd
+			}
+			if cmd == "/timestamps" {
+				m.Input.Reset()
+				m.Input.SetValue("")
+				m.ShowTimestamps = !m.ShowTimestamps
+				feedback := "timestamps off"
+				if m.ShowTimestamps {
+					feedback = "timestamps on"
+				}
+				// Persist best-effort, mirroring the /infobar SaveConfig
+				// call site; a save failure keeps the view toggle but is
+				// surfaced as status text.
+				if m.AppConfig != nil {
+					m.AppConfig.ShowTimestamps = m.ShowTimestamps
+					if err := config.SaveConfig(m.AppConfig); err != nil {
+						focusedState.StatusText = "failed to save timestamps setting"
+					}
+				}
+				// The toggle changes how every cached block renders; mark
+				// the transcript dirty. The render pass also discards the
+				// block cache whenever the timestamps flag differs from
+				// the state it was rendered with.
+				m.refreshTranscript()
+				m.ToastMessage = feedback
+				m.ToastWarning = false
+				m.ToastExpireTime = time.Now().UnixMilli() + 3000
+				clearCmd := tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+					return clearToastMsg{}
+				})
+				m.updateViewport()
+				return m, clearCmd
+			}
 			if cmd == "/model" {
 				m.Input.Reset()
 				m.Input.SetValue("")
@@ -1464,8 +1522,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 	case ToastMsg:
 		m.ToastMessage = msg.Text
 		m.ToastWarning = msg.Warning
-		m.ToastExpireTime = time.Now().UnixMilli() + 3000
-		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+		duration := msg.Duration
+		if duration <= 0 {
+			duration = 3 * time.Second
+		}
+		m.ToastExpireTime = time.Now().UnixMilli() + duration.Milliseconds()
+		return m, tea.Tick(duration, func(t time.Time) tea.Msg {
 			return clearToastMsg{}
 		})
 
@@ -1498,6 +1560,24 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
+			if s.RetryVerb != "" {
+				s.StatusText = ""
+				if s.RetryVerb == retryVerbRejectedByAPI {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "request accepted after retry", Duration: 2 * time.Second}
+					}
+				} else {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "connection regained", Duration: 2 * time.Second}
+					}
+				}
+				s.RetryVerb = ""
+				s.StreamingStyledCache = ""
+				s.StreamingChunkCount = 0
+			}
+			if strings.Contains(s.StatusText, "retry ") {
+				s.StatusText = ""
+			}
 			s.StreamingState = event
 			if s.State != StateConfirmTool {
 				s.State = StateStreaming
@@ -1593,11 +1673,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		case common.RetryEvent:
 			// A stream attempt failed and the executor is retrying after
 			// event.Delay. The agent stays busy (the spinner keeps running)
-			// and the failed attempt's partial output is dropped so it does
-			// not linger in the transcript. The pinned error box is left
-			// alone: it clears when the next successful turn starts
-			// (the "thinking" branch above), and recovery is announced by
-			// the dedicated RecoveryEvent branch below.
+			// while retaining the partial output so it does not abruptly vanish.
 			s.Transcript.generation++
 			s.Transcript.busy = false
 			s.State = StateThinking
@@ -1614,7 +1690,6 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			// would imply a live countdown that never ticks and could linger
 			// on screen while the next attempt already streams.
 			s.StatusText = fmt.Sprintf("%s — retry %d/%d after %s backoff", retryVerb, event.Attempt, event.MaxAttempts, event.Delay.Truncate(100*time.Millisecond))
-			s.StreamingState = common.ContentEvent{ID: event.ID}
 			// Clear streaming render cache for the failed attempt
 			s.StreamingStyledCache = ""
 			s.StreamingChunkCount = 0
@@ -1629,22 +1704,21 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.Transcript.generation++
 			s.State = StateThinking
 			if s.RetryVerb != "" {
+				s.StatusText = ""
 				if s.RetryVerb == retryVerbRejectedByAPI {
-					s.StatusText = "request accepted after retry — streaming response"
 					restoredToast = func() tea.Msg {
-						return ToastMsg{Text: "request accepted after retry"}
+						return ToastMsg{Text: "request accepted after retry", Duration: 2 * time.Second}
 					}
 				} else {
-					s.StatusText = "connection restored — streaming response"
 					restoredToast = func() tea.Msg {
-						return ToastMsg{Text: "connection restored"}
+						return ToastMsg{Text: "connection regained", Duration: 2 * time.Second}
 					}
 				}
 				s.RetryVerb = ""
 			} else {
 				// Recovery for an agent whose retry verb was already cleared
-				// (e.g. a stop raced the recovery): keep the status accurate.
-				s.StatusText = "streaming response"
+				// (e.g. a stop raced the recovery): keep the status clean.
+				s.StatusText = ""
 			}
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
@@ -1685,6 +1759,10 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}
+		}
+
+		if restoredToast != nil {
+			return m, restoredToast
 		}
 
 		if restoredToast != nil {
@@ -1843,9 +1921,13 @@ func (m *Model) updateLayout() {
 			s.RenderedHistory = nil
 		}
 	}
-	vHeight := m.Height - (m.Input.Height() + 1) - StatusBarHeight - AppPadding
+	// Reserve one extra footer row while the info bar is shown
+	// (mirrors the StatusBarHeight reservation above).
+	infoH := m.infoBarHeight()
+
+	vHeight := m.Height - (m.Input.Height() + 1) - StatusBarHeight - AppPadding - infoH
 	if m.Mode == ViewModelPicker {
-		vHeight = m.Height - 3 - StatusBarHeight - AppPadding
+		vHeight = m.Height - 3 - StatusBarHeight - AppPadding - infoH
 	}
 
 	// Reserve space for autocomplete dropdown
@@ -1862,7 +1944,9 @@ func (m *Model) updateLayout() {
 
 	// Ensure file picker also respects the layout height to prevent pushing the status bar off-screen
 	// We subtract StatusBarHeight. If we have a 2-line picker status bar, we subtract 3.
-	fpHeight := m.Height - 3
+	// The info bar never renders while the picker is open, so infoBarHeight()
+	// contributes nothing in that mode.
+	fpHeight := m.Height - 3 - m.infoBarHeight()
 	if fpHeight < 1 {
 		fpHeight = 1
 	}
@@ -2016,6 +2100,24 @@ func (m Model) navigateHistory(dir int) Model {
 }
 
 func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
+	drained := m.Focused.DrainQueuedMessages()
+	if len(drained) > 0 {
+		restored := strings.Join(drained, "\n")
+		curr := m.Input.Value()
+		if curr != "" {
+			m.Input.SetValue(restored + "\n" + curr)
+		} else {
+			m.Input.SetValue(restored)
+		}
+		m.Input.CursorEnd()
+
+		for i := len(drained) - 1; i >= 0; i-- {
+			if len(m.InputHistory) > 0 && m.InputHistory[len(m.InputHistory)-1] == drained[i] {
+				m.InputHistory = m.InputHistory[:len(m.InputHistory)-1]
+			}
+		}
+	}
+
 	focusedState := m.GetAgentState(m.Focused.ID())
 	if focusedState.State == StateConfirmTool && focusedState.PendingConfirm != nil {
 		focusedState.PendingConfirm.ResultCh <- "n"
@@ -2028,7 +2130,7 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.updateViewport()
 		return m, nil
 	}
-	if focusedState.State == StateThinking || focusedState.State == StateStreaming {
+	if focusedState.State == StateThinking || focusedState.State == StateStreaming || focusedState.State == StateStopping {
 		focusedState.PendingStop = true
 		focusedState.State = StateStopping
 		focusedState.StatusText = "Stopping..."
@@ -2036,6 +2138,9 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.Focused.Cancel()
 		m.updateViewport()
 		return m, nil
+	}
+	if len(drained) > 0 {
+		m.updateViewport()
 	}
 	return m, nil
 }

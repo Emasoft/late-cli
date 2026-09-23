@@ -67,4 +67,3 @@ func TestBootstrapNextToastSequence(t *testing.T) {
 		t.Fatal("expected clear command after logit bias toast")
 	}
 }
-
