@@ -26,6 +26,11 @@ const DecisionKeep = "keep"
 const (
 	EntryTypeDecision   = "decision"
 	EntryTypeHistoryRun = "history-run"
+	// EntryTypeTripwire marks a gate-tripwire override: the scorer wanted to
+	// elide past GateConfig.MaxElideFraction, so nothing was elided. The
+	// entry carries Action "tripwire" and the output's total token count;
+	// it is not a per-segment decision and Replay skips it.
+	EntryTypeTripwire = "tripwire"
 )
 
 // ShadowEntry is one JSONL line in the shadow log: a single scored segment
@@ -43,6 +48,11 @@ type ShadowEntry struct {
 	// Type is the entry kind; empty means a per-segment decision (legacy
 	// lines predate the field).
 	Type string `json:"type,omitempty"`
+	// Action is the machine-readable action carried by non-decision entries
+	// ("tripwire" on Type "tripwire"). Empty on per-segment decisions,
+	// whose Decision field carries the action. Additive: older logs simply
+	// lack the field.
+	Action string `json:"action,omitempty"`
 	// Run carries the run totals for Type "history-run" entries.
 	Run *RunSummary `json:"run,omitempty"`
 }
@@ -212,9 +222,11 @@ func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 			report.MalformedLines++
 			continue
 		}
-		if e.Type == EntryTypeHistoryRun {
-			// A run summary is not a decision: counting it would inflate
-			// Entries/TokensTotal and mint a "" unique segment.
+		if e.Type != "" && e.Type != EntryTypeDecision {
+			// Non-decision entries (history-run summaries, tripwire records,
+			// and any future outcome type) are not per-segment decisions:
+			// counting them would inflate Entries/TokensTotal and mint a ""
+			// unique segment.
 			continue
 		}
 		report.Entries++

@@ -959,6 +959,146 @@ func TestResolveCompactionMode(t *testing.T) {
 	}
 }
 
+// TestResolveCompactionMaxElidePercent mirrors TestResolveCompactionThreshold
+// for the elide-fraction tripwire knob: 0 (unset) means the reference default,
+// 1-100 are honored, anything else warns and falls back.
+func TestResolveCompactionMaxElidePercent(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         *Config
+		want        int
+		wantWarning []string
+	}{
+		{
+			name: "nil config uses default",
+			cfg:  nil,
+			want: DefaultCompactionMaxElidePercent,
+		},
+		{
+			name: "unset uses default",
+			cfg:  &Config{},
+			want: DefaultCompactionMaxElidePercent,
+		},
+		{
+			name: "valid value honored",
+			cfg:  &Config{CompactionMaxElidePercent: 50},
+			want: 50,
+		},
+		{
+			name: "one is valid",
+			cfg:  &Config{CompactionMaxElidePercent: 1},
+			want: 1,
+		},
+		{
+			name: "hundred is valid",
+			cfg:  &Config{CompactionMaxElidePercent: 100},
+			want: 100,
+		},
+		{
+			name:        "negative value invalid",
+			cfg:         &Config{CompactionMaxElidePercent: -10},
+			want:        DefaultCompactionMaxElidePercent,
+			wantWarning: []string{"invalid", "-10"},
+		},
+		{
+			name:        "over hundred invalid",
+			cfg:         &Config{CompactionMaxElidePercent: 101},
+			want:        DefaultCompactionMaxElidePercent,
+			wantWarning: []string{"invalid", "101"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, warning := ResolveCompactionMaxElidePercent(tc.cfg)
+			if got != tc.want {
+				t.Fatalf("ResolveCompactionMaxElidePercent() = %d, want %d", got, tc.want)
+			}
+			assertResolverWarning(t, warning, tc.wantWarning)
+		})
+	}
+}
+
+// TestResolveCompactionProtectedFloor mirrors TestResolveCompactionThreshold
+// for the protected-kind floor knob: 0 (unset) means the reference default,
+// 1-100 are honored, anything else warns and falls back.
+func TestResolveCompactionProtectedFloor(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         *Config
+		want        int
+		wantWarning []string
+	}{
+		{
+			name: "nil config uses default",
+			cfg:  nil,
+			want: DefaultCompactionProtectedFloorPercent,
+		},
+		{
+			name: "unset uses default",
+			cfg:  &Config{},
+			want: DefaultCompactionProtectedFloorPercent,
+		},
+		{
+			name: "valid value honored",
+			cfg:  &Config{CompactionProtectedFloor: 20},
+			want: 20,
+		},
+		{
+			name: "one is valid",
+			cfg:  &Config{CompactionProtectedFloor: 1},
+			want: 1,
+		},
+		{
+			name: "hundred is valid",
+			cfg:  &Config{CompactionProtectedFloor: 100},
+			want: 100,
+		},
+		{
+			name:        "negative value invalid",
+			cfg:         &Config{CompactionProtectedFloor: -3},
+			want:        DefaultCompactionProtectedFloorPercent,
+			wantWarning: []string{"invalid", "-3"},
+		},
+		{
+			name:        "over hundred invalid",
+			cfg:         &Config{CompactionProtectedFloor: 250},
+			want:        DefaultCompactionProtectedFloorPercent,
+			wantWarning: []string{"invalid", "250"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, warning := ResolveCompactionProtectedFloor(tc.cfg)
+			if got != tc.want {
+				t.Fatalf("ResolveCompactionProtectedFloor() = %d, want %d", got, tc.want)
+			}
+			assertResolverWarning(t, warning, tc.wantWarning)
+		})
+	}
+}
+
+// assertResolverWarning checks a resolver's warning against the expected
+// substrings (empty means the warning must be empty too).
+func assertResolverWarning(t *testing.T, warning string, wantSubstrings []string) {
+	t.Helper()
+	if len(wantSubstrings) == 0 {
+		if warning != "" {
+			t.Fatalf("warning = %q, want empty", warning)
+		}
+		return
+	}
+	if warning == "" {
+		t.Fatal("warning is empty, want a warning")
+	}
+	for _, substring := range wantSubstrings {
+		if !strings.Contains(warning, substring) {
+			t.Fatalf("warning = %q, want it to contain %q", warning, substring)
+		}
+	}
+}
+
 // TestLoadConfig_CompactionMode covers the config-file path: valid modes
 // parse through, invalid ones survive loading so ResolveCompactionMode can
 // warn and fall back to the default.

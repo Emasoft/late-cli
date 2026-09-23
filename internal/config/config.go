@@ -86,6 +86,22 @@ const DefaultCompactionMode = CompactionModeShadow
 // jev-autocompact-percent (or sets an invalid value).
 const DefaultJevAutocompactPercent = 99
 
+// DefaultCompactionMaxElidePercent is the elide-fraction tripwire: when the
+// compaction scorer wants to elide more than this percentage of a tool
+// output's tokens, it is distrusted and nothing is elided (reference:
+// jev-compaction pipeline.py max_elide_fraction=0.7). Applied when
+// config.json does not set compaction-max-elide-percent (or sets an
+// invalid value).
+const DefaultCompactionMaxElidePercent = 70
+
+// DefaultCompactionProtectedFloorPercent is the score floor (as a
+// percentage) under which protected segment kinds (stacktrace, diff) may be
+// elided: at any higher score they are kept even below the normal
+// threshold (reference: pipeline.py protected_floor=0.05). Applied when
+// config.json does not set compaction-protected-floor (or sets an invalid
+// value).
+const DefaultCompactionProtectedFloorPercent = 5
+
 // Config represents the application configuration.
 type Config struct {
 	EnabledTools        map[string]bool `json:"enabled_tools"`
@@ -144,6 +160,25 @@ type Config struct {
 	// DefaultJevAutocompactPercent; values outside 1-100 are invalid and
 	// resolve back to the default with a warning (see ResolveAutocompact).
 	JevAutocompactPercent int `json:"jev-autocompact-percent,omitempty"`
+
+	// CompactionMaxElidePercent is the compaction gate's elide-fraction
+	// tripwire as a percentage: when the scorer wants to elide more than
+	// this share of a tool output's tokens, the scorer is distrusted and
+	// NOTHING is elided (the tripwire is recorded in the result and the
+	// shadow log). 0 (unset) means DefaultCompactionMaxElidePercent;
+	// values outside 1-100 are invalid and resolve back to the default with
+	// a warning (see ResolveCompactionMaxElidePercent). The tripwire cannot
+	// be disabled from config.json (100 still trips on an over-100% claim,
+	// i.e. never — set it to 100 for the closest thing to off).
+	CompactionMaxElidePercent int `json:"compaction-max-elide-percent,omitempty"`
+
+	// CompactionProtectedFloor is the score floor, as a percentage, under
+	// which protected segment kinds (stacktrace, diff) may be elided: at
+	// any higher score they are kept even below the normal threshold.
+	// 0 (unset) means DefaultCompactionProtectedFloorPercent; values
+	// outside 1-100 are invalid and resolve back to the default with a
+	// warning (see ResolveCompactionProtectedFloor).
+	CompactionProtectedFloor int `json:"compaction-protected-floor,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -419,6 +454,46 @@ func ResolveAutocompact(cfg *Config) (enabled bool, percent int, warning string)
 			cfg.JevAutocompactPercent, DefaultJevAutocompactPercent)
 	}
 	return cfg.JevAutocompact, percent, warning
+}
+
+// ResolveCompactionMaxElidePercent returns the effective compaction
+// elide-fraction tripwire percentage and a warning string, mirroring
+// ResolveCompactionThreshold's invalid-value pattern: 0 (unset) means
+// DefaultCompactionMaxElidePercent, values in 1-100 are honored as-is, and
+// anything else falls back to the default with a warning.
+func ResolveCompactionMaxElidePercent(cfg *Config) (percent int, warning string) {
+	if cfg == nil {
+		return DefaultCompactionMaxElidePercent, ""
+	}
+	if cfg.CompactionMaxElidePercent >= 1 && cfg.CompactionMaxElidePercent <= 100 {
+		return cfg.CompactionMaxElidePercent, ""
+	}
+	if cfg.CompactionMaxElidePercent == 0 {
+		return DefaultCompactionMaxElidePercent, ""
+	}
+	return DefaultCompactionMaxElidePercent,
+		fmt.Sprintf("ignoring invalid config.json compaction-max-elide-percent %d; using %d",
+			cfg.CompactionMaxElidePercent, DefaultCompactionMaxElidePercent)
+}
+
+// ResolveCompactionProtectedFloor returns the effective score floor (as a
+// percentage) under which protected segment kinds may be elided, mirroring
+// ResolveCompactionThreshold's invalid-value pattern: 0 (unset) means
+// DefaultCompactionProtectedFloorPercent, values in 1-100 are honored
+// as-is, and anything else falls back to the default with a warning.
+func ResolveCompactionProtectedFloor(cfg *Config) (percent int, warning string) {
+	if cfg == nil {
+		return DefaultCompactionProtectedFloorPercent, ""
+	}
+	if cfg.CompactionProtectedFloor >= 1 && cfg.CompactionProtectedFloor <= 100 {
+		return cfg.CompactionProtectedFloor, ""
+	}
+	if cfg.CompactionProtectedFloor == 0 {
+		return DefaultCompactionProtectedFloorPercent, ""
+	}
+	return DefaultCompactionProtectedFloorPercent,
+		fmt.Sprintf("ignoring invalid config.json compaction-protected-floor %d; using %d",
+			cfg.CompactionProtectedFloor, DefaultCompactionProtectedFloorPercent)
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

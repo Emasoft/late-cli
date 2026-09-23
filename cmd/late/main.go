@@ -583,6 +583,19 @@ func main() {
 			*compactionThresholdReq, compaction.DefaultRelocationThreshold)
 	}
 
+	// Gate safety knobs (reference-parity semantics for the elide decision).
+	// Max elide fraction: a scorer that wants to drop more than this share
+	// of an output's tokens is distrusted and nothing is elided. Protected
+	// floor: stacktrace and diff segments are only elided below this score.
+	compactionMaxElidePercent, maxElideWarning := appconfig.ResolveCompactionMaxElidePercent(appConfig)
+	if maxElideWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", maxElideWarning)
+	}
+	compactionProtectedFloorPercent, protectedFloorWarning := appconfig.ResolveCompactionProtectedFloor(appConfig)
+	if protectedFloorWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", protectedFloorWarning)
+	}
+
 	// The TUI's /jev-compact-context command and auto-trigger reuse this
 	// pipeline (its scoring client) and elide store; both stay nil when
 	// compaction is off or no backend resolved, which disables them.
@@ -619,6 +632,20 @@ func main() {
 			}
 			compactionShadowLog = shadowLog
 			pipeline := compaction.NewPipeline(backend, "", shadowLog, compaction.PipelineOptions{})
+			// GateConfig: the reference-parity elision safety semantics —
+			// keep threshold, elide-fraction tripwire, and protected-kind
+			// floors — threaded from config.json (defaults mirror the
+			// reference pipeline.py). Applied before EnableRelocation so the
+			// -compaction-threshold flag below keeps precedence.
+			gate := compaction.DefaultGateConfig()
+			gate.KeepThreshold = compactionThreshold
+			gate.MaxElideFraction = float64(compactionMaxElidePercent) / 100
+			protectedFloor := float64(compactionProtectedFloorPercent) / 100
+			gate.ProtectedKinds = map[compaction.SegmentKind]float64{
+				compaction.KindStacktrace: protectedFloor,
+				compaction.KindDiff:       protectedFloor,
+			}
+			pipeline.ApplyGateConfig(gate)
 			if compactionMode == appconfig.CompactionModeEnabled {
 				store := compaction.NewStore()
 				pipeline.EnableRelocation(store, compactionThreshold)
