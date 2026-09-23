@@ -587,8 +587,9 @@ func main() {
 	// pipeline (its scoring client) and elide store; both stay nil when
 	// compaction is off or no backend resolved, which disables them.
 	var (
-		compactionPipeline *compaction.Pipeline
-		compactionStore    *compaction.Store
+		compactionPipeline  *compaction.Pipeline
+		compactionStore     *compaction.Store
+		compactionShadowLog *compaction.ShadowLog
 	)
 	if compactionMode != appconfig.CompactionModeOff {
 		backend, backendErr := compaction.ResolveBackendEnv("")
@@ -616,6 +617,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Warning: compaction shadow log unavailable (%v); continuing without it\n", shadowErr)
 				shadowLog = nil
 			}
+			compactionShadowLog = shadowLog
 			pipeline := compaction.NewPipeline(backend, "", shadowLog, compaction.PipelineOptions{})
 			if compactionMode == appconfig.CompactionModeEnabled {
 				store := compaction.NewStore()
@@ -737,7 +739,7 @@ func main() {
 			compactionStore = compaction.NewStore()
 		}
 		model.Compactor = historyCompactionRunner(sess, compactionPipeline.HistoryScorer(), compactionStore,
-			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold)
+			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog)
 	}
 
 	// Register plugin slash commands + theme catalog so plugin commands fire
@@ -900,7 +902,11 @@ func main() {
 // "shadow") compute the honest would-save report without touching history,
 // so they skip persistence. threshold mirrors the pipeline's elision
 // threshold so both compaction paths make the same keep/elide calls.
-func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer, store session.ElideStore, shadow bool, threshold float64) func(context.Context) (session.CompactionReport, error) {
+// shadowLog receives one "history-run" summary line per run — shadow or
+// mutating, failed or clean — so runs are auditable next to the per-segment
+// decisions they produced; it may be nil (logging is unavailable), and an
+// append failure is a stderr warning, never a run failure.
+func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer, store session.ElideStore, shadow bool, threshold float64, shadowLog *compaction.ShadowLog) func(context.Context) (session.CompactionReport, error) {
 	return func(ctx context.Context) (session.CompactionReport, error) {
 		report, err := sess.CompactContext(ctx, scorer, store, session.CompactionOptions{
 			Threshold:  threshold,
@@ -911,7 +917,26 @@ func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer
 			// failure leaves consistent pointers and stored originals)
 			// history: persist it even when err != nil.
 			if saveErr := session.SaveHistory(sess.HistoryPath, sess.History); saveErr != nil {
-				return report, errors.Join(err, fmt.Errorf("saving compacted history: %w", saveErr))
+				err = errors.Join(err, fmt.Errorf("saving compacted history: %w", saveErr))
+			}
+		}
+		if shadowLog != nil {
+			run := compaction.RunSummary{
+				Shadow:       shadow,
+				Scanned:      report.MessagesScanned,
+				Scored:       report.MessagesScored,
+				Elided:       report.SegmentsElided,
+				TokensBefore: report.TokensBefore,
+				TokensAfter:  report.TokensAfter,
+				TokensSaved:  report.TokensSaved,
+			}
+			if err != nil {
+				run.Err = err.Error()
+			}
+			// Best-effort: a logging failure must never fail the compaction
+			// itself, so it only surfaces as a warning.
+			if appendErr := shadowLog.AppendRun(report.TaskHash, run); appendErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: compaction run summary not logged (%v)\n", appendErr)
 			}
 		}
 		return report, err

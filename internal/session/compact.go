@@ -197,6 +197,11 @@ type CompactionReport struct {
 	StoreSize int
 	// ShadowOnly reports whether the run mutated anything.
 	ShadowOnly bool
+	// TaskHash is the compaction.HashTask digest of the scoring task this
+	// run scored against (the derived ongoing task, never its text). The
+	// shadow log's per-run summary lines group under it, the same way the
+	// per-segment decision lines do.
+	TaskHash string
 }
 
 // CompactContext compacts the session history in place (unless
@@ -231,13 +236,19 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	report.TokensBefore = historyMessageTokens(s.History)
 	report.TokensAfter = report.TokensBefore
 
+	// The scoring task is hashed up front so every report carries its group
+	// key even when the walk stops early: the run summary the caller appends
+	// to the shadow log uses this digest, and the per-segment decisions the
+	// scorer logs share it.
+	task := compactionTask(s.History)
+	report.TaskHash = compaction.HashTask(task)
+
 	if store == nil {
 		// Relocation disarmed: nothing can be stored for the expand tool, so
 		// nothing is elided. The scan/token counts above still stand.
 		return report, nil
 	}
 
-	task := compactionTask(s.History)
 	scored := 0
 	var walkErrs []error
 

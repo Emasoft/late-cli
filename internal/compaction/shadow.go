@@ -20,9 +20,19 @@ import (
 // scored segment is kept; elision comes with the relocation stage.
 const DecisionKeep = "keep"
 
+// Entry types (ShadowEntry.Type). An empty Type is the legacy spelling of
+// EntryTypeDecision: every line written before the field existed is a
+// per-segment decision.
+const (
+	EntryTypeDecision   = "decision"
+	EntryTypeHistoryRun = "history-run"
+)
+
 // ShadowEntry is one JSONL line in the shadow log: a single scored segment
-// at a single decision point. The raw task text never reaches the log —
-// only its TaskHash digest does.
+// at a single decision point — or, with Type "history-run", a whole
+// history-compaction run's summary (then only TS, TaskHash and Run carry
+// data). The raw task text never reaches the log — only its TaskHash digest
+// does.
 type ShadowEntry struct {
 	TS        time.Time `json:"ts"`
 	TaskHash  string    `json:"task_hash"`
@@ -30,6 +40,25 @@ type ShadowEntry struct {
 	Tokens    int       `json:"tokens"`
 	Score     float64   `json:"score"`
 	Decision  string    `json:"decision"`
+	// Type is the entry kind; empty means a per-segment decision (legacy
+	// lines predate the field).
+	Type string `json:"type,omitempty"`
+	// Run carries the run totals for Type "history-run" entries.
+	Run *RunSummary `json:"run,omitempty"`
+}
+
+// RunSummary is the per-run totals of one history-compaction pass — the
+// numbers the TUI status line reports, persisted so runs are auditable
+// alongside the per-segment decisions they produced.
+type RunSummary struct {
+	Shadow       bool   `json:"shadow"`
+	Scanned      int    `json:"scanned"`
+	Scored       int    `json:"scored"`
+	Elided       int    `json:"elided"`
+	TokensBefore int    `json:"tokens_before"`
+	TokensAfter  int    `json:"tokens_after"`
+	TokensSaved  int    `json:"tokens_saved"`
+	Err          string `json:"error,omitempty"`
 }
 
 // ReplayReport summarizes what WOULD have been elided at a score threshold.
@@ -110,7 +139,9 @@ func (l *ShadowLog) Path() string { return l.path }
 // becomes time.Now() and an empty Decision becomes DecisionKeep. The entry
 // is serialized first so a marshal failure cannot leave a torn line behind.
 func (l *ShadowLog) Append(e ShadowEntry) error {
-	if e.Decision == "" {
+	// Decision is a per-segment concept: only decision entries (empty Type is
+	// the legacy spelling) default to keep — a run summary carries none.
+	if e.Decision == "" && e.Type != EntryTypeHistoryRun {
 		e.Decision = DecisionKeep
 	}
 	if e.TS.IsZero() {
@@ -135,10 +166,23 @@ func (l *ShadowLog) Append(e ShadowEntry) error {
 	return nil
 }
 
+// AppendRun writes one history-compaction run summary line (Type
+// "history-run") carrying run's totals grouped under taskHash. It goes
+// through the same crash-atomic append path as decisions; Replay skips
+// these lines so run summaries never count as decisions.
+func (l *ShadowLog) AppendRun(taskHash string, run RunSummary) error {
+	return l.Append(ShadowEntry{
+		TaskHash: taskHash,
+		Type:     EntryTypeHistoryRun,
+		Run:      &run,
+	})
+}
+
 // Replay reads the whole log and reports what WOULD be elided at threshold:
 // every decision whose score is strictly below threshold counts as elided.
-// A missing log file is an empty report, not an error (nothing has been
-// scored yet).
+// History-run summary lines are not decisions — they carry no segment — so
+// they are skipped, not counted as malformed. A missing log file is an empty
+// report, not an error (nothing has been scored yet).
 func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -166,6 +210,11 @@ func (l *ShadowLog) Replay(threshold float64) (ReplayReport, error) {
 		var e ShadowEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			report.MalformedLines++
+			continue
+		}
+		if e.Type == EntryTypeHistoryRun {
+			// A run summary is not a decision: counting it would inflate
+			// Entries/TokensTotal and mint a "" unique segment.
 			continue
 		}
 		report.Entries++

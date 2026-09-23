@@ -118,6 +118,97 @@ func TestShadowLog_ReplayMath(t *testing.T) {
 	}
 }
 
+func TestShadowLog_AppendRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shadow.jsonl")
+	l, err := NewShadowLogAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := RunSummary{
+		Shadow:       true,
+		Scanned:      6,
+		Scored:       5,
+		Elided:       3,
+		TokensBefore: 1000,
+		TokensAfter:  700,
+		TokensSaved:  300,
+	}
+	if err := l.AppendRun("task-hash", run); err != nil {
+		t.Fatalf("AppendRun() error = %v", err)
+	}
+
+	lines := readLines(t, path)
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1", len(lines))
+	}
+	var e ShadowEntry
+	if err := json.Unmarshal([]byte(lines[0]), &e); err != nil {
+		t.Fatalf("run line is not valid JSON: %v (%q)", err, lines[0])
+	}
+	if e.Type != EntryTypeHistoryRun {
+		t.Errorf("Type = %q, want %q", e.Type, EntryTypeHistoryRun)
+	}
+	if e.TaskHash != "task-hash" {
+		t.Errorf("TaskHash = %q, want task-hash", e.TaskHash)
+	}
+	if e.TS.IsZero() {
+		t.Error("run entry TS was not defaulted to now")
+	}
+	if e.SegmentID != "" || e.Decision != "" {
+		t.Errorf("run entry must carry no per-segment fields, got segment_id=%q decision=%q", e.SegmentID, e.Decision)
+	}
+	if e.Run == nil {
+		t.Fatal("Run is nil")
+	}
+	if *e.Run != run {
+		t.Errorf("Run = %+v, want %+v", *e.Run, run)
+	}
+}
+
+func TestShadowLog_ReplaySkipsHistoryRunEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shadow.jsonl")
+	l, err := NewShadowLogAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real log mixes per-segment decisions with run summary lines; only
+	// the decisions may count toward the replay math.
+	for _, e := range []ShadowEntry{
+		{SegmentID: "seg-keep", Tokens: 50, Score: 0.9},
+		{SegmentID: "seg-drop", Tokens: 100, Score: 0.2},
+	} {
+		if err := l.Append(e); err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+	}
+	if err := l.AppendRun("task-hash", RunSummary{Scanned: 4, Scored: 4, Elided: 1, TokensBefore: 500, TokensAfter: 400, TokensSaved: 100}); err != nil {
+		t.Fatalf("AppendRun() error = %v", err)
+	}
+	if err := l.Append(ShadowEntry{SegmentID: "seg-drop", Tokens: 100, Score: 0.3}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	report, err := l.Replay(0.5)
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	want := ReplayReport{
+		Threshold:      0.5,
+		Entries:        3, // the run summary line must not count
+		UniqueSegments: 2,
+		ElidedEntries:  2, // both seg-drop decisions (0.2, 0.3 < 0.5)
+		ElidedSegments: 1,
+		TokensTotal:    250,
+		TokensElided:   200,
+	}
+	if report != want {
+		t.Errorf("Replay() = %+v, want %+v", report, want)
+	}
+	if report.MalformedLines != 0 {
+		t.Errorf("MalformedLines = %d, want 0 (run summaries are skipped, not malformed)", report.MalformedLines)
+	}
+}
+
 func TestShadowLog_ReplayMissingFileIsEmpty(t *testing.T) {
 	l, err := NewShadowLogAt(filepath.Join(t.TempDir(), "never-written.jsonl"))
 	if err != nil {

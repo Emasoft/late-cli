@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,7 +44,7 @@ func TestHistoryCompactionRunnerPersistsMutatingRun(t *testing.T) {
 	sess := compactionTestSession(t, path)
 	store := compaction.NewStore()
 
-	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold)
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, nil)
 	report, err := runner(context.Background())
 	if err != nil {
 		t.Fatalf("runner() error = %v", err)
@@ -83,7 +84,7 @@ func TestHistoryCompactionRunnerShadowRunSkipsPersistence(t *testing.T) {
 	store := compaction.NewStore()
 	original := sess.History[1].Content.Text
 
-	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, true, compaction.DefaultRelocationThreshold)
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, true, compaction.DefaultRelocationThreshold, nil)
 	report, err := runner(context.Background())
 	if err != nil {
 		t.Fatalf("runner() error = %v", err)
@@ -102,5 +103,131 @@ func TestHistoryCompactionRunnerShadowRunSkipsPersistence(t *testing.T) {
 	}
 	if _, ok := store.Get("elide-1"); ok {
 		t.Fatal("shadow run must not store originals")
+	}
+}
+
+// failingHistoryScorer returns no usable scores at all, standing in for a
+// wholesale scorer failure (the mid-walk abort path).
+type failingHistoryScorer struct{}
+
+func (failingHistoryScorer) ScoreBatch(_ context.Context, _ string, _ map[string]compaction.Item) (map[string]float64, error) {
+	return nil, errors.New("scorer down")
+}
+
+// readShadowLines reads the JSONL shadow log and decodes each line.
+func readShadowLines(t *testing.T, path string) []compaction.ShadowEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shadow log %s: %v", path, err)
+	}
+	var entries []compaction.ShadowEntry
+	for i, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var e compaction.ShadowEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("shadow log line %d is not valid JSON: %v (%q)", i, err, line)
+		}
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+// TestHistoryCompactionRunnerAppendsRunSummary: every mutating run appends
+// exactly one "history-run" summary line carrying the report's totals, keyed
+// by the same task hash the per-segment decisions use.
+func TestHistoryCompactionRunnerAppendsRunSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.json")
+	sess := compactionTestSession(t, path)
+	store := compaction.NewStore()
+	shadowLog, err := compaction.NewShadowLogAt(filepath.Join(t.TempDir(), "shadow.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, shadowLog)
+	report, err := runner(context.Background())
+	if err != nil {
+		t.Fatalf("runner() error = %v", err)
+	}
+
+	entries := readShadowLines(t, shadowLog.Path())
+	if len(entries) != 1 {
+		t.Fatalf("got %d shadow log lines, want 1 run summary", len(entries))
+	}
+	e := entries[0]
+	if e.Type != compaction.EntryTypeHistoryRun {
+		t.Errorf("Type = %q, want %q", e.Type, compaction.EntryTypeHistoryRun)
+	}
+	if e.SegmentID != "" || e.Decision != "" {
+		t.Errorf("run summary must carry no decision fields, got segment_id=%q decision=%q", e.SegmentID, e.Decision)
+	}
+	if e.TS.IsZero() {
+		t.Error("run summary TS was not defaulted to now")
+	}
+	if want := compaction.HashTask("Please analyze this build log."); e.TaskHash != want {
+		t.Errorf("TaskHash = %q, want the session task's digest %q", e.TaskHash, want)
+	}
+	if e.TaskHash != report.TaskHash {
+		t.Errorf("TaskHash = %q, want the report's %q", e.TaskHash, report.TaskHash)
+	}
+	if e.Run == nil {
+		t.Fatal("run summary Run is nil")
+	}
+	want := compaction.RunSummary{
+		Scanned:      report.MessagesScanned,
+		Scored:       report.MessagesScored,
+		Elided:       report.SegmentsElided,
+		TokensBefore: report.TokensBefore,
+		TokensAfter:  report.TokensAfter,
+		TokensSaved:  report.TokensSaved,
+	}
+	if *e.Run != want {
+		t.Errorf("Run = %+v, want %+v", *e.Run, want)
+	}
+	if e.Run.Shadow {
+		t.Error("a mutating run must not report Shadow in its summary")
+	}
+	if e.Run.Err != "" {
+		t.Errorf("a clean run must log no error, got %q", e.Run.Err)
+	}
+}
+
+// TestHistoryCompactionRunnerLogsFailedRunSummary: a run that fails still
+// appends its summary (with the error string), and a shadow run's summary
+// says so — the failure must not cost the audit trail.
+func TestHistoryCompactionRunnerLogsFailedRunSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.json")
+	sess := compactionTestSession(t, path)
+	store := compaction.NewStore()
+	shadowLog, err := compaction.NewShadowLogAt(filepath.Join(t.TempDir(), "shadow.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := historyCompactionRunner(sess, failingHistoryScorer{}, store, true, compaction.DefaultRelocationThreshold, shadowLog)
+	report, err := runner(context.Background())
+	if err == nil {
+		t.Fatal("runner() error = nil, want the scorer failure")
+	}
+
+	entries := readShadowLines(t, shadowLog.Path())
+	if len(entries) != 1 {
+		t.Fatalf("got %d shadow log lines, want 1 run summary even for the failed run", len(entries))
+	}
+	e := entries[0]
+	if e.Type != compaction.EntryTypeHistoryRun || e.Run == nil {
+		t.Fatalf("entry = %+v, want a history-run summary", e)
+	}
+	if !e.Run.Shadow {
+		t.Error("a shadow run must report Shadow in its summary")
+	}
+	if e.Run.Err != err.Error() {
+		t.Errorf("Run.Err = %q, want the runner error %q", e.Run.Err, err.Error())
+	}
+	if e.Run.Scored != report.MessagesScored {
+		t.Errorf("Run.Scored = %d, want the report's %d", e.Run.Scored, report.MessagesScored)
 	}
 }
