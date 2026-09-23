@@ -12,6 +12,7 @@ import (
 
 	"late/internal/common"
 	"late/internal/config"
+	"late/internal/pathutil"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -1605,7 +1606,13 @@ func (m *Model) renderModelPickerView() {
 	lines = append(lines, header, "")
 
 	if len(m.ModelPickerModels) <= 1 && (m.AppConfig == nil || len(m.AppConfig.Models) == 0) {
-		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render("No models configured in ~/.config/late/config.json"))
+		// Point the user at the real OS config location; fall back to the
+		// literal only if the platform config dir cannot be resolved.
+		emptyMsg := "No models configured in ~/.config/late/config.json"
+		if cfgDir, dirErr := pathutil.LateConfigDir(); dirErr == nil {
+			emptyMsg = fmt.Sprintf("No models configured in %s", filepath.Join(cfgDir, "config.json"))
+		}
+		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render(emptyMsg))
 		lines = append(lines, "", viewEmptyStyle.Render("Please add a 'models' array to your config file first."))
 	} else {
 		// Instructions
