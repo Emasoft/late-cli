@@ -94,17 +94,20 @@ type HistoryScorer interface {
 }
 
 // ElideStore is the write side of the elided-original store CompactContext
-// relocates runs into: Put stores each elided run's original text under the
-// pointer's id so the expand tool can retrieve it (tool.ExpandStore reads it
-// back). New pointers are content-addressed (compaction.ContentID,
-// "r:<8hex>" — same run text, same id, same record), so Put is idempotent:
-// an existing id keeps its first record. NextID remains only for legacy
-// "elide-<n>" ids minted by older builds; new code never calls it. One store
-// is one id space; production wiring backs it with the compaction pipeline's
-// store so tool-output and history pointers share it.
+// relocates runs into: PutRecord stores each elided run's full record under
+// the pointer's id so the expand tool can retrieve it (tool.ExpandStore
+// reads the text back) and Step 13's outcomes can attribute it (origin,
+// token count, summary, contributing segment ids). New pointers are
+// content-addressed (compaction.ContentID, "r:<8hex>" — same run text, same
+// id, same record), so puts are idempotent: an existing id keeps its first
+// record. NextID remains only for legacy "elide-<n>" ids minted by older
+// builds; new code never calls it. One store is one id space; production
+// wiring backs it with the compaction pipeline's store so tool-output and
+// history pointers share it.
 type ElideStore interface {
 	NextID() string
 	Put(id, text string)
+	PutRecord(rec compaction.Record)
 }
 
 // CompactStore is the in-memory original-text store backing history
@@ -145,6 +148,16 @@ func (s *CompactStore) Put(id, text string) {
 		return
 	}
 	s.originals[id] = text
+}
+
+// PutRecord stores a record's text under its id. The in-memory session
+// store keeps originals only — origin, kind, and counter metadata are the
+// file-backed compaction store's business (main.go wires the same
+// *compaction.Store into the history walk in enabled mode) — and nothing
+// here relies on them: shadow runs never store, and tests only read text
+// back. Idempotent like Put.
+func (s *CompactStore) PutRecord(rec compaction.Record) {
+	s.Put(rec.ID, rec.Text)
 }
 
 // Get returns the original stored for id (the tool.ExpandStore read side).
@@ -323,8 +336,10 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 				return
 			}
 			var text strings.Builder
+			segIDs := make([]string, 0, len(run))
 			for _, seg := range run {
 				text.WriteString(seg.Text)
+				segIDs = append(segIDs, seg.ID)
 			}
 			runText := text.String()
 			id := compaction.ContentID(runText, "", "r")
@@ -332,17 +347,34 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 			for _, seg := range run {
 				tokens += seg.Tokens
 			}
+			summary := compaction.Summarise(runText, compaction.SummaryMaxChars)
 			pointer := compaction.FormatPointer(compaction.Pointer{
 				ID:      id,
 				Lines:   &[2]int{run[0].LineStart, run[len(run)-1].LineEnd},
 				Tokens:  tokens,
-				Summary: compaction.Summarise(runText, compaction.SummaryMaxChars),
+				Summary: summary,
 			})
 			pointers = append(pointers, pointer)
 			stored += len(runText)
 			elidedSegs += len(run)
 			if !opts.ShadowOnly {
-				store.Put(id, runText)
+				// The record mirrors the reference store.py Record for a
+				// history-elided run: kind elided_segment, origin
+				// "history" (the walk has no finer ref to attribute the
+				// run to), the run's token count and pointer summary, and
+				// the contributing segment ids the outcomes ledger
+				// attributes back to. CreatedTurn stays 0 — turn plumbing
+				// does not exist yet.
+				store.PutRecord(compaction.Record{
+					ID:          id,
+					Text:        runText,
+					Kind:        compaction.RecordKindElidedSegment,
+					Origin:      compaction.Origin{Source: compaction.OriginSourceHistory},
+					Tokens:      tokens,
+					CreatedTurn: 0,
+					Summary:     summary,
+					SegmentIDs:  segIDs,
+				})
 			}
 			b.WriteString(pointer)
 			b.WriteString("\n")

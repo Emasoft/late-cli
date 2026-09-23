@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -373,6 +374,81 @@ func TestCompactContextElidesToolResultWithStoreRoundTrip(t *testing.T) {
 		if task != wantTask {
 			t.Errorf("scorer task[%d] = %q, want the truncated last user message %q", i, truncateRunes(task, 80), truncateRunes(wantTask, 80))
 		}
+	}
+}
+
+// (c2) History compaction stores full records, not bare strings: kind
+// elided_segment, origin "history" (Step 12 origin threading), the run's
+// token count, the pointer summary, the contributing segment ids, and
+// zeroed expand/hit counters — everything Step 13's outcomes attribute
+// back through.
+func TestCompactContextStoresRecordMetadata(t *testing.T) {
+	fixture := defaultFixture()
+	s := newCompactSession(fixture)
+	segs := fixtureSegments(t, fixture)
+	store := compaction.NewStore()
+
+	if _, err := s.CompactContext(context.Background(), elideFirstScorer(segs), store, CompactionOptions{}); err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+
+	// Message 5's elided opening segment is a single-segment run.
+	segs5 := segs[5]
+	runText := segs5[0].Text
+	id := compaction.ContentID(runText, "", "r")
+	rec, ok := store.GetRecord(id)
+	if !ok {
+		t.Fatalf("store must hold a record for %s", id)
+	}
+	if rec.Text != runText {
+		t.Errorf("Text = %q, want the stored run %q", truncateRunes(rec.Text, 120), truncateRunes(runText, 120))
+	}
+	if rec.Kind != compaction.RecordKindElidedSegment {
+		t.Errorf("Kind = %q, want %q", rec.Kind, compaction.RecordKindElidedSegment)
+	}
+	if rec.Origin != (compaction.Origin{Source: compaction.OriginSourceHistory, Ref: "", Turn: 0}) {
+		t.Errorf("Origin = %+v, want {history  0}", rec.Origin)
+	}
+	if rec.CreatedTurn != 0 {
+		t.Errorf("CreatedTurn = %d, want 0 (turn plumbing does not exist yet)", rec.CreatedTurn)
+	}
+	if rec.Tokens != segs5[0].Tokens {
+		t.Errorf("Tokens = %d, want %d", rec.Tokens, segs5[0].Tokens)
+	}
+	if want := compaction.Summarise(runText, compaction.SummaryMaxChars); rec.Summary != want {
+		t.Errorf("Summary = %q, want %q", rec.Summary, want)
+	}
+	if !reflect.DeepEqual(rec.SegmentIDs, []string{segs5[0].ID}) {
+		t.Errorf("SegmentIDs = %v, want [%s]", rec.SegmentIDs, segs5[0].ID)
+	}
+	if rec.ExpandCount != 0 || rec.HitCount != 0 {
+		t.Errorf("counters = (expand %d, hit %d), want zeros", rec.ExpandCount, rec.HitCount)
+	}
+
+	// The file-backed production store records the same shape: a put
+	// through the ElideStore interface and a reload must preserve it. A
+	// fresh session runs the walk (the first run rewrote s's history).
+	path := filepath.Join(t.TempDir(), "compaction-store.jsonl")
+	persisted, err := compaction.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture2 := defaultFixture()
+	s2 := newCompactSession(fixture2)
+	segs2 := fixtureSegments(t, fixture2)
+	if _, err := s2.CompactContext(context.Background(), elideFirstScorer(segs2), persisted, CompactionOptions{}); err != nil {
+		t.Fatalf("CompactContext(file-backed store) error = %v", err)
+	}
+	reopened, err := compaction.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2, ok := reopened.GetRecord(id)
+	if !ok {
+		t.Fatalf("reopened store must hold the history record for %s", id)
+	}
+	if !reflect.DeepEqual(rec2, rec) {
+		t.Errorf("reopened record = %+v, want %+v", rec2, rec)
 	}
 }
 

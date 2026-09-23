@@ -706,7 +706,15 @@ func main() {
 			}
 			pipeline.ApplyGateConfig(gate)
 			if compactionMode == appconfig.CompactionModeEnabled {
-				store := compaction.NewStore()
+				// The record store persists elided originals across
+				// restarts: [[elided …]] pointers saved into a session
+				// history must still resolve after `late` exits, so
+				// relocation is backed by the append-only JSONL store at
+				// compaction.DefaultStorePath instead of a throwaway
+				// in-memory map. Open failure degrades to the in-memory
+				// store — compaction keeps working, pointers merely stop
+				// surviving restarts (the shadow-log warning pattern).
+				store := openCompactionStore()
 				pipeline.EnableRelocation(store, compactionThreshold)
 				// The expand tool returns relocated originals. Registered on
 				// the main registry before any spawn: subagents inherit it
@@ -1119,6 +1127,33 @@ func effectiveSubagentBudget(timeoutOverride *time.Duration, globalBudget time.D
 		return 0 // explicit per-spawn unlimited suppresses the global budget
 	}
 	return globalBudget
+}
+
+// openCompactionStore opens the persistent elided-record store at the
+// default path (compaction.DefaultStorePath), degrading to the in-memory
+// store — with a stderr warning — when the path cannot be resolved or the
+// file cannot be opened. Compaction must keep working even when its
+// persistence layer fails, exactly like the shadow log: the session loses
+// only cross-restart pointer resolution, nothing else.
+func openCompactionStore() *compaction.Store {
+	path, err := compaction.DefaultStorePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: compaction record store path unavailable (%v); continuing in-memory — elided originals will not survive restarts\n", err)
+		return compaction.NewStore()
+	}
+	return openCompactionStoreAt(path)
+}
+
+// openCompactionStoreAt is openCompactionStore for an explicit path; split
+// out so tests can exercise the degrade-to-in-memory fallback without
+// touching the real user store.
+func openCompactionStoreAt(path string) *compaction.Store {
+	store, err := compaction.OpenStore(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: compaction record store unavailable (%v); continuing in-memory — elided originals will not survive restarts\n", err)
+		return compaction.NewStore()
+	}
+	return store
 }
 
 // historyCompactionRunner adapts the live session for the TUI's
