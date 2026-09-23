@@ -200,3 +200,95 @@ func TestTodoPaneStartupWidthGuardIsSilent(t *testing.T) {
 		t.Fatalf("todos pane rendered despite narrow terminal: %q", screen)
 	}
 }
+
+// newFocusedTodoPaneModel returns a model with the todo pane open and focused,
+// plus the same model in the unfocused state, at a terminal size where the
+// pane is reserved (>= 85 columns).
+func newFocusedTodoPaneModel(t *testing.T, todos []tool.Todo) (focused, unfocused Model, focusedView, unfocusedView string) {
+	t.Helper()
+	m := newTodoPaneStartupModel(t, todos)
+	m.ShowTodoPane = true
+	m.SetSize(100, 30)
+
+	unfocused = m
+	unfocusedView = m.todoPaneView(m.Viewport.Height())
+
+	m.TodoPaneFocused = true
+	focused = m
+	focusedView = m.todoPaneView(m.Viewport.Height())
+
+	return focused, unfocused, focusedView, unfocusedView
+}
+
+func TestTodoPaneFocusedRenderDiffersFromUnfocused(t *testing.T) {
+	_, _, focused, unfocused := newFocusedTodoPaneModel(t, []tool.Todo{{Text: "Scaffold the parser"}})
+
+	if focused == unfocused {
+		t.Fatal("focused todo pane render must differ from the unfocused render")
+	}
+}
+
+func TestTodoPaneFocusMarker(t *testing.T) {
+	_, _, focused, unfocused := newFocusedTodoPaneModel(t, []tool.Todo{{Text: "Scaffold the parser"}})
+
+	// (b) focused render carries the explicit focus/unfocus hint.
+	if got := ansi.Strip(focused); !strings.Contains(got, "[focused · esc to unfocus]") {
+		t.Fatalf("focused pane missing [focused · esc to unfocus] marker: %q", got)
+	}
+	// (c) unfocused render carries no focus marker.
+	if got := ansi.Strip(unfocused); strings.Contains(got, "[focused") {
+		t.Fatalf("unfocused pane must not contain a [focused marker: %q", got)
+	}
+}
+
+// Truecolor SGR parameter fragments for the theme colors the pane switches
+// between (same hardcoded-fragment pattern as theme_test.go):
+// appBgColor #0B0C0E, todoFocusedBg #1B1E28, primaryColor #E5A85C.
+const (
+	todoTestAppBgSgrParams   = "48;2;11;12;14"
+	todoTestFocusBgSgrParams = "48;2;27;30;40"
+	todoTestBorderSgrParams  = "38;2;229;168;92"
+)
+
+func TestTodoPaneFocusedBackgroundAndBorder(t *testing.T) {
+	_, _, focused, unfocused := newFocusedTodoPaneModel(t, []tool.Todo{{Text: "Scaffold the parser"}})
+
+	// Focused: elevated background (content lines included) + brighter border.
+	if !strings.Contains(focused, todoTestFocusBgSgrParams) {
+		t.Fatalf("focused pane does not paint the focused background (#1B1E28): %q", focused)
+	}
+	if !strings.Contains(focused, todoTestBorderSgrParams) {
+		t.Fatalf("focused pane does not use the brighter primary border (#E5A85C): %q", focused)
+	}
+	if strings.Contains(focused, todoTestAppBgSgrParams) {
+		t.Fatalf("focused pane still paints the app background (#0B0C0E): %q", focused)
+	}
+
+	// Unfocused: unchanged baseline (app background, dark border).
+	if !strings.Contains(unfocused, todoTestAppBgSgrParams) {
+		t.Fatalf("unfocused pane does not paint the app background (#0B0C0E): %q", unfocused)
+	}
+	if strings.Contains(unfocused, todoTestFocusBgSgrParams) {
+		t.Fatalf("unfocused pane paints the focused background (#1B1E28): %q", unfocused)
+	}
+	if strings.Contains(unfocused, todoTestBorderSgrParams) {
+		t.Fatalf("unfocused pane uses the primary border (#E5A85C): %q", unfocused)
+	}
+}
+
+// TestTodoPaneFocusedScreenVTEClean runs the focused pane through the real
+// screen pipeline (View -> sanitizeVTE) and reuses validateNoVTELeaks to prove
+// every cell — pane background included — carries an explicit background, so
+// the focused color survives VTE reset re-assertion.
+func TestTodoPaneFocusedScreenVTEClean(t *testing.T) {
+	focused, _, _, _ := newFocusedTodoPaneModel(t, []tool.Todo{{Text: "Scaffold the parser"}})
+
+	screen := focused.View().Content
+	if !strings.Contains(screen, "[focused · esc to unfocus]") {
+		t.Fatalf("focused pane missing from rendered screen: %q", ansi.Strip(screen))
+	}
+	if !strings.Contains(screen, todoTestFocusBgSgrParams) {
+		t.Fatalf("rendered screen does not paint the focused todo pane background: %q", screen)
+	}
+	validateNoVTELeaks(t, "focused todo pane", screen)
+}
