@@ -203,6 +203,7 @@ export OPENAI_MODEL="model-name"
 * **True cl100k BPE Offline Tokenizer:** Embedded tokenizer calculates real BPE token counts offline with zero heuristic guesswork.
 * **Native Context-Aware Search:** High-performance codebase search with globster filtering that respects `.gitignore` and `.llmignore`.
 * **Agent Skills & MCP Support:** Natively consume external Model Context Protocol (MCP) servers and third-party Agent Skills with zero configuration overhead.
+* **Context Compaction with an Expand Tool (staged: shadow → enabled):** Oversized tool outputs are segmented and scored; low-scoring segments can be elided into pointers with the original text retrievable via the `expand` tool (see the Quickstart).
 * **Git Worktree Support:** Run independent, parallel agent instances across multiple branches simultaneously with zero context bleeding.
 
 ---

@@ -20,6 +20,7 @@ import (
 
 	"late/internal/assets"
 	"late/internal/client"
+	"late/internal/compaction"
 	appconfig "late/internal/config"
 	"late/internal/mcp"
 	"late/internal/pathutil"
@@ -119,6 +120,13 @@ func main() {
 	logitBiasReq := flag.String("logit-bias", "", "Main-agent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
 	suppressThinkingWordsReq := flag.Bool("suppress-thinking-words", false, "Bias anti-overthinking tokens (requires the same model for main agent and subagents).")
 	subagentLogitBiasReq := flag.String("subagent-logit-bias", "", "Subagent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
+	// Compaction (staged rollout of the jev-compaction port): off = no
+	// scoring at all; shadow = score tool outputs + shadow log only
+	// (default, no behavior change); enabled = additionally relocate
+	// low-scoring segments out of oversized tool results (registers the
+	// expand tool so originals stay retrievable).
+	compactionModeReq := flag.String("compaction-mode", "", "Tool-output compaction stage: off, shadow (score + shadow log only), or enabled (also relocate low-scoring segments; adds the expand tool). Overrides config.json compaction-mode. Default: shadow.")
+	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled.")
 
 	flag.Usage = func() {
 		writeHelp(os.Stderr, flag.CommandLine)
@@ -367,6 +375,11 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to load app config: %v\n", err)
 	}
+	// Surface an invalid compaction-threshold-percent the same way the
+	// invalid permission-mode is reported: warn once and use the default.
+	if _, compactionWarning := appconfig.ResolveCompactionThreshold(appConfig); compactionWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionWarning)
+	}
 	enabledTools := make(map[string]bool)
 	if appConfig != nil {
 		for toolName, enabled := range appConfig.EnabledTools {
@@ -532,6 +545,78 @@ func main() {
 				runner:      t.Runner,
 			})
 			pluginToolNames = append(pluginToolNames, t.Name)
+		}
+	}
+
+	// Compaction (staged rollout stage 2 of the jev-compaction port).
+	// Mode resolution: the -compaction-mode flag beats config.json
+	// compaction-mode; both are validated against the same three values
+	// (invalid → warn + shadow, the safe default).
+	compactionMode, compactionModeWarning := appconfig.ResolveCompactionMode(appConfig)
+	if *compactionModeReq != "" {
+		if appconfig.IsValidCompactionMode(*compactionModeReq) {
+			compactionMode = *compactionModeReq
+			compactionModeWarning = ""
+		} else {
+			compactionMode = appconfig.DefaultCompactionMode
+			compactionModeWarning = fmt.Sprintf("ignoring invalid -compaction-mode %q; using %q",
+				*compactionModeReq, appconfig.DefaultCompactionMode)
+		}
+	}
+	if compactionModeWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionModeWarning)
+	}
+
+	// Elision threshold: segments scoring strictly below it are relocated
+	// out of oversized tool results when compaction-mode is enabled
+	// (default per the upstream repo's own shadow-log replay data).
+	compactionThreshold := compaction.DefaultRelocationThreshold
+	if *compactionThresholdReq > 0 && *compactionThresholdReq <= 1 {
+		compactionThreshold = *compactionThresholdReq
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: ignoring invalid -compaction-threshold %v; using %v\n",
+			*compactionThresholdReq, compaction.DefaultRelocationThreshold)
+	}
+
+	if compactionMode != appconfig.CompactionModeOff {
+		backend, backendErr := compaction.ResolveBackendEnv("")
+		if backendErr != nil {
+			if compactionMode == appconfig.CompactionModeEnabled {
+				// Relocation without a backend would fail-open every
+				// oversized result (nothing ever elided): warn and drop to
+				// the shadow stage per the staged rollout.
+				fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q needs a System One backend (%v); falling back to %q\n",
+					appconfig.CompactionModeEnabled, backendErr, appconfig.CompactionModeShadow)
+				compactionMode = appconfig.CompactionModeShadow
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q has no System One backend (%v)\n",
+					appconfig.CompactionModeShadow, backendErr)
+			}
+		}
+		// The pipeline only exists behind a resolved backend: without one
+		// every decisions call would burn retries and fail-open, so this run
+		// proceeds with compaction off instead (the warning above explains).
+		if backendErr == nil {
+			shadowLog, shadowErr := compaction.NewShadowLog()
+			if shadowErr != nil {
+				// Logging is best-effort: scoring (and relocation) still
+				// run without it.
+				fmt.Fprintf(os.Stderr, "Warning: compaction shadow log unavailable (%v); continuing without it\n", shadowErr)
+				shadowLog = nil
+			}
+			pipeline := compaction.NewPipeline(backend, "", shadowLog, compaction.PipelineOptions{})
+			if compactionMode == appconfig.CompactionModeEnabled {
+				store := compaction.NewStore()
+				pipeline.EnableRelocation(store, compactionThreshold)
+				// The expand tool returns relocated originals. Registered on
+				// the main registry before any spawn: subagents inherit it
+				// (and the same store) from the parent registry.
+				sess.Registry.Register(tool.ExpandTool{Store: store})
+			}
+			// Shared by the root agent and every subagent: ExecuteToolCalls
+			// consults it for both (shadow mode scores and logs without
+			// changing results).
+			executor.SetToolResultCompactor(pipeline)
 		}
 	}
 
