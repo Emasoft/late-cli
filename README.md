@@ -196,6 +196,7 @@ export OPENAI_MODEL="model-name"
 * **Developer Ergonomics:**
   * `/compose`: Pop open your preferred `$EDITOR` (Neovim, Vim, Helix, VS Code) to draft complex, multi-line instructions.
   * `/rewind`: Visual history scrubber to roll back turns and branch conversational states.
+  * `/infobar` / `/timestamps`: Toggle the info footer (version, model, context, subagents, skills, uptime) and `[HH:MM:SS]` message timestamps; both persist to `config.json`.
   * `late --prompt "..."`: Start a session with a pre-given prompt, useful for running it from other scripts.
 * **Auditable Subagent History:** Full subagent conversation transcripts and metadata are persisted to disk for total transparency and debugging—without poisoning the orchestrator's active context window. Opt-in persistence protects your disk space while ensuring you can debug overnight autopilot runs.
 * **Exact-Match Diffs & Autonomous Healing:** Strict `search`/`replace` editing with automatic self-healing on mismatch. Edits fail loud; files are never silently corrupted.
@@ -203,6 +204,7 @@ export OPENAI_MODEL="model-name"
 * **True cl100k BPE Offline Tokenizer:** Embedded tokenizer calculates real BPE token counts offline with zero heuristic guesswork.
 * **Native Context-Aware Search:** High-performance codebase search with globster filtering that respects `.gitignore` and `.llmignore`.
 * **Agent Skills & MCP Support:** Natively consume external Model Context Protocol (MCP) servers and third-party Agent Skills with zero configuration overhead.
+* **Context Compaction with an Expand Tool (staged: shadow → enabled):** Oversized tool outputs are segmented and scored; low-scoring segments can be elided into pointers with the original text retrievable via the `expand` tool (see the Quickstart).
 * **Git Worktree Support:** Run independent, parallel agent instances across multiple branches simultaneously with zero context bleeding.
 
 ---

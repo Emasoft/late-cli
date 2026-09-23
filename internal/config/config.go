@@ -55,6 +55,32 @@ const (
 	configFilePerm os.FileMode = 0o600
 )
 
+// DefaultCompactionThresholdPercent is the context-usage percentage at which
+// compaction happens when config.json does not set
+// compaction-threshold-percent (or sets an invalid value).
+const DefaultCompactionThresholdPercent = 80
+
+// Compaction modes (staged rollout of the jev-compaction port). The
+// effective mode is resolved by ResolveCompactionMode: an explicitly set
+// --compaction-mode flag (validated in main) > config.json compaction-mode >
+// DefaultCompactionMode.
+const (
+	// CompactionModeOff disables compaction entirely: no scoring, no shadow
+	// log, no relocation.
+	CompactionModeOff = "off"
+	// CompactionModeShadow scores tool outputs and appends to the shadow log
+	// without changing any tool result (the stage-1 behavior).
+	CompactionModeShadow = "shadow"
+	// CompactionModeEnabled additionally relocates low-scoring segments out
+	// of tool results (with [[elided …]] pointers plus the expand tool to
+	// retrieve the originals).
+	CompactionModeEnabled = "enabled"
+)
+
+// DefaultCompactionMode is the compaction-mode default: score and shadow-log
+// only, never change agent behavior.
+const DefaultCompactionMode = CompactionModeShadow
+
 // Config represents the application configuration.
 type Config struct {
 	EnabledTools        map[string]bool `json:"enabled_tools"`
@@ -86,6 +112,34 @@ type Config struct {
 	Theme       string            `json:"theme,omitempty"`
 	Models      []ModelSetting    `json:"models,omitempty"`
 	AgentModels map[string]string `json:"agent_models,omitempty"`
+
+	// ShowInfoBar toggles the single-line info footer rendered below the
+	// TUI status bar (version, model, context usage, uptime, ...). Toggled
+	// at runtime with the /infobar slash command, which persists the new
+	// value back to config.json.
+	ShowInfoBar bool `json:"show-info-bar,omitempty"`
+
+	// ShowTimestamps toggles the [HH:MM:SS] prefix rendered at the start
+	// of each transcript message block. Toggled at runtime with the
+	// /timestamps slash command, which persists the new value back to
+	// config.json.
+	ShowTimestamps bool `json:"show-timestamps,omitempty"`
+
+	// CompactionThresholdPercent is the context-usage percentage at which
+	// compaction should trigger (surfaced by the TUI info bar as the
+	// remaining headroom). 0 means DefaultCompactionThresholdPercent;
+	// values outside 1-100 are invalid and resolve back to the default
+	// with a warning (see ResolveCompactionThreshold).
+	CompactionThresholdPercent int `json:"compaction-threshold-percent,omitempty"`
+
+	// CompactionMode selects the staged rollout stage of the tool-output
+	// compaction port: CompactionModeOff, CompactionModeShadow (default:
+	// score + shadow log only), or CompactionModeEnabled (also relocate
+	// low-scoring segments and register the expand tool). Set via config
+	// file; the --compaction-mode CLI flag overrides it. Invalid values
+	// warn and fall back to DefaultCompactionMode (see
+	// ResolveCompactionMode).
+	CompactionMode string `json:"compaction-mode,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -290,6 +344,54 @@ func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag bool) (mode st
 		}
 	}
 	return PermissionModeAskForUserApproval, "", nil
+}
+
+// ResolveCompactionThreshold returns the effective compaction threshold
+// percentage and a warning string, mirroring ResolvePermissionMode's
+// invalid-value pattern: 0 (unset) means DefaultCompactionThresholdPercent,
+// values in 1-100 are honored as-is, and anything else falls back to the
+// default with a warning.
+func ResolveCompactionThreshold(cfg *Config) (threshold int, warning string) {
+	if cfg == nil {
+		return DefaultCompactionThresholdPercent, ""
+	}
+	if cfg.CompactionThresholdPercent >= 1 && cfg.CompactionThresholdPercent <= 100 {
+		return cfg.CompactionThresholdPercent, ""
+	}
+	if cfg.CompactionThresholdPercent == 0 {
+		return DefaultCompactionThresholdPercent, ""
+	}
+	return DefaultCompactionThresholdPercent,
+		fmt.Sprintf("ignoring invalid config.json compaction-threshold-percent %d; using %d",
+			cfg.CompactionThresholdPercent, DefaultCompactionThresholdPercent)
+}
+
+// IsValidCompactionMode reports whether mode is one of the accepted
+// compaction-mode values (off, shadow, enabled).
+func IsValidCompactionMode(mode string) bool {
+	switch mode {
+	case CompactionModeOff, CompactionModeShadow, CompactionModeEnabled:
+		return true
+	}
+	return false
+}
+
+// ResolveCompactionMode returns the effective compaction mode from
+// config.json and a warning string, mirroring ResolveCompactionThreshold's
+// invalid-value pattern: empty (unset) means DefaultCompactionMode, valid
+// values are honored as-is, and anything else falls back to the default with
+// a warning. The --compaction-mode CLI flag overrides the resolved value and
+// is validated with IsValidCompactionMode by the caller (main).
+func ResolveCompactionMode(cfg *Config) (mode string, warning string) {
+	if cfg == nil || cfg.CompactionMode == "" {
+		return DefaultCompactionMode, ""
+	}
+	if IsValidCompactionMode(cfg.CompactionMode) {
+		return cfg.CompactionMode, ""
+	}
+	return DefaultCompactionMode,
+		fmt.Sprintf("ignoring invalid config.json compaction-mode %q; using %q",
+			cfg.CompactionMode, DefaultCompactionMode)
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {
