@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // relocationOutput builds a three-paragraph tool output whose segments stay
@@ -278,7 +277,7 @@ func TestPipeline_CompactOutputFailOpenKeepsOriginal(t *testing.T) {
 			store := NewStore()
 			p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
 			if tc.shrink {
-				p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
+				shrinkPipelineRetryCurve(p)
 			}
 			p.EnableRelocation(store, 0.35)
 			applyTestGate(p, 0.35, 0.7)

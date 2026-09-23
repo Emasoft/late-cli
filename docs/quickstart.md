@@ -163,7 +163,7 @@ When Late creates subagents, each appears in its own tab while it works and disa
 
 ## Context Compaction
 
-Late can keep oversized tool outputs out of the orchestrator's context. Pick a stage with `--compaction-mode` (or `compaction-mode` in `config.json`):
+Late can keep oversized tool outputs out of the orchestrator's context. The port follows [jev-compaction](https://github.com/Waxmell114514/jev-compaction) (MIT) and its staged shadow → enabled rollout. Pick a stage with `--compaction-mode` (or `compaction-mode` in `config.json`):
 
 * `off` — no scoring, no logging.
 * `shadow` (default) — tool outputs are segmented and Jev-scored, and what *would* be elided is recorded to the shadow log (`~/.local/share/late/compaction-shadow.jsonl`). No behavior change.
@@ -171,9 +171,53 @@ Late can keep oversized tool outputs out of the orchestrator's context. Pick a s
 
 Scoring is fail-open: any backend error keeps the original tool output. Segments below `--compaction-threshold` (default `0.35`) are elided; `compaction-threshold-percent` in `config.json` sets the context-usage percentage the compaction threshold refers to.
 
+### Pointers and the record store
+
+An elided run of segments is replaced by one pointer line standing exactly where the run stood:
+
+```
+[[elided id=r:1a2b3c4d lines=12-18 tokens=214 "first line of the elided run, cut at 120 chars…"]]
+```
+
+* `id` is content-addressed: the first 8 hex chars of a SHA-256 of the run text, so the same run always maps to the same id and the same record (re-compacting identical text never duplicates records).
+* `lines` is the run's 1-based line range in the original output, `tokens` its token count, and the quoted summary is a 120-char preview so the agent can decide whether the `expand` tool is worth calling.
+
+Under `compaction-mode: enabled` the originals are persisted to an append-only JSONL store at `~/.local/share/late/compaction-store.jsonl`, so pointers saved into a session history still resolve — and `expand` still works — after `late` exits. If the store cannot be opened, compaction degrades to in-memory (with a warning): the session keeps working, only cross-restart pointer resolution is lost.
+
+### Gate safety knobs
+
+The elide decision runs through the reference pipeline's gate (defaults mirror `pipeline.py`):
+
+* `compaction-max-elide-percent` (default `70`, range 1–100) — the tripwire: when the scorer wants to elide more than this share of a tool output's tokens, it is distrusted and NOTHING is elided for that output (recorded in the result and the shadow log).
+* `compaction-protected-floor` (default `5`, range 1–100) — stacktrace and diff segments are only elided below this score, whatever the normal threshold: a dropped hunk or trace silently corrupts everything built on top of it.
+* The token min-gate (fixed 400 tokens) skips scoring entirely for outputs below the floor — the round trip costs more than any possible elision saves.
+
+### Preflight and replay (`-check-compaction`, `-replay-shadow`)
+
+```bash
+late -check-compaction            # three-stage preflight against the resolved backend
+late -replay-shadow=0.10,0.35,0.50   # replay the shadow log at other thresholds
+```
+
+* `-check-compaction` runs the three stages the reference `check.py` runs — (1) decisions answers parse, (2) the gate actually relocates something from a real ~2KB tool output, (3) a pointer expands back byte for byte — prints a per-stage report with latencies, and exits 0/1 without starting the TUI. Run it after configuring a backend and before trusting the feature; the first failing stage names what broke (bad key, malformed request, unreachable server).
+* `-replay-shadow=<thresholds>` is read-only offline replay: it re-decides every logged score at each comma-separated threshold (no scorer round trips) and prints the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, so you can pick `--compaction-threshold` from your own traffic instead of the default.
+
+### Offline demo (`compaction-backend: "offline"`)
+
+```json
+{
+  "compaction-mode": "enabled",
+  "compaction-backend": "offline"
+}
+```
+
+`compaction-backend: "offline"` swaps the System One scoring backend for a deterministic local scripted scorer: scores are a SHA-256 of the task and segment text mapped into [0,1), so the whole flow — shadow scoring, the gate, pointers, `expand`, `/jev-compact-context`, `-check-compaction` — runs with NO API key, NO network, and identical results every run. It exists for demos and tests only: the scores measure nothing about essentialness, so never ship it as a default (the value wins over `JEV_API`/auto-detection when set, and `-check-compaction` passes by construction on this backend).
+
 ### Full-History Compaction (`/jev-compact-context`)
 
 `/jev-compact-context` in the TUI compacts the whole conversation, not just tool outputs: every message after a frozen prefix (the first quarter of the history, so the system prompt and earliest exchanges stay byte-identical for prompt caching) is segmented and Jev-scored against the ongoing task. Low-scoring segments are replaced in place with `[[elided …]]` pointer lines and their originals move to the store, where the `expand` tool retrieves them on demand; user messages are never compacted. The command requires `compaction-mode` ≠ `off`; under `shadow` it runs report-only, showing what a real run would save without touching history.
+
+The frozen prefix is append-only across runs AND restarts: every completed run advances a persisted high-water mark (session meta `CompactionHighWater`), and messages below the mark are never re-scored or rewritten — resumed sessions never spend tokens re-compacting what an earlier run already froze. A run that would mutate a message below the mark fails loudly instead of corrupting the cache anchor. Pointer-bearing messages are final (never re-scored, never nested).
 
 ### Auto-Compaction (`jev-autocompact`)
 
@@ -197,6 +241,8 @@ Scoring is fail-open: any backend error keeps the original tool output. Segments
 ```
 
 `compaction-retrieval` (bool, default `false`) turns on the read side of the compaction store: before every stream request, the store's per-record summaries are scored against the current task and the top matches (up to 5 records scoring ≥ 0.5, capped at a 24k-token digest budget) are appended to the END of the outgoing request as a "Retrieved context" block. That is the work area by construction — it never touches the frozen prefix, never lands in history, and never shows in the transcript, so it costs tokens only for the request that carries it and is re-scored fresh every turn. Each scored record is logged to the shadow log as a `kind=retrieve` decision (`injected`/`skipped`), so `-replay-shadow` tooling can audit what retrieval would have injected at other thresholds. The switch only does something under `compaction-mode: enabled` — that is the only mode whose record store ever fills (the resolver warns about the inert combinations) — and a scoring failure stages nothing for that turn rather than injecting unranked records.
+
+> Credits: the scoring protocol, the gate, the pointer format, the shadow log, and the staged shadow → enabled rollout are a Go port of [jev-compaction](https://github.com/Waxmell114514/jev-compaction) (MIT). The offline scripted scorer mirrors that repo's testing.py demo, which drives the same flow against a scripted stand-in scorer with no backend.
 
 ---
 

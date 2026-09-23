@@ -130,7 +130,7 @@ func main() {
 	compactionModeReq := flag.String("compaction-mode", "", "Tool-output compaction stage: off, shadow (score + shadow log only), or enabled (also relocate low-scoring segments; adds the expand tool). Overrides config.json compaction-mode. Default: shadow.")
 	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled.")
 	replayShadowReq := flag.String("replay-shadow", "", "Replay the default shadow log at the given comma-separated thresholds (e.g. 0.10,0.35,0.50): print the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, then exit. Read-only; the TUI does not start.")
-	checkCompactionReq := flag.Bool("check-compaction", false, "Run the compaction preflight against the resolved System One backend — real requests checking (1) decisions answers and parse, (2) the gate relocates something from a real tool output, (3) a pointer expands back byte for byte — print the per-stage report and exit (0 pass, 1 fail; the TUI does not start). Pairs with -compaction-mode.")
+	checkCompactionReq := flag.Bool("check-compaction", false, "Run the compaction preflight against the resolved System One backend — real requests checking (1) decisions answers and parse, (2) the gate relocates something from a real tool output, (3) a pointer expands back byte for byte — print the per-stage report and exit (0 pass, 1 fail; the TUI does not start). Pairs with -compaction-mode. With config.json compaction-backend \"offline\" the same three stages run against the deterministic local scripted scorer: no key, no network.")
 
 	flag.Usage = func() {
 		writeHelp(os.Stderr, flag.CommandLine)
@@ -609,6 +609,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionRetrievalWarning)
 	}
 
+	// Backend selection (Step 18): config.json compaction-backend points
+	// scoring at a specific scorer. The only value today is "offline" — the
+	// deterministic scripted scorer (no API key, no network; demos and tests
+	// only, its scores are content hashes). A set value WINS over the
+	// environment: JEV_API and auto-detection are consulted only when the
+	// entry is absent, because the config entry is the explicit statement
+	// about where scoring happens. Invalid values warn and fall back to the
+	// env-based path.
+	compactionBackendName, compactionBackendWarning := appconfig.ResolveCompactionBackend(appConfig)
+	if compactionBackendWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionBackendWarning)
+	}
+
 	// -check-compaction: run the compaction preflight (Step 16) against the
 	// backend THIS run would resolve and exit — the TUI never starts. The
 	// mode resolution above is deliberately shared with the normal startup
@@ -617,9 +630,11 @@ func main() {
 	// here the same way it would in a real run. The check itself exercises
 	// scoring, the gate, and expansion — a superset of what shadow mode does
 	// — so it applies in every mode: it is the "would have caught the
-	// too-small local backend before integration" tool.
+	// too-small local backend before integration" tool. With the offline
+	// backend selected in config.json the same stages run against the
+	// scripted scorer — no key, no network, and they pass by construction.
 	if *checkCompactionReq {
-		os.Exit(runCompactionCheck())
+		os.Exit(runCompactionCheck(compactionBackendName == appconfig.CompactionBackendOffline))
 	}
 
 	// Elision threshold: segments scoring strictly below it are relocated
@@ -655,29 +670,48 @@ func main() {
 		compactionShadowLog *compaction.ShadowLog
 		// compactionBackend is the resolved backend behind the pipeline,
 		// captured for the Step 16 startup probe; nil when compaction is
-		// off or no backend resolved (no probe without a pipeline).
+		// off, no backend resolved, or the offline scripted scorer is
+		// selected (nothing to probe — there is no network to reach).
 		compactionBackend *compaction.ResolvedBackend
 	)
 	if compactionMode != appconfig.CompactionModeOff {
-		backend, backendErr := compaction.ResolveBackendEnv("")
-		if backendErr != nil {
-			if compactionMode == appconfig.CompactionModeEnabled {
-				// Relocation without a backend would fail-open every
-				// oversized result (nothing ever elided): warn and drop to
-				// the shadow stage per the staged rollout.
-				fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q needs a System One backend (%v); falling back to %q\n",
-					appconfig.CompactionModeEnabled, backendErr, appconfig.CompactionModeShadow)
-				compactionMode = appconfig.CompactionModeShadow
+		// Scoring source: the offline scripted scorer (compaction-backend
+		// "offline") or, when the config entry is absent/invalid, the
+		// env-resolved System One backend as before. The config entry wins:
+		// an "offline" session never resolves a backend, never needs a key,
+		// and never sends a request.
+		compactionOffline := compactionBackendName == appconfig.CompactionBackendOffline
+		var (
+			backend   compaction.ResolvedBackend
+			scoringOK bool
+		)
+		if compactionOffline {
+			scoringOK = true
+		} else {
+			resolved, backendErr := compaction.ResolveBackendEnv("")
+			if backendErr != nil {
+				if compactionMode == appconfig.CompactionModeEnabled {
+					// Relocation without a backend would fail-open every
+					// oversized result (nothing ever elided): warn and drop to
+					// the shadow stage per the staged rollout.
+					fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q needs a System One backend (%v); falling back to %q\n",
+						appconfig.CompactionModeEnabled, backendErr, appconfig.CompactionModeShadow)
+					compactionMode = appconfig.CompactionModeShadow
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q has no System One backend (%v)\n",
+						appconfig.CompactionModeShadow, backendErr)
+				}
 			} else {
-				fmt.Fprintf(os.Stderr, "Warning: compaction-mode %q has no System One backend (%v)\n",
-					appconfig.CompactionModeShadow, backendErr)
+				backend = resolved
+				scoringOK = true
 			}
 		}
-		// The pipeline only exists behind a resolved backend: without one
-		// every decisions call would burn retries and fail-open, so this run
+		// The pipeline only exists behind usable scoring: without it every
+		// decisions call would burn retries and fail-open, so this run
 		// proceeds with compaction off instead (the warning above explains).
-		if backendErr == nil {
-			compactionBackend = &backend
+		// Offline scoring is always usable — that is the point of the demo
+		// path.
+		if scoringOK {
 			shadowLog, shadowErr := compaction.NewShadowLog()
 			if shadowErr != nil {
 				// Logging is best-effort: scoring (and relocation) still
@@ -686,7 +720,18 @@ func main() {
 				shadowLog = nil
 			}
 			compactionShadowLog = shadowLog
-			pipeline := compaction.NewPipeline(backend, "", shadowLog, compaction.PipelineOptions{})
+			var pipeline *compaction.Pipeline
+			if compactionOffline {
+				// Step 18 demo path: the same segmentation, gate, pointers,
+				// and store over the deterministic scripted scorer. Demos
+				// and tests only — the scripted scores are content hashes,
+				// not essentialness judgments, and must never become a
+				// production default.
+				pipeline = compaction.NewOfflinePipeline(compaction.PipelineOptions{Shadow: shadowLog})
+			} else {
+				compactionBackend = &backend
+				pipeline = compaction.NewPipeline(backend, "", shadowLog, compaction.PipelineOptions{})
+			}
 			// GateConfig: the reference-parity elision safety semantics —
 			// keep threshold, elide-fraction tripwire, and protected-kind
 			// floors — threaded from config.json (defaults mirror the
@@ -1055,7 +1100,8 @@ func main() {
 }
 
 // compactionCheckTimeout bounds the whole -check-compaction preflight (three
-// stages of real requests against the backend, one attempt each) and
+// stages of real requests against the backend, one attempt each; the offline
+// backend's stages are local and finish in microseconds) and
 // compactionProbeTimeout bounds the light startup probe. Generous enough for
 // a slow local gateway, short enough that a dead endpoint cannot hang the
 // flag or the startup path.
@@ -1069,8 +1115,21 @@ const (
 // call the pipeline wiring makes — and returns the process exit code: 0 when
 // every stage passes, 1 otherwise. A missing backend or key is stage 0's
 // failure: the report then says what to configure instead of starting a run
-// that cannot score anything.
-func runCompactionCheck() int {
+// that cannot score anything. With offline (config.json compaction-backend
+// "offline") the same three stages run against the deterministic scripted
+// scorer instead: no backend is resolved, no key is consulted, no request is
+// sent, and the stages pass by construction — the demo path's self-test.
+func runCompactionCheck(offline bool) int {
+	if offline {
+		ctx, cancel := context.WithTimeout(context.Background(), compactionCheckTimeout)
+		defer cancel()
+		results, ok := compaction.RunPreflightOffline(ctx)
+		fmt.Print(compaction.FormatCheckReport(results, ok))
+		if !ok {
+			return 1
+		}
+		return 0
+	}
 	backend, backendErr := compaction.ResolveBackendEnv("")
 	if backendErr != nil {
 		fmt.Print(compaction.FormatCheckReport(noBackendCheckResults(backendErr), false))

@@ -102,6 +102,15 @@ const DefaultCompactionMaxElidePercent = 70
 // value).
 const DefaultCompactionProtectedFloorPercent = 5
 
+// CompactionBackendOffline is the compaction-backend value that selects the
+// deterministic offline scripted scorer (compaction.ScriptedScorer): the
+// whole compaction flow runs locally with no API key and no network. It
+// exists for demos and tests — the scripted scores are a content hash, not a
+// judgment of essentialness — and must never become a production default.
+// It mirrors compaction.OfflineBackendName (re-declared here so the config
+// package stays free of a compaction import).
+const CompactionBackendOffline = "offline"
+
 // Config represents the application configuration.
 type Config struct {
 	EnabledTools        map[string]bool `json:"enabled_tools"`
@@ -179,6 +188,18 @@ type Config struct {
 	// outside 1-100 are invalid and resolve back to the default with a
 	// warning (see ResolveCompactionProtectedFloor).
 	CompactionProtectedFloor int `json:"compaction-protected-floor,omitempty"`
+
+	// CompactionBackend selects where compaction scores come from. The only
+	// value today is CompactionBackendOffline ("offline"): the deterministic
+	// scripted scorer — no API key, no network, demos and tests only (its
+	// scores are content hashes, not judgments). Empty (unset) keeps the
+	// env-based backend resolution (JEV_API / auto-detection) that
+	// compaction.ResolveBackendEnv performs. A set value WINS over the env
+	// — the config entry is the explicit statement about where scoring
+	// happens, so JEV_API is only consulted when this entry is absent.
+	// Invalid values warn and fall back to the env-based resolution (see
+	// ResolveCompactionBackend).
+	CompactionBackend string `json:"compaction-backend,omitempty"`
 
 	// CompactionRetrieval enables the retrieve() read side of the compaction
 	// record store (Step 17): before every stream request the store's digest
@@ -504,6 +525,40 @@ func ResolveCompactionProtectedFloor(cfg *Config) (percent int, warning string) 
 	return DefaultCompactionProtectedFloorPercent,
 		fmt.Sprintf("ignoring invalid config.json compaction-protected-floor %d; using %d",
 			cfg.CompactionProtectedFloor, DefaultCompactionProtectedFloorPercent)
+}
+
+// IsValidCompactionBackend reports whether backend is one of the accepted
+// compaction-backend values (offline).
+func IsValidCompactionBackend(backend string) bool {
+	return backend == CompactionBackendOffline
+}
+
+// ResolveCompactionBackend returns the effective compaction-backend value
+// from config.json plus a warning, mirroring ResolveCompactionMode's
+// invalid-value pattern. Precedence: a set config value WINS — scoring goes
+// exactly where the user pointed it, and the env-based backend resolution
+// (JEV_API / auto-detection inside compaction.ResolveBackendEnv) is only
+// consulted when this entry is ABSENT. So:
+//
+//   - ("", "") — unset (or a nil config): the caller resolves a backend
+//     from the environment as before.
+//   - ("offline", "") — the offline scripted scorer; the caller builds the
+//     offline pipeline and never resolves a backend or needs a key.
+//   - ("", warning) — an unrecognized value: the config entry is ignored
+//     with the warning, and the caller falls back to the env-based
+//     resolution.
+//
+// The warning names the config key so the user can fix the typo in
+// config.json rather than guess which entry was rejected.
+func ResolveCompactionBackend(cfg *Config) (backend string, warning string) {
+	if cfg == nil || cfg.CompactionBackend == "" {
+		return "", ""
+	}
+	if IsValidCompactionBackend(cfg.CompactionBackend) {
+		return cfg.CompactionBackend, ""
+	}
+	return "", fmt.Sprintf("ignoring invalid config.json compaction-backend %q (known values: %s); resolving the backend from the environment",
+		cfg.CompactionBackend, CompactionBackendOffline)
 }
 
 // ResolveCompactionRetrieval returns whether the compaction store's

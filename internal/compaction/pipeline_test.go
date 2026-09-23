@@ -19,6 +19,17 @@ func fixedScoresHandler(scores map[string]float64) func(int, capturedRequest) (i
 	}
 }
 
+// shrinkPipelineRetryCurve shrinks the pipeline's decision-client retry
+// curve for a fast test. The pipeline holds its scorer behind the Scorer
+// interface (so the offline pipeline can swap in the scripted scorer);
+// production code never touches the concrete retry fields, tests do, hence
+// the type assertion — a no-op for a pipeline over any other scorer.
+func shrinkPipelineRetryCurve(p *Pipeline) {
+	if dc, ok := p.client.(*DecisionClient); ok {
+		dc.baseBackoff, dc.maxBackoff = time.Millisecond, time.Millisecond
+	}
+}
+
 func TestPipeline_ScoreToolOutputEndToEnd(t *testing.T) {
 	scores := map[string]float64{"seg-1": 0.9, "seg-2": 0.1, "seg-3": 0.55}
 	d := newDecisionsServer(t, fixedScoresHandler(scores))
@@ -108,7 +119,7 @@ func TestPipeline_FailOpenStillLogs(t *testing.T) {
 	backend := ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}
 	p := NewPipeline(backend, "k", shadow, PipelineOptions{})
 	// Shrink the client's retry curve for a fast test.
-	p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
+	shrinkPipelineRetryCurve(p)
 
 	output := strings.Repeat("a", 200) + "\n\n" + strings.Repeat("b", 200) + "\n\n" + strings.Repeat("c", 200)
 	got, err := p.ScoreToolOutput(context.Background(), "Bash", output)
@@ -223,7 +234,7 @@ func TestPipeline_CanceledContextFailsOpen(t *testing.T) {
 	d := newDecisionsServer(t, echoHandler)
 	backend := ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}
 	p := NewPipeline(backend, "k", nil, PipelineOptions{})
-	p.client.baseBackoff, p.client.maxBackoff = time.Millisecond, time.Millisecond
+	shrinkPipelineRetryCurve(p)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

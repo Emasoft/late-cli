@@ -11,13 +11,29 @@ import (
 	"time"
 )
 
+// Scorer is the batch-scoring interface the Pipeline consumes: score one
+// batch of items against one ongoing task. *DecisionClient (the System One
+// backend client) is the production implementation; compaction.ScriptedScorer
+// is the deterministic offline one (compaction-backend "offline" — demos and
+// tests only). The same method set is session.HistoryScorer's, so a pipeline
+// scores both the tool-output path and full-history compaction.
+type Scorer interface {
+	ScoreBatch(ctx context.Context, task string, items map[string]Item) (map[string]float64, error)
+}
+
+// The production scoring client is the reference Scorer.
+var _ Scorer = (*DecisionClient)(nil)
+
 // Pipeline ties segmentation, scoring, and the shadow log together for the
 // tool layer. Stage 1 (shadow-only) is ScoreToolOutput: it records decisions
 // and returns scores without ever mutating agent behavior. Stage 2
 // (relocation, armed with EnableRelocation) additionally elides low-scoring
 // segments from tool results and stores their originals for the expand tool.
 type Pipeline struct {
-	client      *DecisionClient
+	// client scores every segment batch. Held as the Scorer interface, not
+	// the concrete *DecisionClient, so the deterministic offline scorer
+	// (NewOfflinePipeline) can drive the same pipeline without HTTP.
+	client      Scorer
 	shadow      *ShadowLog
 	maxSegChars int
 	// now is the clock for shadow-log timestamps; a var solely for tests.
@@ -58,8 +74,14 @@ type PipelineOptions struct {
 	MaxSegChars int
 	// HTTPClient overrides the decision client's transport (tests inject
 	// fast/recorded transports here). Nil uses the stdlib default with a
-	// 30s per-attempt timeout.
+	// 30s per-attempt timeout. Only read by NewPipeline (the offline
+	// pipeline never sends requests).
 	HTTPClient *http.Client
+	// Shadow is the shadow log for NewOfflinePipeline, which has no backend
+	// parameter to hang one on. NewPipeline takes its shadow as its own
+	// third argument and ignores this field; nil (the zero value) disables
+	// logging exactly as online.
+	Shadow *ShadowLog
 }
 
 // NewPipeline builds a shadow-only scoring pipeline. backend must be ready
@@ -71,11 +93,18 @@ func NewPipeline(backend ResolvedBackend, apiKey string, shadow *ShadowLog, opts
 	if opts.HTTPClient != nil {
 		c.http = opts.HTTPClient
 	}
-	max := opts.MaxSegChars
+	return newPipelineWithScorer(c, shadow, opts.MaxSegChars)
+}
+
+// newPipelineWithScorer is the shared constructor: one Scorer behind a
+// pipeline with the default segment cap and clock. maxSegChars <= 0 means
+// DefaultMaxSegChars.
+func newPipelineWithScorer(scorer Scorer, shadow *ShadowLog, maxSegChars int) *Pipeline {
+	max := maxSegChars
 	if max <= 0 {
 		max = DefaultMaxSegChars
 	}
-	return &Pipeline{client: c, shadow: shadow, maxSegChars: max, now: time.Now, warnTo: os.Stderr}
+	return &Pipeline{client: scorer, shadow: shadow, maxSegChars: max, now: time.Now, warnTo: os.Stderr}
 }
 
 // noteAuthFailure records an auth rejection: compaction scoring is disabled
@@ -122,12 +151,14 @@ func (p *Pipeline) authDisabled() (bool, string) {
 	return p.authDead, p.authReason
 }
 
-// HistoryScorer exposes the pipeline's decision client as the scorer for
-// full-history compaction: session.CompactContext scores history segments
-// against the ongoing task with the same client — and the same retry and
-// fail-open contract — the tool-output path uses. A nil pipeline yields nil;
-// callers treat that as "compaction unavailable".
-func (p *Pipeline) HistoryScorer() *DecisionClient {
+// HistoryScorer exposes the pipeline's scorer as the scorer for full-history
+// compaction: session.CompactContext scores history segments against the
+// ongoing task with the same scorer — and the same retry and fail-open
+// contract — the tool-output path uses. A nil pipeline yields nil; callers
+// treat that as "compaction unavailable". The concrete type behind the
+// interface is the pipeline's decision client (the offline pipeline returns
+// its ScriptedScorer); session.HistoryScorer is the same method set.
+func (p *Pipeline) HistoryScorer() Scorer {
 	if p == nil {
 		return nil
 	}
