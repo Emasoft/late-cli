@@ -1164,8 +1164,12 @@ func main() {
 	// alt-screen (duplicated footer rows, displaced agent-name line). The
 	// trailing newline the stderr formatting carries is trimmed here so the
 	// toast text is clean. Sources without a sink installed (CLI flows,
-	// pre-TUI bootstrap) still fall back to os.Stderr.
+	// pre-TUI bootstrap) still fall back to os.Stderr. Every diagnostic is
+	// ALSO appended to the durable critical-error log
+	// (~/.local/share/late/late-errors.log): a toast disappears with the
+	// terminal, the file does not — best-effort, never fails the caller.
 	diag := func(msg string) {
+		common.LogError("diagnostic", strings.TrimRight(msg, "\n"))
 		p.Send(tui.DiagnosticMsg{Text: strings.TrimRight(msg, "\n")})
 	}
 
@@ -1247,6 +1251,7 @@ func main() {
 			defer cancel()
 			if err := compaction.ProbeBackend(ctx, probeBackend, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: compaction backend probe failed (%v); scoring fails open this session\n", err)
+				common.LogErrorf("compaction", "backend probe failed: %v", err)
 				p.Send(tui.BootstrapStatusMsg{
 					Text:    "compaction: backend probe failed — scoring fails open",
 					Warning: true,
@@ -1512,6 +1517,7 @@ func openCompactionStore() *compaction.Store {
 	path, err := compaction.DefaultStorePath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: compaction record store path unavailable (%v); continuing in-memory — elided originals will not survive restarts\n", err)
+		common.LogErrorf("compaction-store", "record store path unavailable: %v", err)
 		return compaction.NewStore()
 	}
 	return openCompactionStoreAt(path)
@@ -1524,6 +1530,7 @@ func openCompactionStoreAt(path string) *compaction.Store {
 	store, err := compaction.OpenStore(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: compaction record store unavailable (%v); continuing in-memory — elided originals will not survive restarts\n", err)
+		common.LogErrorf("compaction-store", "record store unavailable at %s: %v", path, err)
 		return compaction.NewStore()
 	}
 	return store
@@ -1631,6 +1638,12 @@ func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer
 			if saveErr := session.SaveHistory(sess.HistoryPath, sess.History); saveErr != nil {
 				err = errors.Join(err, fmt.Errorf("saving compacted history: %w", saveErr))
 			}
+		}
+		if err != nil {
+			// Durable record of the failure (walk aborts, save failures):
+			// the toast/TUI notice is ephemeral, the error log is not.
+			// Best-effort — never fails the run.
+			common.LogErrorf("compaction", "history compaction run failed (shadow=%v): %v", shadow, err)
 		}
 		if shadowLog != nil {
 			run := compaction.RunSummary{

@@ -53,23 +53,45 @@ const RetrieveQuestionTrue = "The item is relevant to the current step."
 // string (pipeline.py), verbatim.
 const RetrieveQuestionFalse = "The item is not relevant right now."
 
-// AdmitQuestionInstructions is the reference ADMIT_QUESTION instructions
-// string (pipeline.py), verbatim — the ONE question this port's
-// DecisionClient asks about every item (noulQuestionFor in client.go, the
-// reference's admit end of score_items). Like the reference, the question
-// never embeds the task: the task digest travels in state.task.
+// AdmitQuestionInstructions is the ONE question this port's DecisionClient
+// asks about every item (noulQuestionFor in client.go, the reference's admit
+// end of score_items). Like the reference, the question never embeds the
+// task: the task digest travels in state.task.
+//
+// The wording sharpens the reference ADMIT_QUESTION's boundary while keeping
+// its conservative spirit ("answer false ONLY if it is noise"): real-run
+// replay showed the reference wording scoring dense work content 0.4–0.89 —
+// almost nothing elided — because "facts, identifiers, errors, results" also
+// describes the boilerplate progress logs that embed those words. The rewrite
+// pins the NOISE side to what it actually is (progress output,
+// confirmations, repeated boilerplate, large repetitive dumps whose key
+// facts are retained nearby or re-derivable) and the ESSENTIAL side to the
+// concrete facts a later step may have to refer back to, and tells the
+// scorer explicitly that verbose intermediate logs are noise even when they
+// mention relevant words while their final results/summaries are essential.
 const AdmitQuestionInstructions = "Will this item still be needed later in the task described in `task`? " +
-	"Answer true if it contains facts, identifiers, errors, results, or decisions " +
-	"that a later step may have to refer back to. Answer false only if it is " +
-	"progress noise, repeated boilerplate, or formatting with no retained content."
+	"Answer false if it is NOISE: progress output, success or progress confirmations, repeated " +
+	"boilerplate, or a large repetitive dump (verbose intermediate logs, build or test output, " +
+	"file listings) whose key facts — file paths, commands, error messages, final results — are " +
+	"retained in the surrounding kept content or can be re-derived by rerunning the step. " +
+	"Verbose intermediate logs are noise even when they mention relevant words; the final result " +
+	"or summary of such a log is essential. " +
+	"Answer true only if it is ESSENTIAL: it contains concrete facts a later step may have to " +
+	"refer back to — file paths, commands and their outcomes, error messages, decisions, user " +
+	"preferences, todo state, numbers or results, or the key fields of an API response — that " +
+	"are not retained elsewhere and cannot be re-derived."
 
-// AdmitQuestionTrue is the reference ADMIT_QUESTION true-criteria string
-// (pipeline.py), verbatim.
-const AdmitQuestionTrue = "The item carries information a later step may need."
+// AdmitQuestionTrue is the admit question's true-criterion: what a "true"
+// answer asserts about the item.
+const AdmitQuestionTrue = "The item carries concrete facts a later step may need — paths, commands, " +
+	"errors, decisions, results, or key response fields — that are not retained elsewhere and " +
+	"cannot be re-derived."
 
-// AdmitQuestionFalse is the reference ADMIT_QUESTION false-criteria string
-// (pipeline.py), verbatim.
-const AdmitQuestionFalse = "The item is noise that can be recovered from the store if ever needed."
+// AdmitQuestionFalse is the admit question's false-criterion: what a "false"
+// answer asserts about the item.
+const AdmitQuestionFalse = "The item is progress noise, a confirmation, repeated boilerplate, or a " +
+	"verbose dump whose useful facts are retained nearby or re-derivable — eliding it loses " +
+	"nothing a later step cannot recover."
 
 // RetrieveActionInjected and RetrieveActionSkipped are the actions recorded
 // on kind=retrieve decision entries (the reference's "injected"/"skipped"):

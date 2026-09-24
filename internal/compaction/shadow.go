@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -169,21 +168,14 @@ type ShadowLog struct {
 }
 
 // DefaultShadowPath returns the shadow log location:
-// ~/.local/share/late/compaction-shadow.jsonl (mirroring the session dir's
-// platform handling; Windows keeps everything under the config dir).
+// ~/.local/share/late/compaction-shadow.jsonl, resolved through
+// pathutil.LateDataDir (Windows keeps everything under the config dir).
 func DefaultShadowPath() (string, error) {
-	if runtime.GOOS == "windows" {
-		dir, err := pathutil.LateConfigDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(dir, "compaction-shadow.jsonl"), nil
-	}
-	home, err := os.UserHomeDir()
+	dir, err := pathutil.LateDataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".local", "share", "late", "compaction-shadow.jsonl"), nil
+	return filepath.Join(dir, "compaction-shadow.jsonl"), nil
 }
 
 // NewShadowLog opens (creating parent directories 0700) the default shadow

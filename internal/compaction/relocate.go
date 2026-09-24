@@ -396,18 +396,33 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 	}
 
 	// Decide per segment first (flags only), so the tripwire can still veto
-	// the whole batch before anything is stored or replaced.
+	// the whole batch before anything is stored or replaced. The origin for
+	// this tool's results decides protection: an activate_skill result is
+	// clamped to a 1.0 score floor before the floor comparison, so no gate
+	// setting can elide the skill instructions the agent was told to follow.
+	// Paragraph atomicity (AtomicElideDecisions): pieces cut from the same
+	// oversized paragraph share one decision, made on the minimum sibling
+	// score — a cut JSON blob is never partially elided into an unparseable
+	// remnant, and a paragraph whose pieces all stay above their floors is
+	// kept fully.
+	source := OriginSourceToolPrefix + toolName
 	gate := p.resolveGate()
-	totalTokens, elidedTokens := 0, 0
-	elide := make([]bool, len(scores.Segments))
+	scoresByID := make([]float64, len(scores.Segments))
+	floors := make([]float64, len(scores.Segments))
+	totalTokens := 0
 	for i, seg := range scores.Segments {
 		score, ok := scores.Scores[seg.ID]
 		if !ok {
 			score = keepScore // defensive; ScoreToolOutput fills every id
 		}
+		scoresByID[i] = protectedScore(source, score)
+		floors[i] = gate.floor(seg.Kind)
 		totalTokens += seg.Tokens
-		if score < gate.floor(seg.Kind) {
-			elide[i] = true
+	}
+	elide := AtomicElideDecisions(scores.Segments, scoresByID, floors)
+	elidedTokens := 0
+	for i, seg := range scores.Segments {
+		if elide[i] {
 			elidedTokens += seg.Tokens
 		}
 	}

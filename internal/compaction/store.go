@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,21 +140,15 @@ func NewStore() *Store {
 }
 
 // DefaultStorePath returns the record store location:
-// ~/.local/share/late/compaction-store.jsonl (mirroring DefaultShadowPath's
-// platform handling; Windows keeps everything under the config dir).
+// ~/.local/share/late/compaction-store.jsonl, resolved through
+// pathutil.LateDataDir (mirroring DefaultShadowPath; Windows keeps everything
+// under the config dir).
 func DefaultStorePath() (string, error) {
-	if runtime.GOOS == "windows" {
-		dir, err := pathutil.LateConfigDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(dir, "compaction-store.jsonl"), nil
-	}
-	home, err := os.UserHomeDir()
+	dir, err := pathutil.LateDataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".local", "share", "late", "compaction-store.jsonl"), nil
+	return filepath.Join(dir, "compaction-store.jsonl"), nil
 }
 
 // OpenStore opens the record store at path, loading previously persisted
@@ -278,9 +271,12 @@ func (s *Store) Records() []*Record {
 // record (see the Store doc). A nil store is a no-op. The synthesized
 // record carries the default kind, an estimated token count, and the
 // pointer summary — Put is the metadata-free legacy entry point; writers
-// that know more (the pipeline and the history walk) use PutRecord.
+// that know more (the pipeline and the history walk) use PutRecord. An
+// empty id or empty text is a no-op: an idless record is unreachable through
+// any pointer, and an empty original has nothing to reconstruct — storing
+// either would only pollute the digest and the record order.
 func (s *Store) Put(id, text string) {
-	if s == nil {
+	if s == nil || id == "" || text == "" {
 		return
 	}
 	s.PutRecord(Record{
@@ -295,10 +291,11 @@ func (s *Store) Put(id, text string) {
 // pipeline's CompactToolOutput writes Origin{Source: "tool:<name>"} with
 // the run's token count, summary, and contributing segment ids; the
 // session's history walk writes Origin{Source: "history"}. Idempotent like
-// Put: an existing id keeps its first record and appends nothing. A nil
-// store is a no-op.
+// Put: an existing id keeps its first record and appends nothing. A record
+// with an empty id or empty text is a no-op (see Put). A nil store is a
+// no-op.
 func (s *Store) PutRecord(rec Record) {
-	if s == nil {
+	if s == nil || rec.ID == "" || rec.Text == "" {
 		return
 	}
 	s.mu.Lock()

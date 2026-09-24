@@ -40,7 +40,14 @@ func compactionTestSession(t *testing.T, path string) *session.Session {
 	t.Cleanup(func() { session.SessionDir = originalSessionDir })
 	return session.New(nil, path, []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("Please analyze this build log.")},
-		{Role: "assistant", Content: client.TextContent(strings.Repeat("verbose analysis ", 200))},
+		// The compaction candidate: assistant content annotating a tool
+		// call. (A pure-prose assistant message — no tool calls — is never
+		// compacted; the walk preserves it byte-identically.)
+		{
+			Role:      "assistant",
+			Content:   client.TextContent(strings.Repeat("verbose analysis ", 200)),
+			ToolCalls: []client.ToolCall{{Index: 0, ID: "call_1", Type: "function", Function: client.FunctionCall{Name: "Bash", Arguments: `{"cmd":"make build"}`}}},
+		},
 	}, "system prompt", false)
 }
 

@@ -262,17 +262,33 @@ func TestScoreBatch_ReferenceWireShape(t *testing.T) {
 		t.Errorf("request body does not match the reference wire shape:\n got: %s\nwant: %s", raw, want)
 	}
 
-	// The admit wording must stay a verbatim port of pipeline.py's
-	// ADMIT_QUESTION — the golden request interpolates the constants, so the
-	// text itself is pinned here.
-	if AdmitQuestionInstructions != "Will this item still be needed later in the task described in `task`? Answer true if it contains facts, identifiers, errors, results, or decisions that a later step may have to refer back to. Answer false only if it is progress noise, repeated boilerplate, or formatting with no retained content." {
-		t.Errorf("AdmitQuestionInstructions drifted from the reference ADMIT_QUESTION wording: %q", AdmitQuestionInstructions)
+	// The admit wording must stay pinned — the golden request above
+	// interpolates the constants, so the text itself is pinned here: the
+	// sharpened boundary (noise = progress output/confirmations/boilerplate/
+	// re-derivable dumps; essential = concrete, non-re-derivable facts;
+	// verbose intermediate logs are noise, their final results essential).
+	if AdmitQuestionInstructions != "Will this item still be needed later in the task described in `task`? "+
+		"Answer false if it is NOISE: progress output, success or progress confirmations, repeated "+
+		"boilerplate, or a large repetitive dump (verbose intermediate logs, build or test output, "+
+		"file listings) whose key facts — file paths, commands, error messages, final results — are "+
+		"retained in the surrounding kept content or can be re-derived by rerunning the step. "+
+		"Verbose intermediate logs are noise even when they mention relevant words; the final result "+
+		"or summary of such a log is essential. "+
+		"Answer true only if it is ESSENTIAL: it contains concrete facts a later step may have to "+
+		"refer back to — file paths, commands and their outcomes, error messages, decisions, user "+
+		"preferences, todo state, numbers or results, or the key fields of an API response — that "+
+		"are not retained elsewhere and cannot be re-derived." {
+		t.Errorf("AdmitQuestionInstructions drifted from the pinned admit wording: %q", AdmitQuestionInstructions)
 	}
-	if AdmitQuestionTrue != "The item carries information a later step may need." {
-		t.Errorf("AdmitQuestionTrue drifted from the reference wording: %q", AdmitQuestionTrue)
+	if AdmitQuestionTrue != "The item carries concrete facts a later step may need — paths, commands, "+
+		"errors, decisions, results, or key response fields — that are not retained elsewhere and "+
+		"cannot be re-derived." {
+		t.Errorf("AdmitQuestionTrue drifted from the pinned wording: %q", AdmitQuestionTrue)
 	}
-	if AdmitQuestionFalse != "The item is noise that can be recovered from the store if ever needed." {
-		t.Errorf("AdmitQuestionFalse drifted from the reference wording: %q", AdmitQuestionFalse)
+	if AdmitQuestionFalse != "The item is progress noise, a confirmation, repeated boilerplate, or a "+
+		"verbose dump whose useful facts are retained nearby or re-derivable — eliding it loses "+
+		"nothing a later step cannot recover." {
+		t.Errorf("AdmitQuestionFalse drifted from the pinned wording: %q", AdmitQuestionFalse)
 	}
 }
 
