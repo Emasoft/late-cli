@@ -77,6 +77,8 @@ Configuration precedence is:
 
 For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
 
+Every accepted key — type, default, CLI flag equivalent, and description — is documented in the [config.json reference](config-reference.md).
+
 ### Tool Approval Mode (`permission-mode`)
 
 You can choose how much supervision Late applies to dangerous commands by adding a `permission-mode` entry to the `config.json` file for your platform (see the locations above):

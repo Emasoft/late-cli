@@ -63,6 +63,8 @@ One binary. Zero configuration. If `llama-server` is already running, Late finds
 
 📖 [**Read the Quickstart Guide**](./docs/quickstart.md) for setup details on persistent settings, fully autonomous containerized workflows, MCP and Skills setup, Git worktrees, keybindings, and more.
 
+📖 [**config.json Reference**](./docs/config-reference.md) for every accepted config key — precedence, boolean synonyms, strict parsing, defaults, and CLI flag equivalents.
+
 
 ## The Architectural Bottleneck
 
