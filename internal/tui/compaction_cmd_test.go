@@ -137,7 +137,7 @@ func TestJevCompactContextCommandDispatchesRun(t *testing.T) {
 	if done.CompactionRunning {
 		t.Fatal("the result message must clear the in-flight guard")
 	}
-	if got := done.GetAgentState(done.Focused.ID()).StatusText; got != "compacted: saved ~25 tokens, 2 segments elided (scored 0/0 messages)" {
+	if got := done.GetAgentState(done.Focused.ID()).StatusText; got != "compacted: saved ~25 tokens, 2 segments elided (scored 0/0 messages)… (estimate — the next request's usage refreshes the bar)" {
 		t.Fatalf("StatusText = %q, want the saved report", got)
 	}
 	if runs != 1 {
@@ -232,7 +232,7 @@ func TestJevCompactContextEndToEnd(t *testing.T) {
 
 	updated, _ := m.Update(result)
 	next := updated.(Model)
-	want := fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)",
+	want := fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)… (estimate — the next request's usage refreshes the bar)",
 		result.report.TokensSaved, result.report.SegmentsElided,
 		result.report.MessagesScored, result.report.MessagesScanned)
 	if got := next.GetAgentState(next.Focused.ID()).StatusText; got != want {

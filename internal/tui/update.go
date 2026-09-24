@@ -455,7 +455,12 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 				msg.report.TokensSaved, msg.report.SegmentsElided,
 				msg.report.MessagesScored, msg.report.MessagesScanned)
 		default:
-			s.StatusText = fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)",
+			// The suffix is honesty, not decoration: the count above was just
+			// recomputed locally (CalculateHistoryTokens), while steady state
+			// tracks the provider-reported usage — the two estimators
+			// disagree, and the bar may jump once the next request's real
+			// usage arrives.
+			s.StatusText = fmt.Sprintf("compacted: saved ~%d tokens, %d segments elided (scored %d/%d messages)… (estimate — the next request's usage refreshes the bar)",
 				msg.report.TokensSaved, msg.report.SegmentsElided,
 				msg.report.MessagesScored, msg.report.MessagesScanned)
 		}
@@ -1332,6 +1337,8 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					// A fresh conversation re-arms the JEV auto-compaction
 					// trigger for every agent.
 					state.AutocompactDisarmed = false
+					// ...and the one-shot 413 payload-recovery compaction.
+					state.PayloadRecoveryUsed = false
 				}
 				m.LastFocusedID = ""
 				m.Viewport.GotoTop()
@@ -1694,6 +1701,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		// the JEV auto-compaction threshold (see maybeJevAutoCompact); it is
 		// returned after the event switch below.
 		var autoCompactCmd tea.Cmd
+		// payloadToastCmd surfaces the 413 payload-too-large guidance as a
+		// warning toast (the error box already carries the full text).
+		var payloadToastCmd tea.Cmd
+		// payloadRecoveryCmd runs the one-shot 413 recovery compaction (see
+		// maybePayloadRecoveryCompaction).
+		var payloadRecoveryCmd tea.Cmd
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
@@ -1799,6 +1812,23 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				} else {
 					s.StatusText = fmt.Sprintf("Error: %v", event.Error)
 					s.Error = event.Error
+					// A 413 (payload too large) is actionable, not just
+					// fatal: the provider rejected the request body
+					// outright, so the error text itself carries the
+					// recovery guidance. The error box renders it above;
+					// the warning toast repeats it where it stays readable
+					// for a few seconds.
+					if errors.Is(event.Error, client.ErrPayloadTooLarge) {
+						payloadToastCmd = payloadTooLargeToastCmd()
+						// One-shot recovery: compact once so the next
+						// request can fit. Only the ROOT agent triggers it —
+						// the recovery always compacts the root session, and
+						// a subagent's 413 is not fixed by rewriting root
+						// history.
+						if event.ID == m.Root.ID() {
+							payloadRecoveryCmd = m.maybePayloadRecoveryCompaction(s)
+						}
+					}
 				}
 				// A turn that ended in error must not produce a recovery
 				// toast on the next turn.
@@ -1904,18 +1934,24 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			}
 		}
 
+		// Compose every command the event produced. tea.Batch drops nils and
+		// returns nil when the list is empty, so the fall-through to the
+		// generic tail below is preserved when nothing fired.
+		var eventCmds []tea.Cmd
 		if restoredToast != nil {
-			return m, restoredToast
-		}
-
-		if restoredToast != nil {
-			if autoCompactCmd != nil {
-				return m, tea.Batch(restoredToast, autoCompactCmd)
-			}
-			return m, restoredToast
+			eventCmds = append(eventCmds, restoredToast)
 		}
 		if autoCompactCmd != nil {
-			return m, autoCompactCmd
+			eventCmds = append(eventCmds, autoCompactCmd)
+		}
+		if payloadRecoveryCmd != nil {
+			eventCmds = append(eventCmds, payloadRecoveryCmd)
+		}
+		if payloadToastCmd != nil {
+			eventCmds = append(eventCmds, payloadToastCmd)
+		}
+		if len(eventCmds) > 0 {
+			return m, tea.Batch(eventCmds...)
 		}
 
 	case ConfirmRequestMsg:
@@ -1991,6 +2027,47 @@ func (m *Model) maybeJevAutoCompact(s *AppState) tea.Cmd {
 	m.CompactionRunning = true
 	s.AutocompactDisarmed = true
 	s.StatusText = "compacting context..."
+	return m.startCompaction()
+}
+
+// payloadRecoveryStatus is the status shown while the one-shot 413 recovery
+// compaction runs.
+const payloadRecoveryStatus = "request too large — compacting context (recovery)…"
+
+// payloadTooLargeToastCmd builds the warning-toast command for a 413
+// failure: the recovery guidance travels on the error text (rendered by the
+// error box), but the status bar truncates, so the toast repeats it where it
+// stays readable. The ToastMsg handler owns the expiry tick.
+func payloadTooLargeToastCmd() tea.Cmd {
+	return func() tea.Msg {
+		return ToastMsg{
+			Text:     client.PayloadTooLargeGuidance,
+			Warning:  true,
+			Duration: 8 * time.Second,
+		}
+	}
+}
+
+// maybePayloadRecoveryCompaction returns the tea.Cmd that runs ONE
+// full-history compaction pass after the root agent's request failed with
+// the payload-too-large (413) sentinel: the provider rejected the request
+// body outright, so the context must shrink before the same request can
+// succeed. It reuses the shared CompactionRunning in-flight guard and fires
+// at most once per conversation — PayloadRecoveryUsed (reset by /new) keeps
+// a provider that still rejects after a compaction from spinning a
+// compact→retry→413 loop. The trigger is inert unless compaction can
+// actually shrink history (CompactionApplies: mode "enabled") or is already
+// running. s must be the failing (root) agent's state.
+func (m *Model) maybePayloadRecoveryCompaction(s *AppState) tea.Cmd {
+	if m.Compactor == nil || !m.CompactionApplies || m.CompactionRunning {
+		return nil
+	}
+	if s.PayloadRecoveryUsed {
+		return nil
+	}
+	s.PayloadRecoveryUsed = true
+	m.CompactionRunning = true
+	s.StatusText = payloadRecoveryStatus
 	return m.startCompaction()
 }
 

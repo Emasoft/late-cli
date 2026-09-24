@@ -177,7 +177,17 @@ Late can keep oversized tool outputs out of the orchestrator's context. The port
 * `shadow` (default) — tool outputs are segmented and Jev-scored, and what *would* be elided is recorded to the shadow log (`~/.local/share/late/compaction-shadow.jsonl`). No behavior change.
 * `enabled` — tool outputs over 4000 characters are segmented and Jev-scored; low-scoring segments are elided into `[[elided …]]` pointers. The `expand` tool retrieves the original text on demand.
 
-Scoring is fail-open: any backend error keeps the original tool output. Segments below `--compaction-threshold` (default `0.35`) are elided; `compaction-threshold-percent` in `config.json` sets the context level the info bar reports headroom for.
+Scoring is fail-open: any backend error keeps the original tool output. Segments scoring strictly below the elision threshold are elided. That threshold resolves as: explicit `-compaction-threshold` flag > `compaction-threshold` in `config.json` (valid range (0,1]) > the default `0.35`. Don't confuse the three similarly named knobs: `compaction-threshold` is the per-segment SCORE cutoff, `compaction-threshold-percent` sets the context level the info bar reports headroom for, and `jev-autocompact-percent` sets the context level that fires the auto-trigger.
+
+The scorer is keep-biased by design, so real scores on dense, code-heavy sessions cluster well above the default — 0.4–0.9 is normal for good content. If a compaction run "saved only a handful of tokens", that is usually the threshold, not a broken scorer: see the 413 playbook below for how to pick a better one from your own shadow log.
+
+### If you hit 413 / context too large
+
+A provider that caps the request body (many proxies reject bodies over ~2 MB) answers every turn with `API error (413)` — Late renders it as *"request body exceeds this provider's limit (413): compact the context with /jev-compact-context (consider raising compaction-threshold in config.json) or start a new session with /new"*. With `compaction-mode: enabled`, the TUI also automatically runs ONE recovery compaction pass (never a loop — at most once per conversation, until `/new`). Work through this playbook:
+
+1. **Measure first**: `late -replay-shadow=0.35,0.5,0.65,0.8` re-decides your existing shadow log at each threshold (read-only, no scorer round trips) and prints the kept/relocated/tokens-saved/still-missed table per threshold, so you can see which cutoff would actually free the space you need.
+2. **Set the threshold**: put the winning value in `config.json` as `"compaction-threshold": 0.65` (or pass `-compaction-threshold=0.65` for a single run) and restart `late`.
+3. **If nothing relocates even at a high threshold**, the session is genuinely dense: start a new session with `/new` and re-seed only the context that matters.
 
 ### Pointers and the record store
 
@@ -208,7 +218,7 @@ late -replay-shadow=0.10,0.35,0.50   # replay the shadow log at other thresholds
 ```
 
 * `-check-compaction` runs the three stages the reference `check.py` runs — (1) decisions answers parse, (2) the gate actually relocates something from a real ~2KB tool output, (3) a pointer expands back byte for byte — prints a per-stage report with latencies, and exits 0/1 without starting the TUI. Run it after configuring a backend and before trusting the feature; the first failing stage names what broke (bad key, malformed request, unreachable server).
-* `-replay-shadow=<thresholds>` is read-only offline replay: it re-decides every logged score at each comma-separated threshold (no scorer round trips) and prints the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, so you can pick `--compaction-threshold` from your own traffic instead of the default.
+* `-replay-shadow=<thresholds>` is read-only offline replay: it re-decides every logged score at each comma-separated threshold (no scorer round trips) and prints the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, so you can pick the elision threshold from your own traffic instead of the default (see the 413 playbook above).
 
 ### Offline demo (`compaction-backend: "offline"`)
 
