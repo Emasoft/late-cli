@@ -55,6 +55,55 @@ const TripwireMaxElideFraction = "max_elide_fraction"
 // TripwireAction is the shadow-log action recorded on a tripwire entry.
 const TripwireAction = "tripwire"
 
+// OriginSourceSkillTool is the Origin.Source of records relocated from
+// activate_skill tool results ("tool:activate_skill") — and the origin whose
+// tool results are protected from elision altogether: activate_skill's
+// output IS the skill's instructions, the guidance the agent was told to
+// follow. Eliding it would silently strip what the agent believes it must
+// do, with nothing left in context to say so. See protectedScore.
+const OriginSourceSkillTool = OriginSourceToolPrefix + "activate_skill"
+
+// SkillToolName is the registry name of the skill-activation tool whose
+// results are protected from elision.
+const SkillToolName = "activate_skill"
+
+// protectedOrigins maps the Origin.Source values whose content must never be
+// elided to the minimum effective score their items may carry. The floor is
+// 1.0: a score clamped up to 1.0 can never sit strictly below any keep
+// threshold in (0, 1], so the item is unelidable at any gate setting.
+var protectedOrigins = map[string]float64{
+	OriginSourceSkillTool: 1.0,
+}
+
+// originScoreFloor returns the minimum effective score for items originating
+// from source, and whether such a floor applies at all. Only protected
+// origins carry one.
+func originScoreFloor(source string) (float64, bool) {
+	f, ok := protectedOrigins[source]
+	return f, ok
+}
+
+// protectedScore raises score to the origin's score floor when one applies:
+// a tool result produced by an activate_skill call is reported as fully
+// essential no matter what the scorer answered, so no gate setting can elide
+// it. Sources without a floor pass the score through unchanged.
+func protectedScore(source string, score float64) float64 {
+	if f, ok := originScoreFloor(source); ok && score < f {
+		return f
+	}
+	return score
+}
+
+// ProtectedTool reports whether toolName's results must never be elided:
+// the gate clamps their scores up to the origin's floor (1.0 for
+// activate_skill), making them unelidable at any threshold. The history walk
+// uses it to skip a tool message whose originating call was activate_skill
+// before it is ever segmented or scored.
+func ProtectedTool(toolName string) bool {
+	_, ok := originScoreFloor(OriginSourceToolPrefix + toolName)
+	return ok
+}
+
 // DefaultGateConfig returns the reference-parity gate configuration.
 func DefaultGateConfig() GateConfig {
 	return GateConfig{

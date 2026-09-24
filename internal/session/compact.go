@@ -46,9 +46,17 @@ import (
 //     history length it covered): shadow runs mutate nothing and report
 //     only, mid-walk scorer aborts leave the mark where it was, and a
 //     failed mark persistence rolls the in-memory advance back.
-//   - User messages are never compacted; assistant and tool-result contents
-//     are. Assistant ToolCalls are structurally required and are never
-//     touched: only Content shrinks.
+//   - User messages are never compacted. Pure-prose assistant messages are
+//     never compacted either: an assistant message with NO tool calls
+//     (decisions, explanations, plans) is the conversation's narrative, not
+//     recoverable work output, and stays byte-identical. Compaction
+//     candidates are tool results and assistant messages WITH ToolCalls
+//     (whose Content annotates the calls). Assistant ToolCalls are
+//     structurally required and are never touched: only Content shrinks.
+//   - Tool results produced by protected tools (activate_skill — see
+//     compaction.ProtectedTool) are never compacted: the result IS the
+//     instructions the agent was told to follow, and eliding them would
+//     silently strip the guidance out of the conversation.
 //   - Segments are scored against the ongoing task (the last user message);
 //     a segment scoring strictly below the threshold is elided into the
 //     store, and each run of consecutive elided segments is replaced by one
@@ -328,6 +336,23 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	scored := 0
 	var walkErrs []error
 
+	// Tool origins: tool_call_id → tool name from the assistant messages
+	// that issued the calls, so the history surface knows which tool
+	// produced each tool result — the same "tool:<name>" origin the
+	// tool-output path stamps on its records. Tool results from protected
+	// tools (compaction.ProtectedTool — activate_skill) are skipped before
+	// segmentation: the gate's protected score floor makes them unelidable
+	// on the tool-output path, and here the honest equivalent is to never
+	// even score them (a kept decision is guaranteed, not scored into).
+	originTool := make(map[string]string)
+	for i := range s.History {
+		for _, tc := range s.History[i].ToolCalls {
+			if tc.ID != "" && tc.Function.Name != "" {
+				originTool[tc.ID] = tc.Function.Name
+			}
+		}
+	}
+
 	for i := frozen; i < len(s.History); i++ {
 		// Unreachable while frozen >= mark holds (it is how frozen is
 		// computed); fail loudly rather than silently mutate the anchor if
@@ -336,6 +361,13 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 			return report, fmt.Errorf("compaction: message %d sits below the high-water mark %d: %w", i, mark, ErrFrozenPrefix)
 		}
 		msg := &s.History[i]
+		if msg.Role == "tool" {
+			if name, ok := originTool[msg.ToolCallID]; ok && compaction.ProtectedTool(name) {
+				// A protected tool's result (the skill's instructions):
+				// never re-segmented, never scored, never rewritten.
+				continue
+			}
+		}
 		// Already-elided messages are final: their pointers stand in history
 		// and their originals live in the store. Re-scoring one would let a
 		// pointer line become segment text and nest new pointers.
@@ -431,12 +463,26 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 			b.WriteString("\n")
 			run = run[:0]
 		}
-		for _, seg := range segs {
+		// Per-segment scores and the (flat) elide floor, then the shared
+		// paragraph-atomicity decision (same rule as the tool-output path):
+		// pieces cut from the same oversized paragraph share ONE decision,
+		// made on the minimum sibling score — one low piece elides the whole
+		// paragraph (stored whole, restorable whole through the pointer), so
+		// a cut JSON blob is never partially elided into an unparseable
+		// remnant, and pieces above the floor keep the paragraph fully.
+		segScores := make([]float64, len(segs))
+		segFloors := make([]float64, len(segs))
+		for i, seg := range segs {
 			score, ok := scores[seg.ID]
 			if !ok {
 				score = keepScoreFallback
 			}
-			if score >= opts.Threshold {
+			segScores[i] = score
+			segFloors[i] = opts.Threshold
+		}
+		elide := compaction.AtomicElideDecisions(segs, segScores, segFloors)
+		for i, seg := range segs {
+			if !elide[i] {
 				flushRun()
 				b.WriteString(seg.Text)
 				continue
@@ -514,13 +560,30 @@ func frozenPrefix(n, percent int) int {
 	return frozen
 }
 
-// compactableContent reports whether msg is a compaction candidate: an
-// assistant or tool-result message whose text-only content exceeds
-// minCompactChars. User messages are never compacted; multimodal messages
-// pass through untouched (parts cannot be rebuilt losslessly here); shorter
-// messages offer no elidable granularity.
+// compactableContent reports whether msg is a compaction candidate: a
+// tool-result message, or an assistant message WITH tool calls, whose
+// text-only content exceeds minCompactChars.
+//
+// User messages are never compacted. Pure-prose assistant messages — an
+// assistant message with NO tool calls: decisions, explanations, plans — are
+// never compacted either: they are the conversation's narrative, not
+// recoverable work output, and the agent's later reasoning builds on them
+// verbatim. Only tool results and the content annotating assistant tool
+// calls are work output that the store can hold and the expand tool can
+// restore. Multimodal messages pass through untouched (parts cannot be
+// rebuilt losslessly here); shorter messages offer no elidable granularity.
 func compactableContent(msg *client.ChatMessage) bool {
-	if msg.Role != "assistant" && msg.Role != "tool" {
+	switch msg.Role {
+	case "tool":
+		// Tool results are the compaction surface: recoverable from the
+		// store through the expand tool.
+	case "assistant":
+		// Assistant content is compactable only when it annotates tool
+		// calls; pure prose stays byte-identical.
+		if len(msg.ToolCalls) == 0 {
+			return false
+		}
+	default:
 		return false
 	}
 	if len(msg.Content.Parts) != 0 {

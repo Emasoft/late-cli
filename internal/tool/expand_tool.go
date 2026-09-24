@@ -98,6 +98,9 @@ func (t ExpandTool) CallString(args json.RawMessage) string {
 }
 
 func (t ExpandTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if t.Store == nil {
+		return "", fmt.Errorf("no elided-original store is wired — nothing to expand")
+	}
 	var params struct {
 		ID string `json:"id"`
 	}

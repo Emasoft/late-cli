@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"late/internal/common"
 )
 
 // Scorer is the batch-scoring interface the Pipeline consumes: score one
@@ -126,6 +128,9 @@ func (p *Pipeline) noteAuthFailure(reason string) {
 	if !p.authWarned {
 		p.authWarned = true
 		fmt.Fprintf(p.warnTo, "Warning: compaction scoring disabled for this session (%v)\n", reason)
+		// Durable record of the poisoning (the warning is ephemeral):
+		// best-effort, never fails the pipeline.
+		common.LogErrorf("compaction", "scoring disabled for this session (auth): %v", reason)
 	}
 }
 
@@ -238,27 +243,56 @@ func (p *Pipeline) ScoreToolOutput(ctx context.Context, toolName, output string)
 	// is always keep. When relocation is armed (stage 2), the recorded
 	// decision reflects what CompactToolOutput does with this score: elide
 	// strictly below the segment's floor (the protected-kind floor when the
-	// kind has one, else the relocation threshold), keep otherwise. Append
-	// failures are recorded but never fail the call — logging must not be
-	// able to break scoring.
+	// kind has one, else the relocation threshold), with the same paragraph
+	// atomicity (AtomicElideDecisions — minimum sibling score for cut
+	// paragraphs) and protected-origin clamping (activate_skill at a 1.0
+	// score floor) the elide path applies, so the log stays a faithful
+	// replay of the real decisions. Append failures are recorded but never
+	// fail the call — logging must not be able to break scoring.
 	if p.shadow != nil {
 		now := p.now()
 		relocStore, _ := p.relocationArmed()
 		gate := p.resolveGate()
-		for _, s := range out.Segments {
+		source := OriginSourceToolPrefix + toolName
+		scoresByID := make([]float64, len(out.Segments))
+		floors := make([]float64, len(out.Segments))
+		for i, s := range out.Segments {
 			score, ok := out.Scores[s.ID]
 			if !ok {
 				score = keepScore
 			}
+			scoresByID[i] = protectedScore(source, score)
+			floors[i] = gate.floor(s.Kind)
+		}
+		elided := make([]bool, len(out.Segments))
+		decide, decFloors := AtomicDecisionScores(out.Segments, scoresByID, floors)
+		for i := range out.Segments {
+			elided[i] = decide[i] < decFloors[i]
+		}
+		if relocStore == nil {
+			// Shadow mode (stage 1): relocation is not armed, so every
+			// decision is keep — the log records what actually happens.
+			for i := range elided {
+				elided[i] = false
+			}
+		}
+		for i, s := range out.Segments {
+			// The score the decision was made on: the origin-protected
+			// clamp (1.0) when one applies, the paragraph-minimum sibling
+			// score for pieces of a cut paragraph. Recording the decision's
+			// own binding score keeps Stats/Replay (score vs threshold)
+			// consistent with the recorded decision.
+			score := decide[i]
 			// The floor this segment's elide decision turns on: the
 			// protected-kind floor when the kind has one, else the
-			// relocation threshold in force. Recorded with the entry so
-			// Stats, FalseNegativeRate, and ReplayTable can re-run the
-			// decision from score vs threshold without re-scoring (0 when
-			// no threshold is in force — never counts as elided).
-			floor := gate.floor(s.Kind)
+			// relocation threshold in force (the paragraph minimum for
+			// grouped pieces — AtomicDecisionScores). Recorded with the
+			// entry so Stats, FalseNegativeRate, and ReplayTable can re-run
+			// the decision from score vs threshold without re-scoring (0
+			// when no threshold is in force — never counts as elided).
+			floor := decFloors[i]
 			decision := DecisionKeep
-			if relocStore != nil && score < floor {
+			if elided[i] {
 				decision = DecisionElide
 			}
 			if aerr := p.shadow.Append(ShadowEntry{

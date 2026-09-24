@@ -84,8 +84,10 @@ const (
 )
 
 // noulQuestionFor builds the one question the client asks per item, named
-// for that item: the reference's ADMIT_QUESTION (pipeline.py), ported
-// verbatim to the AdmitQuestion* constants in retrieve.go, with scorer.py's
+// for that item: the reference's ADMIT_QUESTION (pipeline.py) structure —
+// instructions plus true/false criteria — carried by the AdmitQuestion*
+// constants in retrieve.go (the reference's conservative shape with wording
+// sharpened against real-run replay; see the constants), with scorer.py's
 // _ref_question "Considering item <ref> only:" prefix — the batch shares one
 // state, so the question text is the only thing that tells the model which
 // of the batch's items a given answer is about.
@@ -269,7 +271,8 @@ type packed struct {
 
 // ScoreBatch scores every item for the given task with one "noul" question
 // per item ("Considering item <ref> only: <admit instructions>" — the
-// reference's ADMIT_QUESTION, ported to the AdmitQuestion* constants), with
+// reference's ADMIT_QUESTION structure via the AdmitQuestion* constants),
+// with
 // the task traveling only in state.task, batched under the protocol ceilings:
 // at most
 // MaxItemsPerRequest items and MaxStateTokens estimated tokens per request

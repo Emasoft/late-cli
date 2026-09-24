@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"late/internal/client"
@@ -78,15 +82,16 @@ func cmpLongText(tag string, n int) string {
 // defaultFixture builds a 12-message history whose frozen prefix is
 // max(1, 12/4) = 3 messages (the system prompt plus the two earliest
 // exchanges) and whose eligible region mixes four compactable candidates
-// (indices 4, 5, 7, 8), a long user message (index 9 — never compacted), and
-// short filler.
+// (indices 4, 5, 7, 8 — assistant-with-tool-calls and tool results; a
+// pure-prose assistant would NOT be a candidate), a long user message
+// (index 9 — never compacted), and short filler.
 func defaultFixture() []client.ChatMessage {
 	return []client.ChatMessage{
 		cmpStamped(cmpSystem("You are a helpful coding assistant."), 0),                                         // 0 frozen
 		cmpStamped(cmpUser("Explore the repository and summarize it."), 1),                                      // 1 frozen
 		cmpStamped(cmpAssistant("It is a Go CLI for LLM chat sessions."), 2),                                    // 2 frozen
 		cmpStamped(cmpUser("Now inspect internal/session."), 3),                                                 // 3
-		cmpStamped(cmpAssistant(cmpLongText("alpha", 3)), 4),                                                    // 4 candidate
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("alpha", 3), []client.ToolCall{cmpToolCall("call_4")}), 4), // 4 candidate
 		cmpStamped(cmpTool(cmpLongText("beta", 3)), 5),                                                          // 5 candidate (tool result)
 		cmpStamped(cmpUser("What about tool calls?"), 6),                                                        // 6
 		cmpStamped(cmpAssistantWithCalls(cmpLongText("gamma", 3), []client.ToolCall{cmpToolCall("call_7")}), 7), // 7 candidate
@@ -580,14 +585,14 @@ func TestCompactContextShadowModeDoesNotMutate(t *testing.T) {
 func TestCompactContextFailOpenMidWalk(t *testing.T) {
 	sentinel := errors.New("scorer unavailable")
 	fixture := []client.ChatMessage{
-		cmpStamped(cmpSystem("system prompt"), 0),         // frozen
-		cmpStamped(cmpUser("first question"), 1),          // frozen
-		cmpStamped(cmpAssistant("first answer"), 2),       // frozen
-		cmpStamped(cmpAssistant(cmpLongText("c1", 3)), 3), // candidate 1
-		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),      // candidate 2
-		cmpStamped(cmpAssistant(cmpLongText("c3", 3)), 5), // candidate 3 — fails here
-		cmpStamped(cmpTool(cmpLongText("c4", 3)), 6),      // candidate 4
-		cmpStamped(cmpAssistant(cmpLongText("c5", 3)), 7), // candidate 5
+		cmpStamped(cmpSystem("system prompt"), 0),                                                             // frozen
+		cmpStamped(cmpUser("first question"), 1),                                                              // frozen
+		cmpStamped(cmpAssistant("first answer"), 2),                                                           // frozen
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c1", 3), []client.ToolCall{cmpToolCall("call_c1")}), 3), // candidate 1
+		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),                                                          // candidate 2
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c3", 3), []client.ToolCall{cmpToolCall("call_c3")}), 5), // candidate 3 — fails here
+		cmpStamped(cmpTool(cmpLongText("c4", 3)), 6),                                                          // candidate 4
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c5", 3), []client.ToolCall{cmpToolCall("call_c5")}), 7), // candidate 5
 	}
 	s := newCompactSession(fixture)
 	segs := fixtureSegments(t, fixture)
@@ -685,13 +690,13 @@ func TestCompactContextFailOpenCompleteScoresFinishWalk(t *testing.T) {
 func TestCompactContextPartialScoresAbortMidWalk(t *testing.T) {
 	sentinel := errors.New("scorer degraded")
 	fixture := []client.ChatMessage{
-		cmpStamped(cmpSystem("system prompt"), 0),         // frozen
-		cmpStamped(cmpUser("first question"), 1),          // frozen
-		cmpStamped(cmpAssistant("first answer"), 2),       // frozen
-		cmpStamped(cmpAssistant(cmpLongText("c1", 3)), 3), // candidate 1 — scored cleanly
-		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),      // candidate 2 — partial scores here
-		cmpStamped(cmpAssistant(cmpLongText("c3", 3)), 5), // candidate 3
-		cmpStamped(cmpTool(cmpLongText("c4", 3)), 6),      // candidate 4
+		cmpStamped(cmpSystem("system prompt"), 0),                                                             // frozen
+		cmpStamped(cmpUser("first question"), 1),                                                              // frozen
+		cmpStamped(cmpAssistant("first answer"), 2),                                                           // frozen
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c1", 3), []client.ToolCall{cmpToolCall("call_c1")}), 3), // candidate 1 — scored cleanly
+		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),                                                          // candidate 2 — partial scores here
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c3", 3), []client.ToolCall{cmpToolCall("call_c3")}), 5), // candidate 3
+		cmpStamped(cmpTool(cmpLongText("c4", 3)), 6),                                                          // candidate 4
 	}
 	s := newCompactSession(fixture)
 	segs := fixtureSegments(t, fixture)
@@ -893,7 +898,7 @@ func TestCompactContextThresholdIsExclusive(t *testing.T) {
 		fixture := []client.ChatMessage{
 			cmpStamped(cmpSystem("system prompt"), 0),
 			cmpStamped(cmpUser("question"), 1),
-			cmpStamped(cmpAssistant(cmpLongText("x", 4)), 2), // the only candidate (n=4 clears minCompactChars)
+			cmpStamped(cmpAssistantWithCalls(cmpLongText("x", 4), []client.ToolCall{cmpToolCall("call_x")}), 2), // the only candidate (n=4 clears minCompactChars)
 		}
 		return newCompactSession(fixture), fixture, fixtureSegments(t, fixture)
 	}
@@ -927,6 +932,59 @@ func TestCompactContextThresholdIsExclusive(t *testing.T) {
 		}
 		if !strings.Contains(s.History[2].Content.Text, "[[elided id=r:") {
 			t.Error("expected the segment just below the threshold to be elided under a content id")
+		}
+	})
+}
+
+// (P10) Out-of-range CompactionOptions clamp to the safe production defaults:
+// a threshold outside (0, 1] falls back to compaction.DefaultRelocationThreshold
+// (0.35 — pinned via the keep-at-exactly-0.35 behavior, which an unclamped 0
+// would break by eliding everything and a 5 would break by keeping everything),
+// and a frozen percent outside (0, 100] falls back to defaultFrozenPercent (25).
+func TestCompactContextOptionsClampToDefaults(t *testing.T) {
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("question"), 1),
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("x", 4), []client.ToolCall{cmpToolCall("call_x")}), 2),
+	}
+
+	t.Run("threshold 0 clamps to the default 0.35", func(t *testing.T) {
+		s := newCompactSession(fixture)
+		segs := fixtureSegments(t, fixture)
+		scorer := elideFirstScorer(segs)
+		scorer.scores[segs[2][0].Text] = compaction.DefaultRelocationThreshold // exactly the default: kept
+		if _, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{Threshold: 0}); err != nil {
+			t.Fatalf("CompactContext() error = %v", err)
+		}
+		if s.History[2].Content.Text != fixture[2].Content.Text {
+			t.Error("threshold 0 must clamp to 0.35, which keeps a segment at exactly 0.35")
+		}
+	})
+
+	t.Run("threshold 5 clamps to the default 0.35", func(t *testing.T) {
+		s := newCompactSession(fixture)
+		segs := fixtureSegments(t, fixture)
+		scorer := elideFirstScorer(segs)
+		scorer.scores[segs[2][0].Text] = compaction.DefaultRelocationThreshold - 0.01 // just below: elided
+		if _, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{Threshold: 5}); err != nil {
+			t.Fatalf("CompactContext() error = %v", err)
+		}
+		if !strings.Contains(s.History[2].Content.Text, "[[elided id=r:") {
+			t.Error("threshold 5 must clamp to 0.35, which elides a segment just below 0.35")
+		}
+	})
+
+	t.Run("frozen percent 0 and 150 clamp to the default 25", func(t *testing.T) {
+		for _, bad := range []int{0, 150} {
+			s := newCompactSession(fixture)
+			if _, err := s.CompactContext(context.Background(), &stubScorer{fallback: 0.9}, NewCompactStore(), CompactionOptions{FrozenPercent: bad}); err != nil {
+				t.Fatalf("FrozenPercent %d: CompactContext() error = %v", bad, err)
+			}
+			// 3 messages at the clamped default 25% → frozen = max(1, 0) = 1,
+			// so the assistant candidate at index 2 was scanned.
+			if s.History[2].Content.Text != fixture[2].Content.Text {
+				t.Errorf("FrozenPercent %d: history mutated (clamp broken)", bad)
+			}
 		}
 	})
 }
@@ -1108,8 +1166,8 @@ func TestCompactContextHighWaterFreezesAcrossRuns(t *testing.T) {
 	// messages. Everything below the mark must stay exactly as run 1 left it.
 	growth := []client.ChatMessage{
 		cmpStamped(cmpUser("Second question"), 12),
-		cmpStamped(cmpAssistant(cmpLongText("eps", 3)), 13),              // new candidate
-		cmpStamped(cmpToolResult("call_13", cmpLongText("zeta", 3)), 14), // new candidate
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("eps", 3), []client.ToolCall{cmpToolCall("call_13")}), 13), // new candidate
+		cmpStamped(cmpToolResult("call_13", cmpLongText("zeta", 3)), 14),                                        // new candidate
 		cmpStamped(cmpAssistant("A short new answer."), 15),
 	}
 	s.History = append(s.History, growth...)
@@ -1193,7 +1251,7 @@ func TestCompactContextHighWaterPersistsAcrossSaveReload(t *testing.T) {
 
 	growth := []client.ChatMessage{
 		cmpStamped(cmpUser("Second question"), 12),
-		cmpStamped(cmpAssistant(cmpLongText("eps", 3)), 13),
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("eps", 3), []client.ToolCall{cmpToolCall("call_13b")}), 13),
 	}
 	for _, msg := range growth {
 		if err := resumed.AddMessage(msg); err != nil {
@@ -1275,8 +1333,8 @@ func TestCompactContextNeverRescoresPointerBearingMessages(t *testing.T) {
 	fixture := []client.ChatMessage{
 		cmpStamped(cmpSystem("system prompt"), 0),
 		cmpStamped(cmpUser("question"), 1),
-		cmpStamped(cmpTool(pointerBearing), 2),               // pointer-bearing candidate
-		cmpStamped(cmpAssistant(cmpLongText("fresh", 3)), 3), // control candidate
+		cmpStamped(cmpTool(pointerBearing), 2), // pointer-bearing candidate
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("fresh", 3), []client.ToolCall{cmpToolCall("call_f")}), 3), // control candidate
 		cmpStamped(cmpUser("follow-up"), 4),
 		cmpStamped(cmpAssistant("short"), 5),
 	}
@@ -1355,9 +1413,9 @@ func TestCompactContextMidWalkAbortKeepsHighWater(t *testing.T) {
 		cmpStamped(cmpSystem("system prompt"), 0),
 		cmpStamped(cmpUser("first question"), 1),
 		cmpStamped(cmpAssistant("first answer"), 2),
-		cmpStamped(cmpAssistant(cmpLongText("c1", 3)), 3),
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c1", 3), []client.ToolCall{cmpToolCall("call_m1")}), 3),
 		cmpStamped(cmpTool(cmpLongText("c2", 3)), 4),
-		cmpStamped(cmpAssistant(cmpLongText("c3", 3)), 5),
+		cmpStamped(cmpAssistantWithCalls(cmpLongText("c3", 3), []client.ToolCall{cmpToolCall("call_m3")}), 5),
 	}
 	s := newCompactSession(fixture)
 	scorer := elideFirstScorer(fixtureSegments(t, fixture))
@@ -1496,5 +1554,248 @@ func TestCompactContextAuthErrorStopsWalk(t *testing.T) {
 	}
 	if s.CompactionHighWater() != 0 {
 		t.Errorf("CompactionHighWater = %d, want 0 (a mid-walk abort must not advance the mark)", s.CompactionHighWater())
+	}
+}
+
+// --- Priority fixes: prose preservation, skill preservation, atomicity -------
+
+// (P3) A pure-prose assistant message — no tool calls — is the
+// conversation's narrative and must stay byte-identical through a mutating
+// run, even when the scorer scores everything 0.0. Only the tool result
+// (the recoverable work output) is compacted.
+func TestCompactContextPreservesProseAssistant(t *testing.T) {
+	prose := "## Plan\n\n" + cmpLongText("prose", 6)
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("make a plan"), 1),
+		cmpStamped(cmpAssistant(prose), 2),             // pure prose — never compacted
+		cmpStamped(cmpTool(cmpLongText("beta", 3)), 3), // control candidate
+		cmpStamped(cmpUser("go"), 4),
+	}
+	s := newCompactSession(fixture)
+	scorer := &stubScorer{fallback: 0.1} // everything scored would be elided
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+
+	if got := s.History[2].Content.Text; got != prose {
+		t.Fatalf("the pure-prose assistant message was compacted:\n got %q\nwant %q",
+			truncateRunes(got, 200), truncateRunes(prose, 200))
+	}
+	// It was never even scored: only the tool result reached the scorer.
+	if scorer.calls != 1 {
+		t.Errorf("scorer calls = %d, want 1 (prose assistants are not candidates)", scorer.calls)
+	}
+	if report.MessagesScored != 1 {
+		t.Errorf("MessagesScored = %d, want 1", report.MessagesScored)
+	}
+	// The control tool result was compacted as usual.
+	if !strings.Contains(s.History[3].Content.Text, "[[elided id=") {
+		t.Error("the tool-result control was not compacted")
+	}
+}
+
+// (P4) A tool result originating from the activate_skill tool is the skill's
+// instructions — what the agent was told to follow — and must never be
+// elided: the walk skips it before segmentation, so it is byte-identical and
+// never scored, while a control result from another tool compacts normally.
+func TestCompactContextPreservesActivateSkillResults(t *testing.T) {
+	skillResult := "Skill instructions:\n" + cmpLongText("skill", 6)
+	control := cmpLongText("bash", 6)
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("use the skill"), 1),
+		cmpStamped(cmpAssistantWithCalls("", []client.ToolCall{
+			{Index: 0, ID: "call_s", Type: "function", Function: client.FunctionCall{Name: "activate_skill", Arguments: `{"name":"demo"}`}},
+			{Index: 1, ID: "call_b", Type: "function", Function: client.FunctionCall{Name: "Bash", Arguments: `{"cmd":"ls"}`}},
+		}), 2),
+		cmpStamped(cmpToolResult("call_s", skillResult), 3), // skill result — never compacted
+		cmpStamped(cmpToolResult("call_b", control), 4),     // control — compacted
+	}
+	s := newCompactSession(fixture)
+	scorer := &stubScorer{fallback: 0.0} // everything scored would be elided
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+
+	if got := s.History[3].Content.Text; got != skillResult {
+		t.Fatalf("the activate_skill result was compacted:\n got %q\nwant %q",
+			truncateRunes(got, 200), truncateRunes(skillResult, 200))
+	}
+	// Only the control reached the scorer.
+	if scorer.calls != 1 {
+		t.Errorf("scorer calls = %d, want 1 (protected tool results are never scored)", scorer.calls)
+	}
+	if report.MessagesScored != 1 {
+		t.Errorf("MessagesScored = %d, want 1", report.MessagesScored)
+	}
+	if !strings.Contains(s.History[4].Content.Text, "[[elided id=") {
+		t.Error("the control tool result was not compacted")
+	}
+}
+
+// (P2) History-surface paragraph atomicity: a >2x maxSegChars JSON paragraph
+// cut into pieces by splitOversized elides as ONE unit when a single piece
+// scores below the floor — the pointer references the full original and
+// Reconstruct restores it byte for byte — and stays byte-identical when all
+// pieces score above the floor.
+func TestCompactContextParagraphAtomicity(t *testing.T) {
+	build := func() (*Session, []client.ChatMessage) {
+		// One pretty-printed JSON object, no blank lines: one oversized
+		// paragraph splitOversized cuts mid-structure.
+		var b strings.Builder
+		b.WriteString("{\n")
+		for i := 0; i < 60; i++ {
+			fmt.Fprintf(&b, "  \"key_%03d\": \"value %03d with some padding text to bulk the line past trivial lengths\",\n", i, i)
+		}
+		b.WriteString("  \"final\": true\n}")
+		blob := b.String()
+		if len(blob) <= 2*minCompactChars {
+			t.Fatalf("fixture too small: %d bytes, want > %d", len(blob), 2*minCompactChars)
+		}
+		fixture := []client.ChatMessage{
+			cmpStamped(cmpSystem("system prompt"), 0),
+			cmpStamped(cmpUser("parse this"), 1),
+			cmpStamped(cmpToolResult("call_x", blob), 2),
+		}
+		return newCompactSession(fixture), fixture
+	}
+	segment := func(t *testing.T, blob string) []compaction.Segment {
+		t.Helper()
+		segs := compaction.SegmentSegments(blob, minCompactChars)
+		if len(segs) < 3 {
+			t.Fatalf("SegmentSegments() = %d pieces, want ≥3", len(segs))
+		}
+		for _, seg := range segs {
+			if seg.Group != segs[0].Group {
+				t.Fatal("fixture sanity: cut pieces do not share a group")
+			}
+		}
+		return segs
+	}
+
+	t.Run("one low piece elides the whole paragraph", func(t *testing.T) {
+		s, fixture := build()
+		blob := fixture[2].Content.Text
+		segs := segment(t, blob)
+
+		// Only the middle piece scores below the floor; without atomicity
+		// eliding it would leave an unparseable JSON remnant.
+		scores := map[string]float64{}
+		for _, seg := range segs {
+			scores[seg.Text] = 0.9
+		}
+		scores[segs[1].Text] = 0.1
+		scorer := &stubScorer{scores: scores, fallback: 0.9}
+		store := compaction.NewStore()
+
+		report, err := s.CompactContext(context.Background(), scorer, store, CompactionOptions{})
+		if err != nil {
+			t.Fatalf("CompactContext() error = %v", err)
+		}
+
+		compacted := s.History[2].Content.Text
+		pointers := compaction.FindPointers(compacted)
+		if len(pointers) != 1 {
+			t.Fatalf("FindPointers(compacted) = %d pointers, want 1 (the whole paragraph)", len(pointers))
+		}
+		if report.SegmentsElided != len(segs) {
+			t.Errorf("SegmentsElided = %d, want all %d pieces", report.SegmentsElided, len(segs))
+		}
+		rec, ok := store.GetRecord(pointers[0].ID)
+		if !ok {
+			t.Fatalf("store holds no record for %s", pointers[0].ID)
+		}
+		if rec.Text != blob {
+			t.Error("the pointer's record is not the FULL original paragraph")
+		}
+		if restored := compaction.Reconstruct(compacted, store); restored != blob {
+			t.Error("Reconstruct(compacted) is not byte-for-byte")
+		}
+	})
+
+	t.Run("all pieces above the floor keep the message", func(t *testing.T) {
+		s, fixture := build()
+		blob := fixture[2].Content.Text
+		segment(t, blob)
+
+		scorer := &stubScorer{fallback: 0.9}
+		report, err := s.CompactContext(context.Background(), scorer, compaction.NewStore(), CompactionOptions{})
+		if err != nil {
+			t.Fatalf("CompactContext() error = %v", err)
+		}
+		if s.History[2].Content.Text != blob {
+			t.Error("a message whose pieces all stay above the floor must be kept byte-for-byte")
+		}
+		if report.MessagesCompacted != 0 || report.SegmentsElided != 0 {
+			t.Errorf("expected a no-op report, got %+v", report)
+		}
+	})
+}
+
+// (P9) The full transient-outage story, pinned end to end with the REAL
+// decision client: the scorer endpoint 500s forever → the client spends its
+// full 4-attempt retry budget, the walk FAILS OPEN (completes with everything
+// kept), the scorer's error surfaces, and the session stays usable — the
+// client is not poisoned, so a later scoring call still reaches the server.
+func TestCompactContextTransientOutageCompletesWithEverythingKept(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error": {"message": "overloaded"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	scorer := compaction.NewDecisionClient(
+		compaction.ResolvedBackend{Backend: compaction.Backend{Name: "test", URL: srv.URL, Model: "jev-latest"}, APIKey: "k"},
+		"k")
+
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("run the thing"), 1),
+		cmpStamped(cmpToolResult("call_out", cmpLongText("outage", 3)), 2), // one candidate
+		cmpStamped(cmpUser("next"), 3),
+	}
+	s := newCompactSession(fixture)
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err == nil {
+		t.Fatal("CompactContext() error = nil, want the scorer's outage errors surfaced")
+	}
+
+	// The full retry budget was spent, then fail-open kept everything.
+	if got := atomic.LoadInt32(&hits); got != 4 {
+		t.Errorf("server hits = %d, want 4 (full attempt budget)", got)
+	}
+	if report.MessagesScored != 1 {
+		t.Errorf("MessagesScored = %d, want 1 (the fail-open scores completed the walk)", report.MessagesScored)
+	}
+	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 {
+		t.Errorf("an outage must keep everything, got %+v", report)
+	}
+	if got, want := s.History[2].Content.Text, fixture[2].Content.Text; got != want {
+		t.Error("the outage mutated the tool result")
+	}
+	// The walk completed: the mark advanced, so the session stays coherent.
+	if got := s.CompactionHighWater(); got != len(fixture) {
+		t.Errorf("high-water = %d, want %d (the walk completed)", got, len(fixture))
+	}
+	// The session is usable: an outage is transient, not a poison — the
+	// client still reaches the server on the next scoring call.
+	if scorer.Unavailable() {
+		t.Error("the client was poisoned by a 500 outage; only auth may poison")
+	}
+	before := atomic.LoadInt32(&hits)
+	if _, err := scorer.ScoreBatch(context.Background(), "still alive", map[string]compaction.Item{"seg-1": {Text: "x", Tokens: 1}}); err == nil {
+		t.Error("the server is still down; want an error")
+	}
+	if got := atomic.LoadInt32(&hits) - before; got != 4 {
+		t.Errorf("post-outage call hit the server %d times, want 4 (the session still scores)", got)
 	}
 }

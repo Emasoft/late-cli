@@ -48,6 +48,17 @@ type Segment struct {
 	// segments from SegmentSegments.
 	LineStart int
 	LineEnd   int
+	// Group is the 1-based identity of the merged paragraph span this
+	// segment was cut from: when splitOversized cuts one oversized
+	// paragraph into several pieces, every piece carries the same Group, so
+	// the elide decision can keep the paragraph ATOMIC — pieces of one
+	// paragraph must share a single elide decision (PropagateGroupDecisions),
+	// because eliding one piece of a cut paragraph corrupts the whole (a
+	// JSON blob split mid-structure and partially elided is unparseable).
+	// 0 means ungrouped — segments built outside SegmentSegments (hand-built
+	// test fixtures) carry no grouping and behave exactly as before this
+	// field existed: each stands alone.
+	Group int
 }
 
 // SegmentKind classifies a segment's content so the gate can treat kinds
@@ -214,11 +225,16 @@ func SegmentSegments(toolOutput string, maxSegChars int) []Segment {
 
 	var segs []Segment
 	n := 0
+	group := 0
 	// newlines counts the '\n' bytes in toolOutput[:cursor]; pieces arrive
 	// in offset order, so line numbers come from one linear pass. (The
 	// reference carries the same information as line_span.)
 	cursor, newlines := 0, 0
 	for _, sp := range mergeParagraphs(paras, toolOutput, maxSegChars) {
+		// One group per merged paragraph span: every piece splitOversized
+		// cuts from this span shares the id, so the elide decision can treat
+		// the paragraph as one atomic unit.
+		group++
 		for _, piece := range splitOversized(toolOutput, sp, maxSegChars) {
 			n++
 			text := toolOutput[piece.start:piece.end]
@@ -241,6 +257,7 @@ func SegmentSegments(toolOutput string, maxSegChars int) []Segment {
 				Kind:      classifyKind(text),
 				LineStart: lineStart,
 				LineEnd:   lineEnd,
+				Group:     group,
 			})
 		}
 	}
@@ -378,4 +395,85 @@ func splitOversized(s string, sp span, maxSegChars int) []span {
 		start = cut
 	}
 	return out
+}
+
+// AtomicElideDecisions computes per-segment elide decisions with paragraph
+// atomicity: pieces cut from the same oversized paragraph (equal nonzero
+// Group — the pieces splitOversized produced) share ONE decision, made on
+// the paragraph's MINIMUM sibling score against the MINIMUM sibling floor.
+// See AtomicDecisionScores for the exact decision inputs; this returns just
+// the flags. A mismatched input triple yields nil (a caller bug).
+func AtomicElideDecisions(segs []Segment, scores, floors []float64) []bool {
+	decide, decFloors := AtomicDecisionScores(segs, scores, floors)
+	if decide == nil {
+		return nil
+	}
+	elide := make([]bool, len(segs))
+	for i := range segs {
+		elide[i] = decide[i] < decFloors[i]
+	}
+	return elide
+}
+
+// AtomicDecisionScores returns, per segment, the score and floor its elide
+// decision turns on, with paragraph atomicity: segments cut from the same
+// oversized paragraph (equal nonzero Group — the pieces splitOversized
+// produced) decide as ONE unit, on the paragraph's MINIMUM sibling score
+// against the MINIMUM sibling floor.
+//
+// Why: oversized single paragraphs are hard-cut by splitOversized into
+// multiple segment pieces; eliding ONE piece of a cut paragraph corrupts the
+// whole — a JSON blob split mid-structure and partially elided is
+// unparseable, and a prose paragraph loses its middle. So a cut paragraph is
+// decided as a unit: one low sibling (the minimum sibling score is the
+// binding one) elides the WHOLE paragraph — the run's original is stored
+// whole and Reconstruct restores it byte for byte — while siblings above
+// their floor keep the paragraph fully.
+//
+// scores[i] is segment i's score (the caller applies any origin protection
+// first), floors[i] its elide floor (the gate's protected-kind floor when
+// the kind has one, else the keep threshold; a flat threshold for callers
+// without a gate). The returned slices are fresh; ungrouped segments
+// (Group 0) decide on their own score and floor. For groups whose floors are
+// all equal — the overwhelmingly common case, pieces of one paragraph
+// sharing their content kind — the decision reduces exactly to
+// min-score < floor. The decision scores returned here are also what the
+// shadow log records, so score-vs-threshold replay reproduces the recorded
+// decisions. A mismatched input triple yields (nil, nil) — a caller bug.
+func AtomicDecisionScores(segs []Segment, scores, floors []float64) (decide, decFloors []float64) {
+	if len(segs) != len(scores) || len(segs) != len(floors) {
+		return nil, nil // defensive: a mismatched triple is a caller bug
+	}
+	decide = append([]float64(nil), scores...)
+	decFloors = append([]float64(nil), floors...)
+
+	// Group reduce: minimum score and minimum floor per paragraph.
+	type minima struct{ score, floor float64 }
+	groups := make(map[int]*minima)
+	for i, seg := range segs {
+		if seg.Group <= 0 {
+			continue
+		}
+		m, ok := groups[seg.Group]
+		if !ok {
+			m = &minima{score: decide[i], floor: decFloors[i]}
+			groups[seg.Group] = m
+			continue
+		}
+		if decide[i] < m.score {
+			m.score = decide[i]
+		}
+		if decFloors[i] < m.floor {
+			m.floor = decFloors[i]
+		}
+	}
+	for i, seg := range segs {
+		if seg.Group <= 0 {
+			continue
+		}
+		m := groups[seg.Group]
+		decide[i] = m.score
+		decFloors[i] = m.floor
+	}
+	return decide, decFloors
 }
