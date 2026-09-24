@@ -128,7 +128,7 @@ func main() {
 	// low-scoring segments out of oversized tool results (registers the
 	// expand tool so originals stay retrievable).
 	compactionModeReq := flag.String("compaction-mode", "", "Tool-output compaction stage: off, shadow (score + shadow log only), or enabled (also relocate low-scoring segments; adds the expand tool). Overrides config.json compaction-mode. Default: shadow.")
-	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled.")
+	compactionThresholdReq := flag.Float64("compaction-threshold", compaction.DefaultRelocationThreshold, "Score (0-1] below which tool-output segments are elided when -compaction-mode=enabled. Overrides config.json compaction-threshold; default 0.35.")
 	replayShadowReq := flag.String("replay-shadow", "", "Replay the default shadow log at the given comma-separated thresholds (e.g. 0.10,0.35,0.50): print the kept/relocated/tokens-saved/still-missed table plus the false-negative rate, then exit. Read-only; the TUI does not start.")
 	checkCompactionReq := flag.Bool("check-compaction", false, "Run the compaction preflight against the resolved System One backend — real requests checking (1) decisions answers and parse, (2) the gate relocates something from a real tool output, (3) a pointer expands back byte for byte — print the per-stage report and exit (0 pass, 1 fail; the TUI does not start). Pairs with -compaction-mode. With config.json compaction-backend \"offline\" the same three stages run against the deterministic local scripted scorer: no key, no network.")
 
@@ -651,12 +651,21 @@ func main() {
 	// Elision threshold: segments scoring strictly below it are relocated
 	// out of oversized tool results when compaction-mode is enabled
 	// (default per the upstream repo's own shadow-log replay data).
-	compactionThreshold := compaction.DefaultRelocationThreshold
-	if *compactionThresholdReq > 0 && *compactionThresholdReq <= 1 {
-		compactionThreshold = *compactionThresholdReq
-	} else {
-		fmt.Fprintf(os.Stderr, "Warning: ignoring invalid -compaction-threshold %v; using %v\n",
-			*compactionThresholdReq, compaction.DefaultRelocationThreshold)
+	// Precedence: an explicitly passed -compaction-threshold flag >
+	// config.json compaction-threshold > the 0.35 default. The resolver
+	// receives the flag value only when it was explicitly passed
+	// (flag.Visit — config loads after flag.Parse, so this is the only
+	// reliable explicit-flag signal); 0 otherwise, so the config entry can
+	// win over the flag's built-in default.
+	compactionThresholdFlagValue := 0.0
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "compaction-threshold" {
+			compactionThresholdFlagValue = *compactionThresholdReq
+		}
+	})
+	compactionThreshold, compactionThresholdWarning := appconfig.ResolveCompactionScoreThreshold(appConfig, compactionThresholdFlagValue)
+	if compactionThresholdWarning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", compactionThresholdWarning)
 	}
 
 	// Gate safety knobs (reference-parity semantics for the elide decision).
@@ -746,8 +755,9 @@ func main() {
 			// GateConfig: the reference-parity elision safety semantics —
 			// keep threshold, elide-fraction tripwire, and protected-kind
 			// floors — threaded from config.json (defaults mirror the
-			// reference pipeline.py). Applied before EnableRelocation so the
-			// -compaction-threshold flag below keeps precedence.
+			// reference pipeline.py). KeepThreshold uses the SAME resolved
+			// compactionThreshold as EnableRelocation below — one source of
+			// truth for the elision cutoff (flag > config > default).
 			gate := compaction.DefaultGateConfig()
 			gate.KeepThreshold = compactionThreshold
 			gate.MaxElideFraction = float64(compactionMaxElidePercent) / 100
@@ -892,6 +902,10 @@ func main() {
 		}
 		model.Compactor = historyCompactionRunner(sess, compactionPipeline.HistoryScorer(), compactionStore,
 			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog)
+		// The TUI's one-shot 413 payload-recovery compaction only fires when
+		// compaction can actually shrink history: mode "enabled" (after the
+		// shadow fallback above), not shadow report-only runs.
+		model.CompactionApplies = compactionMode == appconfig.CompactionModeEnabled
 	}
 
 	// Retrieval hooks (Step 17): BaseOrchestrator runs the hook at every

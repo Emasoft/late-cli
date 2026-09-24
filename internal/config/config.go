@@ -94,6 +94,13 @@ const DefaultJevAutocompactPercent = 99
 // invalid value).
 const DefaultCompactionMaxElidePercent = 70
 
+// DefaultCompactionThreshold mirrors compaction.DefaultRelocationThreshold —
+// the score strictly below which segments are elided (re-declared here so
+// the config package stays free of a compaction import). It is the fallback
+// when neither the -compaction-threshold flag nor config.json
+// compaction-threshold provides a valid value.
+const DefaultCompactionThreshold = 0.35
+
 // DefaultCompactionProtectedFloorPercent is the score floor (as a
 // percentage) under which protected segment kinds (stacktrace, diff) may be
 // elided: at any higher score they are kept even below the normal
@@ -180,6 +187,19 @@ type Config struct {
 	// be disabled from config.json (100 still trips on an over-100% claim,
 	// i.e. never — set it to 100 for the closest thing to off).
 	CompactionMaxElidePercent int `json:"compaction-max-elide-percent,omitempty"`
+
+	// CompactionThreshold is the elision score threshold: the score
+	// strictly below which tool-output segments (and full-history
+	// segments, for /jev-compact-context) are elided when compaction-mode
+	// is "enabled". 0 (unset) means the -compaction-threshold flag, or the
+	// DefaultCompactionThreshold (0.35) when the flag is not passed; values
+	// outside (0,1] are invalid and resolve back to the default with a
+	// warning (see ResolveCompactionScoreThreshold). NOTE: this is the
+	// per-segment SCORE cutoff — compaction-threshold-percent above is a
+	// different knob (the context-usage level the info bar reports
+	// headroom for), and jev-autocompact-percent is a third one (the
+	// context-usage level that fires the auto-trigger).
+	CompactionThreshold float64 `json:"compaction-threshold,omitempty"`
 
 	// CompactionProtectedFloor is the score floor, as a percentage, under
 	// which protected segment kinds (stacktrace, diff) may be elided: at
@@ -485,6 +505,44 @@ func ResolveAutocompact(cfg *Config) (enabled bool, percent int, warning string)
 			cfg.JevAutocompactPercent, DefaultJevAutocompactPercent)
 	}
 	return cfg.JevAutocompact, percent, warning
+}
+
+// ResolveCompactionScoreThreshold resolves the elision score threshold: the
+// score strictly below which segments are elided when compaction-mode is
+// "enabled" (also the /jev-compact-context walk's keep threshold). It is a
+// DIFFERENT knob from compaction-threshold-percent (the context-usage level
+// the info bar reports headroom for) and from jev-autocompact-percent (the
+// context-usage level that fires the auto-trigger).
+//
+// Precedence: an explicitly passed -compaction-threshold flag > config.json
+// compaction-threshold > DefaultCompactionThreshold (0.35). The caller
+// passes flagValue = 0 when the flag was NOT on the command line (the
+// flag.Visit detection in main) — flag values are indistinguishable from
+// defaults through the flag package alone, and 0 is itself invalid, so it
+// doubles cleanly as the "not set" sentinel. Valid range is (0,1] for both
+// sources: an explicitly passed but out-of-range flag warns and falls
+// through to the config entry (or the default), and an out-of-range config
+// value warns and falls back to the default.
+func ResolveCompactionScoreThreshold(cfg *Config, flagValue float64) (threshold float64, warning string) {
+	if flagValue > 0 && flagValue <= 1 {
+		// Explicit, valid flag wins over everything.
+		return flagValue, ""
+	}
+	if cfg != nil && cfg.CompactionThreshold > 0 && cfg.CompactionThreshold <= 1 {
+		threshold = cfg.CompactionThreshold
+	} else {
+		threshold = DefaultCompactionThreshold
+	}
+	switch {
+	case flagValue != 0:
+		// Explicit but out of range: the caller meant to set it, so say so.
+		warning = fmt.Sprintf("ignoring invalid -compaction-threshold %v; using %v", flagValue, threshold)
+	case cfg != nil && (cfg.CompactionThreshold < 0 || cfg.CompactionThreshold > 1):
+		// Present but invalid. 0 is the silent unset (see the Config doc);
+		// anything else outside (0,1] warns.
+		warning = fmt.Sprintf("ignoring invalid config.json compaction-threshold %v; using %v", cfg.CompactionThreshold, threshold)
+	}
+	return threshold, warning
 }
 
 // ResolveCompactionMaxElidePercent returns the effective compaction

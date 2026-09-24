@@ -159,6 +159,14 @@ type AppState struct {
 	// window — typically right after a compaction shrank the history — or
 	// when /new starts a fresh conversation.
 	AutocompactDisarmed bool
+
+	// PayloadRecoveryUsed records that the one-shot 413 payload-recovery
+	// compaction already ran for this agent's conversation: when the root
+	// agent's request fails with the payload-too-large sentinel, the TUI
+	// triggers exactly one compaction pass, then waits for the user (or the
+	// next turn) rather than spinning a compact→retry→413 loop. /new clears
+	// it together with AutocompactDisarmed.
+	PayloadRecoveryUsed bool
 }
 
 // CompactionRunner runs one full-history context-compaction pass on the
@@ -223,6 +231,15 @@ type Model struct {
 	// CompactContext run (manual command or auto-trigger) may execute at a
 	// time. Set when the run is dispatched, cleared by compactionResultMsg.
 	CompactionRunning bool
+
+	// CompactionApplies reports that the session's compaction mode is
+	// "enabled" — the mode whose runs actually rewrite (shrink) history.
+	// The 413 payload-recovery trigger only fires behind it: a shadow-mode
+	// run would only report what a compaction would save, which cannot
+	// recover a request the provider already rejected for size. Wired from
+	// cmd/late/main.go (the resolved mode after its shadow fallback);
+	// tests set it directly.
+	CompactionApplies bool
 
 	// Double-click copy & Toast tracking
 	LastClickX      int
