@@ -47,8 +47,13 @@ func newRetrieveTestSession(t *testing.T, history []client.ChatMessage, historyP
 	decisionsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(answerStatus)
+		// The decisions protocol answers with noul objects, not bare numbers.
+		wire := make(map[string]any, len(answers))
+		for ref, score := range answers {
+			wire[ref] = map[string]any{"type": "noul", "noul": score}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"answers": answers,
+			"answers": wire,
 			"usage":   map[string]int{"input_tokens": 1},
 		})
 	}))

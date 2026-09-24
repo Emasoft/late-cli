@@ -17,12 +17,13 @@ import (
 )
 
 // capturedDecisionRequest mirrors the wire request so tests can assert the
-// protocol shape (model, state, per-item noul questions).
+// reference protocol shape (model, state with a {ref,text} items array,
+// per-item noul questions with instructions and criteria).
 type capturedDecisionRequest struct {
 	Model string `json:"model"`
 	State struct {
-		Task  string               `json:"task"`
-		Items map[string]stateItem `json:"items"`
+		Task  string      `json:"task"`
+		Items []stateItem `json:"items"`
 	} `json:"state"`
 	Questions map[string]decisionQuestion `json:"questions"`
 }
@@ -93,9 +94,14 @@ func (d *decisionsServer) requests() []capturedRequest {
 	return append([]capturedRequest(nil), d.got...)
 }
 
-// answersBody builds a decisions response serving each ref its score.
+// answersBody builds a decisions response serving each ref its score as the
+// protocol's noul answer object ({"type":"noul","noul":<score>}).
 func answersBody(scores map[string]float64) string {
-	b, err := json.Marshal(map[string]any{"answers": scores, "usage": map[string]any{"input_tokens": 10, "output_tokens": 0}})
+	answers := make(map[string]any, len(scores))
+	for ref, s := range scores {
+		answers[ref] = map[string]any{"type": "noul", "noul": s}
+	}
+	b, err := json.Marshal(map[string]any{"answers": answers, "usage": map[string]any{"input_tokens": 10, "output_tokens": 0}})
 	if err != nil {
 		panic(err)
 	}
@@ -158,6 +164,9 @@ func TestScoreBatch_BatchesAboveProtocolCeiling(t *testing.T) {
 		if r.Req.Model != "jev-latest" {
 			t.Errorf("request %d model = %q, want jev-latest", i+1, r.Req.Model)
 		}
+		if r.Req.State.Task != "Ship the release" {
+			t.Errorf("request %d state.task = %q, want Ship the release", i+1, r.Req.State.Task)
+		}
 		for ref := range r.Req.Questions {
 			if seen[ref] {
 				t.Errorf("item %s sent in more than one request", ref)
@@ -167,12 +176,33 @@ func TestScoreBatch_BatchesAboveProtocolCeiling(t *testing.T) {
 			if q.Type != "noul" {
 				t.Errorf("item %s question type = %q, want noul", ref, q.Type)
 			}
-			wantPrompt := "Score 0.0-1.0 how essential this segment is for the ongoing task: Ship the release"
-			if q.Prompt != wantPrompt {
-				t.Errorf("item %s question prompt = %q, want %q", ref, q.Prompt, wantPrompt)
+			wantInstructions := "Considering item " + ref + " only: " + AdmitQuestionInstructions
+			if q.Instructions != wantInstructions {
+				t.Errorf("item %s question instructions = %q, want %q", ref, q.Instructions, wantInstructions)
 			}
-			if _, ok := r.Req.State.Items[ref]; !ok {
-				t.Errorf("item %s has a question but no state entry", ref)
+			if q.Criteria.True != AdmitQuestionTrue || q.Criteria.False != AdmitQuestionFalse {
+				t.Errorf("item %s question criteria = %+v, want the admit true/false texts", ref, q.Criteria)
+			}
+			// state.items is an array of {ref,text}: the asked ref must
+			// appear exactly once, carrying its own text.
+			var item *stateItem
+			for j := range r.Req.State.Items {
+				if r.Req.State.Items[j].Ref == ref {
+					if item != nil {
+						t.Errorf("item %s appears more than once in state.items", ref)
+					}
+					item = &r.Req.State.Items[j]
+				}
+			}
+			if item == nil {
+				t.Errorf("item %s has a question but no state.items entry", ref)
+				continue
+			}
+			var n int
+			if _, err := fmt.Sscanf(ref, "seg-%d", &n); err == nil {
+				if want := fmt.Sprintf("paragraph %d", n); item.Text != want {
+					t.Errorf("item %s state text = %q, want %q", ref, item.Text, want)
+				}
 			}
 		}
 	}
@@ -187,6 +217,60 @@ func TestScoreBatch_BatchesAboveProtocolCeiling(t *testing.T) {
 		if want := float64(i) * 0.01; scores[ref] != want {
 			t.Errorf("scores[%s] = %v, want %v", ref, scores[ref], want)
 		}
+	}
+}
+
+// TestScoreBatch_ReferenceWireShape is the golden test: the exact bytes of a
+// two-item decisions request must match the reference protocol (scorer.py
+// build_state + _ref_question, types.py Noul.to_payload, openrouter.py ask)
+// — state.items is an ARRAY of {ref,text} pairs, each question carries
+// instructions ("Considering item <ref> only: …") plus true/false criteria,
+// the task travels only in state.task, and the answer comes back as a noul
+// object. The question texts are interpolated from the AdmitQuestion*
+// constants, so their wording is pinned verbatim against pipeline.py's
+// ADMIT_QUESTION below.
+func TestScoreBatch_ReferenceWireShape(t *testing.T) {
+	rawCh := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		rawCh <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answers": {"seg-1": {"type": "noul", "noul": 0.75}, "seg-2": {"type": "noul", "noul": 0.25}}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := fastClient(srv.URL, 1)
+	if _, err := c.ScoreBatch(context.Background(), "Ship the release", map[string]Item{
+		"seg-1": {Text: "alpha text", Tokens: 5},
+		"seg-2": {Text: "beta text", Tokens: 5},
+	}); err != nil {
+		t.Fatalf("ScoreBatch() error = %v", err)
+	}
+	raw := <-rawCh
+
+	want := `{"model":"jev-latest","state":{"task":"Ship the release","items":[` +
+		`{"ref":"seg-1","text":"alpha text"},{"ref":"seg-2","text":"beta text"}]},` +
+		`"questions":{` +
+		`"seg-1":{"type":"noul","instructions":"Considering item seg-1 only: ` + AdmitQuestionInstructions + `","criteria":{"true":"` + AdmitQuestionTrue + `","false":"` + AdmitQuestionFalse + `"}},` +
+		`"seg-2":{"type":"noul","instructions":"Considering item seg-2 only: ` + AdmitQuestionInstructions + `","criteria":{"true":"` + AdmitQuestionTrue + `","false":"` + AdmitQuestionFalse + `"}}}}`
+	if string(raw) != want {
+		t.Errorf("request body does not match the reference wire shape:\n got: %s\nwant: %s", raw, want)
+	}
+
+	// The admit wording must stay a verbatim port of pipeline.py's
+	// ADMIT_QUESTION — the golden request interpolates the constants, so the
+	// text itself is pinned here.
+	if AdmitQuestionInstructions != "Will this item still be needed later in the task described in `task`? Answer true if it contains facts, identifiers, errors, results, or decisions that a later step may have to refer back to. Answer false only if it is progress noise, repeated boilerplate, or formatting with no retained content." {
+		t.Errorf("AdmitQuestionInstructions drifted from the reference ADMIT_QUESTION wording: %q", AdmitQuestionInstructions)
+	}
+	if AdmitQuestionTrue != "The item carries information a later step may need." {
+		t.Errorf("AdmitQuestionTrue drifted from the reference wording: %q", AdmitQuestionTrue)
+	}
+	if AdmitQuestionFalse != "The item is noise that can be recovered from the store if ever needed." {
+		t.Errorf("AdmitQuestionFalse drifted from the reference wording: %q", AdmitQuestionFalse)
 	}
 }
 
@@ -245,7 +329,13 @@ func TestScoreBatch_OversizedItemSkipped(t *testing.T) {
 		t.Errorf("small items = %v/%v, want the echoHandler scores 0.01/0.02, not fail-open %v", scores["seg-1"], scores["seg-2"], keepScore)
 	}
 	for i, r := range d.requests() {
-		if _, ok := r.Req.State.Items["seg-huge"]; ok {
+		found := false
+		for _, it := range r.Req.State.Items {
+			if it.Ref == "seg-huge" {
+				found = true
+			}
+		}
+		if found {
 			t.Errorf("request %d carried the oversized item", i+1)
 		}
 	}
@@ -413,8 +503,11 @@ func TestScoreBatch_PerBackendURL(t *testing.T) {
 	}
 }
 
-// TestScoreBatch_AnswerParsingLenient: numeric and string-number answers are
-// accepted and clamped into [0,1]; junk answers fail that item only.
+// TestScoreBatch_AnswerParsingLenient: the protocol's noul answer object is
+// the primary answer form; bare numbers and string numbers (local gateways,
+// test stubs) stay tolerated; everything parses clamped into [0,1]; junk
+// answers (non-numeric strings, wrong-type objects, noul objects without a
+// number) fail that item only.
 func TestScoreBatch_AnswerParsingLenient(t *testing.T) {
 	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
 		return http.StatusOK, `{"answers": {
@@ -422,37 +515,56 @@ func TestScoreBatch_AnswerParsingLenient(t *testing.T) {
 			"seg-str": "0.5",
 			"seg-high": 1.7,
 			"seg-low": -0.2,
-			"seg-junk": "banana"
+			"seg-obj": {"type": "noul", "noul": 0.75},
+			"seg-obj-high": {"type": "noul", "noul": 2.0},
+			"seg-junk": "banana",
+			"seg-wrongtype": {"type": "choice", "choice": "a"},
+			"seg-nonoul": {"type": "noul"}
 		}}`
 	})
 	c := fastClient(d.srv.URL, 0)
 
 	items := map[string]Item{
-		"seg-num":  {Text: "a", Tokens: 1},
-		"seg-str":  {Text: "b", Tokens: 1},
-		"seg-high": {Text: "c", Tokens: 1},
-		"seg-low":  {Text: "d", Tokens: 1},
-		"seg-junk": {Text: "e", Tokens: 1},
+		"seg-num":       {Text: "a", Tokens: 1},
+		"seg-str":       {Text: "b", Tokens: 1},
+		"seg-high":      {Text: "c", Tokens: 1},
+		"seg-low":       {Text: "d", Tokens: 1},
+		"seg-obj":       {Text: "e", Tokens: 1},
+		"seg-obj-high":  {Text: "f", Tokens: 1},
+		"seg-junk":      {Text: "g", Tokens: 1},
+		"seg-wrongtype": {Text: "h", Tokens: 1},
+		"seg-nonoul":    {Text: "i", Tokens: 1},
 	}
 	scores, err := c.ScoreBatch(context.Background(), "task", items)
 	if err == nil {
-		t.Fatal("ScoreBatch() error = nil, want the junk answer recorded as an error")
+		t.Fatal("ScoreBatch() error = nil, want the unusable answers recorded as errors")
 	}
 	want := map[string]float64{
-		"seg-num":  0.25,
-		"seg-str":  0.5,
-		"seg-high": 1, // clamped
-		"seg-low":  0, // clamped
-		"seg-junk": 1, // fail-open
+		"seg-num":       0.25,
+		"seg-str":       0.5,
+		"seg-high":      1, // clamped
+		"seg-low":       0, // clamped
+		"seg-obj":       0.75,
+		"seg-obj-high":  1, // clamped
+		"seg-junk":      1, // fail-open
+		"seg-wrongtype": 1, // fail-open
+		"seg-nonoul":    1, // fail-open (noul object without a number must not decode as a silent 0)
 	}
 	for ref, w := range want {
 		if scores[ref] != w {
 			t.Errorf("scores[%s] = %v, want %v", ref, scores[ref], w)
 		}
 	}
-	var junkErr *ItemScoreError
-	if !errors.As(err, &junkErr) || junkErr.ItemID != "seg-junk" {
-		t.Errorf("error = %v, want *ItemScoreError for seg-junk", err)
+	for _, id := range []string{"seg-junk", "seg-wrongtype", "seg-nonoul"} {
+		found := false
+		for _, e := range strings.Split(err.Error(), "\n") {
+			if strings.Contains(e, fmt.Sprintf("score item %q", id)) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("error %v missing the failure for %q", err, id)
+		}
 	}
 }
 
@@ -460,7 +572,7 @@ func TestScoreBatch_AnswerParsingLenient(t *testing.T) {
 // ref keeps that ref at 1.0 without touching the others.
 func TestScoreBatch_MissingAnswerFailsOpenItemOnly(t *testing.T) {
 	d := newDecisionsServer(t, func(_ int, _ capturedRequest) (int, string) {
-		return http.StatusOK, `{"answers": {"seg-1": 0.3}}`
+		return http.StatusOK, `{"answers": {"seg-1": {"type": "noul", "noul": 0.3}}}`
 	})
 	c := fastClient(d.srv.URL, 0)
 

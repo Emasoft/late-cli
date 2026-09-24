@@ -19,13 +19,14 @@ import (
 // Documented deviation from the reference: the reference asks
 // RETRIEVE_QUESTION, a typed Noul question carrying its own instructions and
 // true/false criteria, while the task digest travels in state.task. The Go
-// DecisionClient speaks one fixed question format (noulQuestion: "Score
-// 0.0-1.0 how essential this segment is for the ongoing task: <task>") with
-// no per-call question plumbing, so the reference's question text is folded
-// into the task slot instead (RetrieveTask): the constants below carry the
-// reference wording verbatim, and the fixed envelope then scores "essential
-// for <that framing>". The semantics are equivalent — a high score means the
-// stored item is relevant to the task right now.
+// DecisionClient speaks the reference's question format (instructions plus
+// true/false criteria — noulQuestionFor in client.go) but carries ONE fixed
+// question, the ADMIT_QUESTION port below, with no per-call question
+// plumbing, so the retrieve question's text is folded into the task slot
+// instead (RetrieveTask): the constants here carry the reference wording
+// verbatim, and the request then scores "relevant to <that framing>". The
+// semantics are equivalent — a high score means the stored item is relevant
+// to the task right now.
 //
 // A second deviation, also deliberate: the reference's score_items fails
 // open with keep-scores on ANY Jev error, so an outage retrieves (and
@@ -51,6 +52,24 @@ const RetrieveQuestionTrue = "The item is relevant to the current step."
 // RetrieveQuestionFalse is the reference RETRIEVE_QUESTION false-criteria
 // string (pipeline.py), verbatim.
 const RetrieveQuestionFalse = "The item is not relevant right now."
+
+// AdmitQuestionInstructions is the reference ADMIT_QUESTION instructions
+// string (pipeline.py), verbatim — the ONE question this port's
+// DecisionClient asks about every item (noulQuestionFor in client.go, the
+// reference's admit end of score_items). Like the reference, the question
+// never embeds the task: the task digest travels in state.task.
+const AdmitQuestionInstructions = "Will this item still be needed later in the task described in `task`? " +
+	"Answer true if it contains facts, identifiers, errors, results, or decisions " +
+	"that a later step may have to refer back to. Answer false only if it is " +
+	"progress noise, repeated boilerplate, or formatting with no retained content."
+
+// AdmitQuestionTrue is the reference ADMIT_QUESTION true-criteria string
+// (pipeline.py), verbatim.
+const AdmitQuestionTrue = "The item carries information a later step may need."
+
+// AdmitQuestionFalse is the reference ADMIT_QUESTION false-criteria string
+// (pipeline.py), verbatim.
+const AdmitQuestionFalse = "The item is noise that can be recovered from the store if ever needed."
 
 // RetrieveActionInjected and RetrieveActionSkipped are the actions recorded
 // on kind=retrieve decision entries (the reference's "injected"/"skipped"):
