@@ -153,6 +153,17 @@ func main() {
 	// one kept/relocated/tokens-saved/still-missed row per given threshold
 	// (re-decided from the recorded scores, no scorer round trip) plus the
 	// false-negative rate — then exit without starting the TUI.
+	//
+	// This branch deliberately runs BEFORE appconfig.LoadConfig: the replay
+	// consumes only the shadow log, never config.json, and LoadConfig has
+	// side effects a read-only diagnostic must not take — it CREATES a
+	// default config.json when the file is missing and tightens the config
+	// dir/file permissions. The price is that the startup config warnings
+	// (invalid compaction-mode, compaction-threshold-percent, …) are not
+	// printed on this path; they surface on any normal run or
+	// -check-compaction (which resolves the config below). If a replay ever
+	// needs to honor a config setting, move this branch below the
+	// LoadConfig block and accept the side effects.
 	if *replayShadowReq != "" {
 		thresholds, err := parseReplayThresholds(*replayShadowReq)
 		if err != nil {
