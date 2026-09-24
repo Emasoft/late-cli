@@ -94,6 +94,16 @@ type BaseOrchestrator struct {
 	// nil (the default) is the plain no-hook behavior.
 	retrievalHookFn func(context.Context)
 
+	// diagnosticsFn receives mid-session diagnostic lines (currently the
+	// dropped-progress-events notice) when installed — main wires it to the
+	// live TUI so the notice surfaces as a warning toast instead of a raw
+	// fmt.Fprintf(os.Stderr, ...) that would paint text over the
+	// alt-screen. Guarded by mu like the other settable fields; nil (the
+	// default) falls back to os.Stderr. Subagent orchestrators are separate
+	// BaseOrchestrator instances, so each child gets the sink installed too
+	// (cmd/late/main.go propagates it alongside SetRetrievalHook).
+	diagnosticsFn func(msg string)
+
 	// idleKillReason records why the idle watchdog cancelled this run; guarded
 	// by mu. Empty unless the watchdog killed the run.
 	idleKillReason string
@@ -157,13 +167,40 @@ func (o *BaseOrchestrator) trySendProgress(ev common.Event) {
 
 // reportDroppedEvents logs how many progress events were silently dropped
 // because the event consumer stalled, then resets the counter. It is called
-// from onEndTurn so each turn reports only its own drops. Stderr is used
-// instead of a field on the final ContentEvent because extending the shared
-// event contract (internal/common) is out of scope for this hardening.
+// from onEndTurn so each turn reports only its own drops. The line goes to
+// the installed diagnostics sink (see SetDiagnostics) or, when none is
+// installed, to os.Stderr — the pre-sink behavior pinned by tests.
 func (o *BaseOrchestrator) reportDroppedEvents() {
 	if dropped := o.droppedEvents.Swap(0); dropped > 0 {
-		fmt.Fprintf(os.Stderr, "late: %d events dropped (consumer stalled)\n", dropped)
+		o.reportf("late: %d events dropped (consumer stalled)\n", dropped)
 	}
+}
+
+// SetDiagnostics installs fn as this orchestrator's diagnostics sink: reportf
+// lines (e.g. the dropped-events notice) are routed to fn instead of
+// os.Stderr, so a TUI session can surface them as toasts without raw text
+// painting over the alt-screen. Passing nil removes the sink and restores the
+// stderr fallback. Re-calling SetDiagnostics replaces the previous sink — the
+// LAST installed sink wins. Must be called before the first run to apply to
+// it (or any time; reads are mutex-guarded, so installing mid-run is safe).
+func (o *BaseOrchestrator) SetDiagnostics(fn func(msg string)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.diagnosticsFn = fn
+}
+
+// reportf formats one diagnostic line and routes it to the installed
+// diagnostics sink, or — when no sink is installed — to os.Stderr with the
+// exact same format string, pinning the pre-sink behavior.
+func (o *BaseOrchestrator) reportf(format string, args ...any) {
+	o.mu.RLock()
+	fn := o.diagnosticsFn
+	o.mu.RUnlock()
+	if fn != nil {
+		fn(fmt.Sprintf(format, args...))
+		return
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
 }
 
 func (o *BaseOrchestrator) SetContext(ctx context.Context) {
