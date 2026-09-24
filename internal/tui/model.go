@@ -106,8 +106,8 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		AppConfig:             cfg,
 		SelectedTheme:         "default",
 		activeThemeStyles:     LateTheme,
-		ShowInfoBar:           cfg != nil && cfg.ShowInfoBar,
-		ShowTimestamps:        cfg != nil && cfg.ShowTimestamps,
+		ShowInfoBar:           cfg != nil && cfg.ShowInfoBar.Bool(),
+		ShowTimestamps:        cfg != nil && cfg.ShowTimestamps.Bool(),
 		JevAutocompact:        autocompactEnabled,
 		JevAutocompactPercent: autocompactPercent,
 	}

@@ -13,8 +13,7 @@ import (
 // and its Resolve* function implementing the mandatory precedence
 // explicitly-passed flag > config.json entry > built-in default.
 
-func boolPtr(v bool) *bool { return &v }
-func intPtr(v int) *int    { return &v }
+func intPtr(v int) *int { return &v }
 
 // TestResolveSystemPrompt covers the string group: system-prompt,
 // system-prompt-file, and append-system-prompt (all resolved identically).
@@ -114,34 +113,34 @@ func TestResolveAppendSystemPrompt(t *testing.T) {
 	}
 }
 
-// TestResolveDefaultTrueBools covers the *bool tri-state group whose flag
+// TestResolveDefaultTrueBools covers the *FlexBool tri-state group whose flag
 // default is true: use-tools, enable-bash, inject-cwd, enable-subagents,
 // show-cwd. All five resolve with identical semantics; the shared table runs
 // every case against each resolver via its field accessor.
 func TestResolveDefaultTrueBools(t *testing.T) {
 	resolvers := map[string]struct {
 		resolve func(*Config, bool, bool) (bool, string)
-		field   func(*Config) **bool
+		field   func(*Config) **FlexBool
 	}{
 		"use-tools": {
 			resolve: ResolveUseTools,
-			field:   func(c *Config) **bool { return &c.UseTools },
+			field:   func(c *Config) **FlexBool { return &c.UseTools },
 		},
 		"enable-bash": {
 			resolve: ResolveEnableBash,
-			field:   func(c *Config) **bool { return &c.EnableBash },
+			field:   func(c *Config) **FlexBool { return &c.EnableBash },
 		},
 		"inject-cwd": {
 			resolve: ResolveInjectCWD,
-			field:   func(c *Config) **bool { return &c.InjectCWD },
+			field:   func(c *Config) **FlexBool { return &c.InjectCWD },
 		},
 		"enable-subagents": {
 			resolve: ResolveEnableSubagents,
-			field:   func(c *Config) **bool { return &c.EnableSubagents },
+			field:   func(c *Config) **FlexBool { return &c.EnableSubagents },
 		},
 		"show-cwd": {
 			resolve: ResolveShowCWD,
-			field:   func(c *Config) **bool { return &c.ShowCWD },
+			field:   func(c *Config) **FlexBool { return &c.ShowCWD },
 		},
 	}
 
@@ -201,11 +200,11 @@ func TestResolveDefaultTrueBools(t *testing.T) {
 	}
 }
 
-// withBoolField returns a config whose named *bool field is set to v (an
+// withBoolField returns a config whose named *FlexBool field is set to v (an
 // explicit entry — the tri-state "set" case, distinct from a nil/unset one).
-func withBoolField(field func(*Config) **bool, v bool) *Config {
+func withBoolField(field func(*Config) **FlexBool, v bool) *Config {
 	cfg := &Config{}
-	*field(cfg) = boolPtr(v)
+	*field(cfg) = flexPtr(v)
 	return cfg
 }
 
@@ -219,19 +218,19 @@ func TestResolveDefaultFalseBools(t *testing.T) {
 	}{
 		"gemma-thinking": {
 			resolve: ResolveGemmaThinking,
-			set:     func(c *Config, v bool) { c.GemmaThinking = v },
+			set:     func(c *Config, v bool) { c.GemmaThinking = FlexBool(v) },
 		},
 		"enable-sqz": {
 			resolve: ResolveEnableSqz,
-			set:     func(c *Config, v bool) { c.EnableSqz = v },
+			set:     func(c *Config, v bool) { c.EnableSqz = FlexBool(v) },
 		},
 		"enable-images": {
 			resolve: ResolveEnableImages,
-			set:     func(c *Config, v bool) { c.EnableImages = v },
+			set:     func(c *Config, v bool) { c.EnableImages = FlexBool(v) },
 		},
 		"suppress-thinking-words": {
 			resolve: ResolveSuppressThinkingWords,
-			set:     func(c *Config, v bool) { c.SuppressThinkingWords = v },
+			set:     func(c *Config, v bool) { c.SuppressThinkingWords = FlexBool(v) },
 		},
 	}
 
@@ -683,23 +682,23 @@ func TestConfig_CLIEquivalentKeysJSONRoundTrip(t *testing.T) {
 		{"SystemPrompt", cfg.SystemPrompt == "sp", "sp"},
 		{"SystemPromptFile", cfg.SystemPromptFile == "/tmp/sp.md", "/tmp/sp.md"},
 		{"AppendSystemPrompt", cfg.AppendSystemPrompt == "asp", "asp"},
-		{"InjectCWD", cfg.InjectCWD != nil && !*cfg.InjectCWD, "explicit false"},
-		{"GemmaThinking", cfg.GemmaThinking, "true"},
-		{"UseTools", cfg.UseTools != nil && !*cfg.UseTools, "explicit false"},
-		{"EnableBash", cfg.EnableBash != nil && !*cfg.EnableBash, "explicit false"},
+		{"InjectCWD", cfg.InjectCWD != nil && !(*cfg.InjectCWD).Bool(), "explicit false"},
+		{"GemmaThinking", cfg.GemmaThinking.Bool(), "true"},
+		{"UseTools", cfg.UseTools != nil && !(*cfg.UseTools).Bool(), "explicit false"},
+		{"EnableBash", cfg.EnableBash != nil && !(*cfg.EnableBash).Bool(), "explicit false"},
 		{"BashTimeout", cfg.BashTimeout == "90s", "90s"},
-		{"EnableSqz", cfg.EnableSqz, "true"},
-		{"EnableImages", cfg.EnableImages, "true"},
-		{"EnableSubagents", cfg.EnableSubagents != nil && !*cfg.EnableSubagents, "explicit false"},
+		{"EnableSqz", cfg.EnableSqz.Bool(), "true"},
+		{"EnableImages", cfg.EnableImages.Bool(), "true"},
+		{"EnableSubagents", cfg.EnableSubagents != nil && !(*cfg.EnableSubagents).Bool(), "explicit false"},
 		{"SubagentMaxTurns", cfg.SubagentMaxTurns != nil && *cfg.SubagentMaxTurns == 42, "42"},
 		{"SubagentIdleTimeout", cfg.SubagentIdleTimeout == "5m", "5m"},
 		{"SubagentIdleKillAfter", cfg.SubagentIdleKillAfter == "1m", "1m"},
 		{"MaxStreamRetries", cfg.MaxStreamRetries != nil && *cfg.MaxStreamRetries == 3, "3"},
 		{"MaxConcurrentLLMRequests", cfg.MaxConcurrentLLMRequests != nil && *cfg.MaxConcurrentLLMRequests == 2, "2"},
-		{"SuppressThinkingWords", cfg.SuppressThinkingWords, "true"},
+		{"SuppressThinkingWords", cfg.SuppressThinkingWords.Bool(), "true"},
 		{"LogitBias", cfg.LogitBias == `{"5":-1}`, `{"5":-1}`},
 		{"SubagentLogitBias", cfg.SubagentLogitBias == "5:2", "5:2"},
-		{"ShowCWD", cfg.ShowCWD != nil && !*cfg.ShowCWD, "explicit false"},
+		{"ShowCWD", cfg.ShowCWD != nil && !(*cfg.ShowCWD).Bool(), "explicit false"},
 	}
 	for _, c := range checks {
 		if !c.ok {

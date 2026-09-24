@@ -161,7 +161,9 @@ type Config struct {
 	// SaveSubagentHistories opts in to persisting subagent conversation
 	// histories under <sessions>/<session-id>/subagents/. Default false.
 	// Enable via config file or the --save-subagent-histories CLI flag.
-	SaveSubagentHistories bool `json:"save_subagent_histories,omitempty"`
+	// The value is a FlexBool, so config.json accepts the on/off synonyms
+	// ("yes", "on", 1, ...) alongside true/false.
+	SaveSubagentHistories FlexBool `json:"save_subagent_histories,omitempty"`
 
 	// PermissionMode selects how potentially dangerous commands are
 	// supervised. One of the PermissionMode* constants; empty means the
@@ -209,26 +211,28 @@ type Config struct {
 	AppendSystemPrompt string `json:"append-system-prompt,omitempty"`
 
 	// InjectCWD replaces ${{CWD}} in the system prompt with the working
-	// directory. Flag: --inject-cwd. Default true. *bool tri-state: nil
+	// directory. Flag: --inject-cwd. Default true. *FlexBool tri-state: nil
 	// (absent entry) = unset → default, so an explicit false is
-	// distinguishable from unset (mirrors ShowTodoPane).
-	InjectCWD *bool `json:"inject-cwd,omitempty"`
+	// distinguishable from unset (mirrors ShowTodoPane). FlexBool values
+	// accept the on/off synonyms (true/on/enabled/yes/1, ...).
+	InjectCWD *FlexBool `json:"inject-cwd,omitempty"`
 
 	// GemmaThinking prepends the Gemma <|think|> token to the system
-	// prompt. Flag: --gemma-thinking. Default false; a plain bool suffices
-	// because the default is false.
-	GemmaThinking bool `json:"gemma-thinking,omitempty"`
+	// prompt. Flag: --gemma-thinking. Default false; a plain FlexBool
+	// suffices because the default is false.
+	GemmaThinking FlexBool `json:"gemma-thinking,omitempty"`
 
 	// UseTools offers tools to the main agent at all. Flag: --use-tools.
-	// Default true. *bool tri-state: nil (absent entry) = unset → default.
-	UseTools *bool `json:"use-tools,omitempty"`
+	// Default true. *FlexBool tri-state: nil (absent entry) = unset →
+	// default.
+	UseTools *FlexBool `json:"use-tools,omitempty"`
 
 	// EnableBash enables the bash tool. Flag: --enable-bash. Default
-	// true. *bool tri-state: nil (absent entry) = unset → default. This is
-	// the MASTER switch: config.json enabled_tools.bash provides per-tool
+	// true. *FlexBool tri-state: nil (absent entry) = unset → default. This
+	// is the MASTER switch: config.json enabled_tools.bash provides per-tool
 	// granularity and is ANDed with it — either being false disables the
 	// bash tool (see ResolveEnableBash).
-	EnableBash *bool `json:"enable-bash,omitempty"`
+	EnableBash *FlexBool `json:"enable-bash,omitempty"`
 
 	// BashTimeout is the max wall-clock time for one bash tool call.
 	// Flag: --bash-timeout. Duration STRING parsed with
@@ -238,17 +242,17 @@ type Config struct {
 
 	// EnableSqz compresses bash tool output with the external 'sqz' binary
 	// when it is available. Flag: --enable-sqz. Default false.
-	EnableSqz bool `json:"enable-sqz,omitempty"`
+	EnableSqz FlexBool `json:"enable-sqz,omitempty"`
 
 	// EnableImages force-enables image attachments even when the backend
 	// does not advertise vision support. Flag: --enable-images.
 	// Default false.
-	EnableImages bool `json:"enable-images,omitempty"`
+	EnableImages FlexBool `json:"enable-images,omitempty"`
 
 	// EnableSubagents allows the agent to spawn subagents.
-	// Flag: --enable-subagents. Default true. *bool tri-state: nil
+	// Flag: --enable-subagents. Default true. *FlexBool tri-state: nil
 	// (absent entry) = unset → default.
-	EnableSubagents *bool `json:"enable-subagents,omitempty"`
+	EnableSubagents *FlexBool `json:"enable-subagents,omitempty"`
 
 	// SubagentMaxTurns is the maximum number of turns per subagent.
 	// Flag: --subagent-max-turns. Default DefaultSubagentMaxTurns (500).
@@ -290,7 +294,7 @@ type Config struct {
 	// SuppressThinkingWords biases anti-overthinking tokens (requires the
 	// same model for the main agent and subagents). Flag:
 	// --suppress-thinking-words. Default false.
-	SuppressThinkingWords bool `json:"suppress-thinking-words,omitempty"`
+	SuppressThinkingWords FlexBool `json:"suppress-thinking-words,omitempty"`
 
 	// LogitBias is the main-agent token bias, in the same format the
 	// --logit-bias flag accepts: a JSON object or comma-separated
@@ -303,9 +307,9 @@ type Config struct {
 	SubagentLogitBias string `json:"subagent-logit-bias,omitempty"`
 
 	// ShowCWD shows the git branch / working directory in the status bar.
-	// Flag: --show-cwd. Default true. *bool tri-state: nil (absent entry)
-	// = unset → default.
-	ShowCWD *bool `json:"show-cwd,omitempty"`
+	// Flag: --show-cwd. Default true. *FlexBool tri-state: nil (absent
+	// entry) = unset → default.
+	ShowCWD *FlexBool `json:"show-cwd,omitempty"`
 
 	// Legacy subagent fields for backward compatibility
 	SubagentBaseURL string `json:"subagent_base_url,omitempty"`
@@ -318,7 +322,7 @@ type Config struct {
 	// The todos panel is open by default; set false to start with it
 	// closed. Terminals narrower than 85 columns always start with the
 	// pane closed; it can be opened later with /todos.
-	ShowTodoPane *bool `json:"show-todo-pane,omitempty"`
+	ShowTodoPane *FlexBool `json:"show-todo-pane,omitempty"`
 
 	Theme       string            `json:"theme,omitempty"`
 	Models      []ModelSetting    `json:"models,omitempty"`
@@ -328,13 +332,13 @@ type Config struct {
 	// TUI status bar (version, model, context usage, uptime, ...). Toggled
 	// at runtime with the /infobar slash command, which persists the new
 	// value back to config.json.
-	ShowInfoBar bool `json:"show-info-bar,omitempty"`
+	ShowInfoBar FlexBool `json:"show-info-bar,omitempty"`
 
 	// ShowTimestamps toggles the [HH:MM:SS] prefix rendered at the start
 	// of each transcript message block. Toggled at runtime with the
 	// /timestamps slash command, which persists the new value back to
 	// config.json.
-	ShowTimestamps bool `json:"show-timestamps,omitempty"`
+	ShowTimestamps FlexBool `json:"show-timestamps,omitempty"`
 
 	// CompactionThresholdPercent is the context-usage percentage at which
 	// compaction should trigger (surfaced by the TUI info bar as the
@@ -356,7 +360,7 @@ type Config struct {
 	// (the /jev-compact-context flow): when the focused agent's context
 	// usage crosses JevAutocompactPercent of the context window, the TUI
 	// runs one compaction pass. Default false.
-	JevAutocompact bool `json:"jev-autocompact,omitempty"`
+	JevAutocompact FlexBool `json:"jev-autocompact,omitempty"`
 
 	// JevAutocompactPercent is that threshold percentage. 0 (unset) means
 	// DefaultJevAutocompactPercent; values outside 1-100 are invalid and
@@ -415,15 +419,18 @@ type Config struct {
 	// record store to read, which only fills when compaction-mode is
 	// "enabled" — ResolveCompactionRetrieval warns about the inert
 	// combinations.
-	CompactionRetrieval bool `json:"compaction-retrieval,omitempty"`
+	CompactionRetrieval FlexBool `json:"compaction-retrieval,omitempty"`
 
-	// Degraded is set by LoadConfig when config.json exists but could not
-	// be read or parsed: the returned config is a fallback default, not
-	// the user's real settings. SaveConfig refuses to persist a degraded
-	// config so that runtime toggles (/infobar, /timestamps, /model)
-	// cannot overwrite the user's hand-edited config.json with defaults.
-	// It is never serialized (json:"-") and is NOT set when the file is
-	// merely missing — that is a normal fresh install.
+	// Degraded is defense-in-depth for SaveConfig: a config loaded from an
+	// invalid config.json must never be persisted, because it is a
+	// fallback default, not the user's real settings. Since the strict
+	// config rework, LoadConfig returns a nil config together with a
+	// rendered ConfigParseError for every content problem and main exits
+	// before the TUI starts (strict-config rule R2/R3), so NO normal
+	// startup path sets this flag anymore — it exists so that a future
+	// caller that hands a partially-loaded config to SaveConfig still
+	// cannot clobber the user's hand-edited config.json. It is never
+	// serialized (json:"-").
 	Degraded bool `json:"-"`
 }
 
@@ -444,6 +451,23 @@ func defaultConfig() Config {
 	}
 }
 
+// LoadConfig loads and strictly parses config.json.
+//
+// Behavior contract:
+//
+//   - Missing file (fresh install): a default config is written and returned
+//     with a nil error — late starts normally.
+//   - Any content problem (JSON syntax error, unknown top-level entry,
+//     wrong-typed value, invalid enum value, invalid boolean synonym) is
+//     FATAL: a rendered *ConfigParseError naming the exact file, line, and
+//     column is returned together with a nil config, and the caller (main)
+//     must print it and exit instead of starting on fallback defaults
+//     (strict-config rules R2/R3 — no fallback-to-defaults startup).
+//   - The file existing but being unreadable, or the config directory being
+//     uncreatable, is likewise fatal (nil config, non-nil error).
+//   - A failed post-load permission hardening is NOT fatal: the config
+//     content is fully valid, so it is returned together with the
+//     permission error for the caller to surface as a warning.
 func LoadConfig() (*Config, error) {
 	lateConfigDir, err := pathutil.LateConfigDir()
 	if err != nil {
@@ -454,38 +478,42 @@ func LoadConfig() (*Config, error) {
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Pre-populate with a default config that enables everything
+			// Fresh install: pre-populate with a default config that
+			// enables everything. A missing file is not a config error.
 			fallback := defaultConfig()
 			defaultData, _ := json.MarshalIndent(fallback, "", "  ")
 
 			// Ensure directory exists
 			if err := os.MkdirAll(lateConfigDir, configDirPerm); err != nil {
-				return &fallback, fmt.Errorf("failed to create config directory: %w", err)
+				return nil, fmt.Errorf("failed to create config directory: %w", err)
 			}
 
 			if err := os.WriteFile(configPath, defaultData, configFilePerm); err != nil {
-				return &fallback, fmt.Errorf("failed to write default config: %w", err)
+				return nil, fmt.Errorf("failed to write default config: %w", err)
 			}
 
 			if err := ensureSecureConfigPermissions(lateConfigDir, configPath); err != nil {
+				// The default config was written successfully; a failed
+				// permission hardening must not abort the fresh install.
 				return &fallback, err
 			}
 
 			return &fallback, nil
 		}
 
-		fallback := defaultConfig()
-		fallback.Degraded = true
-		return &fallback, fmt.Errorf("failed to read %s: %w", configPath, err)
+		// The file exists but cannot be read (e.g. it is a directory).
+		// Starting on fallback defaults would silently ignore every user
+		// setting, so this is fatal under the strict-config rules.
+		return nil, fmt.Errorf("failed to read %s: %w", configPath, err)
 	}
 
 	permErr := ensureSecureConfigPermissions(lateConfigDir, configPath)
 
-	var cfg Config
-	if err := json.Unmarshal(content, &cfg); err != nil {
-		fallback := defaultConfig()
-		fallback.Degraded = true
-		return &fallback, fmt.Errorf("failed to parse %s: %w", configPath, err)
+	cfg, err := parseConfigContent(configPath, content)
+	if err != nil {
+		// Strict config: a broken config.json never yields a fallback
+		// config. The caller must render the error and abort.
+		return nil, err
 	}
 
 	if cfg.EnabledTools == nil {
@@ -502,10 +530,12 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if permErr != nil {
-		return &cfg, permErr
+		// Permission hardening failed, but the config content is fully
+		// valid: return it so the caller can warn and continue.
+		return cfg, permErr
 	}
 
-	return &cfg, nil
+	return cfg, nil
 }
 
 func ResolveOpenAISettings(cfg *Config) OpenAISettings {
@@ -592,7 +622,7 @@ func ResolveSaveSubagentHistories(cfg *Config, cliExplicit bool, cliValue bool, 
 		return *savedPreference
 	}
 	if cfg != nil {
-		return cfg.SaveSubagentHistories
+		return cfg.SaveSubagentHistories.Bool()
 	}
 	return false
 }
@@ -669,8 +699,8 @@ func ResolveSubagentTimeout(cfg *Config, cliExplicit bool, cliValue time.Duratio
 // returns the effective value plus an optional warning for the caller to
 // surface; a nil cfg behaves like an absent entry. Boolean and plain-string
 // settings have no invalid VALUE (a wrong-typed config.json entry fails the
-// whole parse and is surfaced by the degraded-config guard), so their
-// warning return is always empty.
+// whole parse with a line/column error and aborts startup — strict-config
+// rules R2/R3), so their warning return is always empty.
 // -------------------------------------------------------------------------
 
 // resolveDurationString is the shared body of the duration-string resolvers
@@ -737,30 +767,30 @@ func ResolveAppendSystemPrompt(cfg *Config, cliExplicit bool, cliValue string) (
 
 // ResolveUseTools resolves whether tools are offered to the main agent at
 // all (flag: --use-tools). Precedence: explicitly passed flag >
-// config.json "use-tools" > true. The config entry is a *bool: nil (absent)
-// = unset.
+// config.json "use-tools" > true. The config entry is a *FlexBool: nil
+// (absent) = unset; values accept the on/off synonyms.
 func ResolveUseTools(cfg *Config, cliExplicit bool, cliValue bool) (bool, string) {
 	if cliExplicit {
 		return cliValue, ""
 	}
 	if cfg != nil && cfg.UseTools != nil {
-		return *cfg.UseTools, ""
+		return cfg.UseTools.Bool(), ""
 	}
 	return true, ""
 }
 
 // ResolveEnableBash resolves the bash tool's MASTER switch (flag:
 // --enable-bash). Precedence: explicitly passed flag > config.json
-// "enable-bash" > true. The config entry is a *bool: nil (absent) = unset.
-// enabled_tools.bash in config.json provides per-tool granularity and is
-// ANDed with this switch by the caller — either being false disables the
+// "enable-bash" > true. The config entry is a *FlexBool: nil (absent) =
+// unset. enabled_tools.bash in config.json provides per-tool granularity and
+// is ANDed with this switch by the caller — either being false disables the
 // bash tool, exactly as the flag's false always has.
 func ResolveEnableBash(cfg *Config, cliExplicit bool, cliValue bool) (bool, string) {
 	if cliExplicit {
 		return cliValue, ""
 	}
 	if cfg != nil && cfg.EnableBash != nil {
-		return *cfg.EnableBash, ""
+		return cfg.EnableBash.Bool(), ""
 	}
 	return true, ""
 }
@@ -768,41 +798,41 @@ func ResolveEnableBash(cfg *Config, cliExplicit bool, cliValue bool) (bool, stri
 // ResolveInjectCWD resolves whether ${{CWD}} is replaced with the working
 // directory in the system prompt (flag: --inject-cwd). Precedence:
 // explicitly passed flag > config.json "inject-cwd" > true. The config
-// entry is a *bool: nil (absent) = unset.
+// entry is a *FlexBool: nil (absent) = unset.
 func ResolveInjectCWD(cfg *Config, cliExplicit bool, cliValue bool) (bool, string) {
 	if cliExplicit {
 		return cliValue, ""
 	}
 	if cfg != nil && cfg.InjectCWD != nil {
-		return *cfg.InjectCWD, ""
+		return cfg.InjectCWD.Bool(), ""
 	}
 	return true, ""
 }
 
 // ResolveEnableSubagents resolves whether the agent may spawn subagents
 // (flag: --enable-subagents). Precedence: explicitly passed flag >
-// config.json "enable-subagents" > true. The config entry is a *bool: nil
-// (absent) = unset.
+// config.json "enable-subagents" > true. The config entry is a *FlexBool:
+// nil (absent) = unset.
 func ResolveEnableSubagents(cfg *Config, cliExplicit bool, cliValue bool) (bool, string) {
 	if cliExplicit {
 		return cliValue, ""
 	}
 	if cfg != nil && cfg.EnableSubagents != nil {
-		return *cfg.EnableSubagents, ""
+		return cfg.EnableSubagents.Bool(), ""
 	}
 	return true, ""
 }
 
 // ResolveShowCWD resolves whether the status bar shows the git branch /
 // working directory (flag: --show-cwd). Precedence: explicitly passed flag >
-// config.json "show-cwd" > true. The config entry is a *bool: nil (absent)
-// = unset.
+// config.json "show-cwd" > true. The config entry is a *FlexBool: nil
+// (absent) = unset.
 func ResolveShowCWD(cfg *Config, cliExplicit bool, cliValue bool) (bool, string) {
 	if cliExplicit {
 		return cliValue, ""
 	}
 	if cfg != nil && cfg.ShowCWD != nil {
-		return *cfg.ShowCWD, ""
+		return cfg.ShowCWD.Bool(), ""
 	}
 	return true, ""
 }
@@ -814,7 +844,7 @@ func ResolveGemmaThinking(cfg *Config, cliExplicit bool, cliValue bool) (bool, s
 	if cliExplicit {
 		return cliValue, ""
 	}
-	return cfg != nil && cfg.GemmaThinking, ""
+	return cfg != nil && cfg.GemmaThinking.Bool(), ""
 }
 
 // ResolveEnableSqz resolves whether bash tool output is compressed with the
@@ -824,7 +854,7 @@ func ResolveEnableSqz(cfg *Config, cliExplicit bool, cliValue bool) (bool, strin
 	if cliExplicit {
 		return cliValue, ""
 	}
-	return cfg != nil && cfg.EnableSqz, ""
+	return cfg != nil && cfg.EnableSqz.Bool(), ""
 }
 
 // ResolveEnableImages resolves whether image attachments are force-enabled
@@ -835,7 +865,7 @@ func ResolveEnableImages(cfg *Config, cliExplicit bool, cliValue bool) (bool, st
 	if cliExplicit {
 		return cliValue, ""
 	}
-	return cfg != nil && cfg.EnableImages, ""
+	return cfg != nil && cfg.EnableImages.Bool(), ""
 }
 
 // ResolveSuppressThinkingWords resolves whether anti-overthinking tokens
@@ -846,7 +876,7 @@ func ResolveSuppressThinkingWords(cfg *Config, cliExplicit bool, cliValue bool) 
 	if cliExplicit {
 		return cliValue, ""
 	}
-	return cfg != nil && cfg.SuppressThinkingWords, ""
+	return cfg != nil && cfg.SuppressThinkingWords.Bool(), ""
 }
 
 // ResolveBashTimeout resolves the max wall-clock time for one bash tool
@@ -996,7 +1026,7 @@ func (cfg *Config) ResolveShowTodoPane() bool {
 	if cfg == nil || cfg.ShowTodoPane == nil {
 		return true
 	}
-	return *cfg.ShowTodoPane
+	return cfg.ShowTodoPane.Bool()
 }
 
 // ResolveCompactionThreshold returns the effective compaction threshold
@@ -1067,7 +1097,7 @@ func ResolveAutocompact(cfg *Config) (enabled bool, percent int, warning string)
 		warning = fmt.Sprintf("ignoring invalid config.json jev-autocompact-percent %d; using %d",
 			cfg.JevAutocompactPercent, DefaultJevAutocompactPercent)
 	}
-	return cfg.JevAutocompact, percent, warning
+	return cfg.JevAutocompact.Bool(), percent, warning
 }
 
 // ResolveCompactionScoreThreshold resolves the elision score threshold: the
@@ -1185,16 +1215,17 @@ func ResolveCompactionBackend(cfg *Config) (backend string, warning string) {
 // ResolveCompactionRetrieval returns whether the compaction store's
 // retrieve() read side is enabled, mirroring ResolveAutocompact's resolver
 // shape (value plus warning). The switch is a plain boolean defaulting to
-// false: absent means retrieval never runs. A bool config entry has no
-// invalid VALUE — a wrong-typed config.json value fails the whole parse and
-// is surfaced by the degraded-config guard — so the warning return carries
-// the one invalid COMBINATION instead: retrieval enabled while
+// false: absent means retrieval never runs. A boolean config entry has no
+// invalid VALUE — a wrong-typed or nonsensical config.json value fails the
+// whole parse with a line/column error and aborts startup (strict-config
+// rules R2/R3) — so the warning return carries the one invalid COMBINATION
+// instead: retrieval enabled while
 // compaction-mode is not "enabled". The record store only fills when
 // relocation runs (mode "enabled"), so in shadow or off mode retrieval
 // would score an eternally empty store and inject nothing; the resolver
 // still honors the switch (harmless no-op) and lets the warning explain.
 func ResolveCompactionRetrieval(cfg *Config) (enabled bool, warning string) {
-	if cfg == nil || !cfg.CompactionRetrieval {
+	if cfg == nil || !cfg.CompactionRetrieval.Bool() {
 		return false, ""
 	}
 	mode, _ := ResolveCompactionMode(cfg)
@@ -1274,9 +1305,10 @@ func (cfg *Config) GetModelForAgent(agentType string) (ModelSetting, bool) {
 }
 
 // SaveConfig atomically writes the configuration back to config.json.
-// A degraded config (loaded from an invalid config.json) is never saved:
-// the caller must fix or remove the file first, so a fallback default can
-// never clobber the user's hand-edited config.
+// A degraded config is never saved (defense-in-depth): since the strict
+// config rework no LoadConfig path returns one, but if a caller ever hands a
+// partially-loaded config to SaveConfig, the refusal protects the user's
+// hand-edited config.json from being clobbered by defaults.
 func SaveConfig(cfg *Config) error {
 	if cfg != nil && cfg.Degraded {
 		return fmt.Errorf("refusing to save config: it was loaded from an invalid config.json; fix or remove the file first")

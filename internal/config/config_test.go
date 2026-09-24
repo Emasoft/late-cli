@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -216,31 +217,135 @@ func TestLoadConfig_OpenAIOnlyConfigDefaultsEnabledTools(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_MalformedFileFallsBackWithError(t *testing.T) {
-	configRoot := t.TempDir()
-	setUserConfigEnv(t, configRoot)
-	configPath := lateConfigPath(t)
+// TestLoadConfig_StrictErrorsAbort pins the strict-config startup rule: any
+// config.json content problem — JSON syntax error, unknown top-level entry,
+// wrong-typed value, invalid enum value, invalid boolean synonym — is fatal.
+// LoadConfig returns the rendered line/column error together with a NIL
+// config so main can print it and exit instead of silently starting on
+// fallback defaults.
+func TestLoadConfig_StrictErrorsAbort(t *testing.T) {
+	cases := []struct {
+		name           string
+		configContent  string
+		wantErrParts   []string
+		wantNilCfg     bool
+		wantPositioned bool
+	}{
+		{
+			name:          "valid config parses without error",
+			configContent: `{"enabled_tools":{"bash":true},"openai_model":"gpt-test"}`,
+			wantNilCfg:    false,
+		},
+		{
+			name:           "syntax error is fatal and positioned",
+			configContent:  `{"enabled_tools":{"bash":true},}`,
+			wantErrParts:   []string{"error in ", "at line 1", "column", "invalid character ','"},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			name:           "unknown key names the entry and suggests the closest",
+			configContent:  `{"compaction_mode": true}`,
+			wantErrParts:   []string{"error in ", `"compaction_mode" is not a valid config.json entry`, `Did you mean "compaction-mode"?`},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			name:           "wrong-typed value is fatal and positioned",
+			configContent:  `{"compaction-threshold-percent":"many"}`,
+			wantErrParts:   []string{`"compaction-threshold-percent" must be a number, found a string`},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			name:           "invalid enum value is fatal and positioned",
+			configContent:  `{"compaction-mode":"shado"}`,
+			wantErrParts:   []string{`"shado" is not a valid compaction-mode value`, `Did you mean "shadow"?`},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			name:           "invalid boolean synonym is fatal and positioned",
+			configContent:  `{"use-tools":"actve"}`,
+			wantErrParts:   []string{`"actve" is not a valid boolean value for "use-tools"`, "Accepted values are:"},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			// A formerly permissive case: an unknown entry is no longer
+			// silently ignored.
+			name:           "unknown extra field is rejected",
+			configContent:  `{"totally-new-option":123}`,
+			wantErrParts:   []string{`"totally-new-option" is not a valid config.json entry`},
+			wantNilCfg:     true,
+			wantPositioned: true,
+		},
+		{
+			// A formerly wrong-typed case: "yes" is now a valid boolean
+			// synonym for the FlexBool entries.
+			name:           "boolean synonym yes parses",
+			configContent:  `{"jev-autocompact":"yes","save_subagent_histories":1}`,
+			wantErrParts:   nil,
+			wantNilCfg:     false,
+			wantPositioned: false,
+		},
+	}
 
-	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, []byte(`{"enabled_tools":`), 0644); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			configRoot := t.TempDir()
+			setUserConfigEnv(t, configRoot)
+			configPath := lateConfigPath(t)
 
-	cfg, err := LoadConfig()
-	if err == nil {
-		t.Fatal("expected parse error for malformed config")
-	}
-	if cfg == nil {
-		t.Fatal("expected fallback config despite parse error")
-	}
-	if !cfg.EnabledTools["write_file"] || !cfg.EnabledTools["target_edit"] {
-		t.Fatalf("expected fallback default tools, got %#v", cfg.EnabledTools)
+			if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, []byte(tc.configContent), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := LoadConfig()
+			if tc.wantNilCfg {
+				if err == nil {
+					t.Fatal("LoadConfig() expected a fatal error, got nil")
+				}
+				if cfg != nil {
+					t.Fatalf("LoadConfig() returned a config alongside a fatal error — strict config must not fall back: %#v", cfg)
+				}
+				if !strings.HasPrefix(err.Error(), "error in ") || !strings.Contains(err.Error(), configPath) {
+					t.Fatalf("LoadConfig() error = %q, want it to name the config path %q", err.Error(), configPath)
+				}
+				for _, part := range tc.wantErrParts {
+					if !strings.Contains(err.Error(), part) {
+						t.Fatalf("LoadConfig() error = %q, want it to contain %q", err.Error(), part)
+					}
+				}
+				if tc.wantPositioned {
+					var parseErr *ConfigParseError
+					if !errors.As(err, &parseErr) {
+						t.Fatalf("LoadConfig() error = %T, want *ConfigParseError", err)
+					}
+					if !strings.Contains(err.Error(), "at line ") || !strings.Contains(err.Error(), "column ") {
+						t.Fatalf("LoadConfig() error = %q, want a line/column position", err.Error())
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v, want nil", err)
+			}
+			if cfg == nil {
+				t.Fatal("LoadConfig() returned nil config")
+			}
+		})
 	}
 }
 
-func TestLoadConfig_ReadErrorFallsBackWithError(t *testing.T) {
+// TestLoadConfig_UnreadableFileIsFatal pins that an existing-but-unreadable
+// config.json (here: the config path is a directory) aborts with an error
+// naming the path and a nil config — starting on fallback defaults would
+// silently ignore the user's real settings.
+func TestLoadConfig_UnreadableFileIsFatal(t *testing.T) {
 	configRoot := t.TempDir()
 	setUserConfigEnv(t, configRoot)
 	configPath := lateConfigPath(t)
@@ -251,17 +356,20 @@ func TestLoadConfig_ReadErrorFallsBackWithError(t *testing.T) {
 
 	cfg, err := LoadConfig()
 	if err == nil {
-		t.Fatal("expected read error when config path is a directory")
+		t.Fatal("expected error when config path is a directory")
 	}
-	if cfg == nil {
-		t.Fatal("expected fallback config despite read error")
+	if cfg != nil {
+		t.Fatal("expected nil config on a fatal load error")
 	}
-	if !cfg.EnabledTools["read_file"] || !cfg.EnabledTools["bash"] {
-		t.Fatalf("expected fallback default tools, got %#v", cfg.EnabledTools)
+	if !strings.Contains(err.Error(), configPath) {
+		t.Fatalf("LoadConfig() error = %q, want it to contain the config path %q", err.Error(), configPath)
 	}
 }
 
-func TestLoadConfig_DefaultCreateFailureFallsBackWithError(t *testing.T) {
+// TestLoadConfig_DefaultCreateFailureIsFatal pins that a fresh install that
+// cannot write its default config.json aborts with an error and a nil
+// config instead of starting on in-memory defaults.
+func TestLoadConfig_DefaultCreateFailureIsFatal(t *testing.T) {
 	configRoot := t.TempDir()
 	blockingPath := filepath.Join(configRoot, "not-a-dir")
 	if err := os.WriteFile(blockingPath, []byte("x"), 0644); err != nil {
@@ -274,11 +382,21 @@ func TestLoadConfig_DefaultCreateFailureFallsBackWithError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when config directory cannot be created")
 	}
-	if cfg == nil {
-		t.Fatal("expected fallback config despite creation failure")
+	if cfg != nil {
+		t.Fatal("expected nil config on a fatal load error")
 	}
-	if !cfg.EnabledTools["read_file"] || !cfg.EnabledTools["bash"] {
-		t.Fatalf("expected fallback default tools, got %#v", cfg.EnabledTools)
+}
+
+// TestSaveConfig_RefusesDegradedConfig pins the defense-in-depth guard: the
+// Degraded flag is never set by LoadConfig anymore (strict config aborts
+// instead), but if a caller ever hands a degraded config to SaveConfig it
+// must refuse so defaults cannot clobber the user's hand-edited config.json.
+func TestSaveConfig_RefusesDegradedConfig(t *testing.T) {
+	degraded := &Config{Degraded: true}
+	if err := SaveConfig(degraded); err == nil {
+		t.Fatal("SaveConfig() expected a refusal error for a degraded config, got nil")
+	} else if !strings.Contains(err.Error(), "refusing to save config") {
+		t.Fatalf("SaveConfig() error = %q, want it to mention refusing to save", err.Error())
 	}
 }
 
@@ -766,8 +884,8 @@ func TestConfig_ResolveShowTodoPane(t *testing.T) {
 		{"nil config defaults to open", nil, true},
 		{"absent show-todo-pane entry defaults to open", &absentEntry, true},
 		{"zero-value config defaults to open", &Config{}, true},
-		{"explicit false starts with the pane closed", &Config{ShowTodoPane: &closed}, false},
-		{"explicit true keeps the pane open", &Config{ShowTodoPane: &open}, true},
+		{"explicit false starts with the pane closed", &Config{ShowTodoPane: flexPtr(closed)}, false},
+		{"explicit true keeps the pane open", &Config{ShowTodoPane: flexPtr(open)}, true},
 	}
 
 	for _, tt := range tests {
@@ -1294,7 +1412,7 @@ func TestLoadConfig_CompactionMode(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid mode warns via resolver", func(t *testing.T) {
+	t.Run("invalid mode is a fatal load error under strict config", func(t *testing.T) {
 		configRoot := t.TempDir()
 		setUserConfigEnv(t, configRoot)
 		configPath := lateConfigPath(t)
@@ -1306,10 +1424,22 @@ func TestLoadConfig_CompactionMode(t *testing.T) {
 		}
 
 		cfg, err := LoadConfig()
-		if err != nil {
-			t.Fatalf("LoadConfig() error = %v", err)
+		if err == nil {
+			t.Fatal("LoadConfig() expected the invalid compaction-mode to be a fatal error")
 		}
-		mode, warning := ResolveCompactionMode(cfg)
+		if cfg != nil {
+			t.Fatal("LoadConfig() returned a config alongside a fatal error")
+		}
+		if !strings.Contains(err.Error(), `"yolo" is not a valid compaction-mode value`) {
+			t.Fatalf("LoadConfig() error = %q, want the R3 enum message", err.Error())
+		}
+	})
+
+	t.Run("resolver still warns on an invalid in-memory value (defense in depth)", func(t *testing.T) {
+		// Strict config rejects an invalid compaction-mode at load time, so
+		// the resolver's warning branch is unreachable via LoadConfig; it is
+		// kept for callers that construct a Config directly.
+		mode, warning := ResolveCompactionMode(&Config{CompactionMode: "yolo"})
 		if mode != DefaultCompactionMode {
 			t.Fatalf("resolved mode = %q, want %q", mode, DefaultCompactionMode)
 		}
@@ -1369,7 +1499,7 @@ func TestLoadConfig_ParsesInfoBarAndThresholdFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	if !cfg.ShowInfoBar {
+	if !cfg.ShowInfoBar.Bool() {
 		t.Fatal("ShowInfoBar = false, want true")
 	}
 	if cfg.CompactionThresholdPercent != 65 {
@@ -1388,7 +1518,7 @@ func TestConfig_InfoBarAndThresholdJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if !decoded.ShowInfoBar {
+	if !decoded.ShowInfoBar.Bool() {
 		t.Fatal("ShowInfoBar after round trip = false, want true")
 	}
 	if decoded.CompactionThresholdPercent != 65 {
@@ -1542,7 +1672,7 @@ func TestConfig_AutocompactJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if !decoded.JevAutocompact {
+	if !decoded.JevAutocompact.Bool() {
 		t.Fatal("JevAutocompact after round trip = false, want true")
 	}
 	if decoded.JevAutocompactPercent != 90 {
@@ -1566,126 +1696,10 @@ func TestConfig_AutocompactJSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_DegradationGuard covers the config degradation guard: a
-// config.json that cannot be parsed or read yields the fallback default
-// together with an error naming the exact file path and a Degraded flag
-// that makes SaveConfig refuse to overwrite the user's file. A valid file
-// (including unknown extra keys, which must keep parsing permissively)
-// loads non-degraded and saves normally. A missing file (fresh install) is
-// covered by TestLoadConfig_MissingFileCreatesDefault and stays
-// non-degraded.
-func TestLoadConfig_DegradationGuard(t *testing.T) {
-	cases := []struct {
-		name          string
-		configContent string
-		wantErr       bool
-		wantPathInErr bool
-		wantDegraded  bool
-		// roundTripModel: non-empty for savable configs — SaveConfig must
-		// succeed and the model must survive a save/reload round trip.
-		roundTripModel string
-	}{
-		{
-			name:           "valid config parses without degradation",
-			configContent:  `{"enabled_tools":{"bash":true},"openai_model":"gpt-test"}`,
-			wantErr:        false,
-			wantDegraded:   false,
-			roundTripModel: "gpt-test",
-		},
-		{
-			name:          "trailing comma is a parse error naming the path",
-			configContent: `{"enabled_tools":{"bash":true},}`,
-			wantErr:       true,
-			wantPathInErr: true,
-			wantDegraded:  true,
-		},
-		{
-			name:          "wrong-typed field is a parse error naming the path",
-			configContent: `{"jev-autocompact":"yes"}`,
-			wantErr:       true,
-			wantPathInErr: true,
-			wantDegraded:  true,
-		},
-		{
-			name:           "unknown extra field parses permissively",
-			configContent:  `{"totally-new-option":123}`,
-			wantErr:        false,
-			wantDegraded:   false,
-			roundTripModel: "",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			configRoot := t.TempDir()
-			setUserConfigEnv(t, configRoot)
-			configPath := lateConfigPath(t)
-
-			if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(configPath, []byte(tc.configContent), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
-			cfg, err := LoadConfig()
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("LoadConfig() expected an error, got nil")
-				}
-				if tc.wantPathInErr && !strings.Contains(err.Error(), configPath) {
-					t.Fatalf("LoadConfig() error = %q, want it to contain the config path %q", err.Error(), configPath)
-				}
-			} else if err != nil {
-				t.Fatalf("LoadConfig() error = %v, want nil", err)
-			}
-			if cfg == nil {
-				t.Fatal("LoadConfig() returned nil config")
-			}
-			if cfg.Degraded != tc.wantDegraded {
-				t.Fatalf("cfg.Degraded = %v, want %v", cfg.Degraded, tc.wantDegraded)
-			}
-
-			if !tc.wantDegraded {
-				if err := SaveConfig(cfg); err != nil {
-					t.Fatalf("SaveConfig() error = %v, want nil for a non-degraded config", err)
-				}
-				if tc.roundTripModel != "" {
-					reloaded, err := LoadConfig()
-					if err != nil {
-						t.Fatalf("LoadConfig() after save error = %v", err)
-					}
-					if reloaded.OpenAIModel != tc.roundTripModel {
-						t.Fatalf("round-tripped OpenAIModel = %q, want %q", reloaded.OpenAIModel, tc.roundTripModel)
-					}
-					if reloaded.Degraded {
-						t.Fatal("reloaded config after a normal save must not be degraded")
-					}
-				}
-				return
-			}
-
-			before, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			saveErr := SaveConfig(cfg)
-			if saveErr == nil {
-				t.Fatal("SaveConfig() expected a refusal error for a degraded config, got nil")
-			}
-			if !strings.Contains(saveErr.Error(), "refusing to save config") {
-				t.Fatalf("SaveConfig() error = %q, want it to mention refusing to save", saveErr.Error())
-			}
-			after, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(after) != string(before) {
-				t.Fatalf("SaveConfig() modified a degraded config's file:\nbefore: %s\nafter:  %s", before, after)
-			}
-		})
-	}
-}
+// The degradation guard is covered by TestLoadConfig_StrictErrorsAbort
+// (every content error is fatal with a nil config) and
+// TestSaveConfig_RefusesDegradedConfig (the Degraded defense-in-depth
+// refusal).
 
 // TestConfig_DegradedNotSerialized pins that the runtime-only Degraded flag
 // never leaks into config.json (json:"-").
