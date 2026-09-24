@@ -100,51 +100,55 @@ func (p pluginInlineTool) CallString(args json.RawMessage) string {
 func main() {
 	// Parse flags
 	helpReq := flag.Bool("help", false, "Show this help and exit.")
-	systemPromptReq := flag.String("system-prompt", "", "Replace the built-in system prompt with this text.")
-	systemPromptFileReq := flag.String("system-prompt-file", "", "Replace the built-in system prompt with a file's contents (highest priority).")
-	useToolsReq := flag.Bool("use-tools", true, "Offer tools to the main agent at all.")
-	enableBashReq := flag.Bool("enable-bash", true, "Enable the bash tool.")
-	bashTimeout := flag.Duration("bash-timeout", 10*time.Minute, "Max wall-clock time for one bash tool call (0 = unlimited)")
-	injectCWDReq := flag.Bool("inject-cwd", true, "Replace ${{CWD}} in the system prompt with the working directory.")
-	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents.")
-	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt.")
-	subagentMaxTurns := flag.Int("subagent-max-turns", 500, "Maximum turns per subagent.")
+	systemPromptReq := flag.String("system-prompt", "", "Replace the built-in system prompt with this text; config.json \"system-prompt\" applies unless the flag is passed")
+	systemPromptFileReq := flag.String("system-prompt-file", "", "Replace the built-in system prompt with a file's contents (highest priority); config.json \"system-prompt-file\" applies unless the flag is passed")
+	useToolsReq := flag.Bool("use-tools", true, "Offer tools to the main agent at all; config.json \"use-tools\" applies unless the flag is passed")
+	enableBashReq := flag.Bool("enable-bash", true, "Enable the bash tool (master switch; enabled_tools.bash provides per-tool granularity); config.json \"enable-bash\" applies unless the flag is passed")
+	bashTimeout := flag.Duration("bash-timeout", appconfig.DefaultBashTimeout, "Max wall-clock time for one bash tool call (0 = unlimited); config.json \"bash-timeout\" applies unless the flag is passed")
+	injectCWDReq := flag.Bool("inject-cwd", true, "Replace ${{CWD}} in the system prompt with the working directory; config.json \"inject-cwd\" applies unless the flag is passed")
+	enableSubagentsReq := flag.Bool("enable-subagents", true, "Allow the agent to spawn subagents; config.json \"enable-subagents\" applies unless the flag is passed")
+	gemmaThinkingReq := flag.Bool("gemma-thinking", false, "Prepend the Gemma <|think|> token to the system prompt; config.json \"gemma-thinking\" applies unless the flag is passed")
+	subagentMaxTurns := flag.Int("subagent-max-turns", appconfig.DefaultSubagentMaxTurns, "Maximum turns per subagent (0 = unlimited); config.json \"subagent-max-turns\" applies unless the flag is passed")
 	subagentTimeout := flag.Duration("subagent-timeout", appconfig.DefaultSubagentTimeout, "Max wall-clock time for one subagent run (0 = unlimited; config.json subagent_timeout applies unless the flag is passed)")
-	subagentIdleTimeout := flag.Duration("subagent-idle-timeout", 15*time.Minute, "Notify when a subagent has been truly idle (no stream progress, no in-flight tool, no nested spawn) for this long (0 = off)")
-	subagentIdleKillAfter := flag.Duration("subagent-idle-kill-after", 0, "Kill a subagent that stays truly idle past this duration (0 = notify only)")
+	subagentIdleTimeout := flag.Duration("subagent-idle-timeout", appconfig.DefaultSubagentIdleTimeout, "Notify when a subagent has been truly idle (no stream progress, no in-flight tool, no nested spawn) for this long (0 = off); config.json \"subagent-idle-timeout\" applies unless the flag is passed")
+	subagentIdleKillAfter := flag.Duration("subagent-idle-kill-after", 0, "Kill a subagent that stays truly idle past this duration (0 = notify only); config.json \"subagent-idle-kill-after\" applies unless the flag is passed")
 	// LATE_MAX_STREAM_RETRIES optionally overrides the default retry budget
-	// for LLM stream errors; an explicit -max-stream-retries flag wins over it.
+	// for LLM stream errors; an explicit -max-stream-retries flag wins over
+	// it. Full precedence: flag > env > config.json "max-stream-retries" >
+	// executor.DefaultMaxStreamRetries (ResolveMaxStreamRetries).
 	maxStreamRetriesDefault := executor.DefaultMaxStreamRetries
+	maxStreamRetriesEnvSet := false
 	if v := os.Getenv("LATE_MAX_STREAM_RETRIES"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil {
 			maxStreamRetriesDefault = parsed
+			maxStreamRetriesEnvSet = true
 		} else {
 			fmt.Fprintf(os.Stderr, "Warning: ignoring invalid LATE_MAX_STREAM_RETRIES %q: %v\n", v, err)
 		}
 	}
-	maxStreamRetries := flag.Int("max-stream-retries", maxStreamRetriesDefault, "Retries for LLM stream errors with backoff; 0 disables. Env: LATE_MAX_STREAM_RETRIES")
+	maxStreamRetries := flag.Int("max-stream-retries", maxStreamRetriesDefault, "Retries for LLM stream errors with backoff; 0 disables. Env: LATE_MAX_STREAM_RETRIES; config.json \"max-stream-retries\" (flag > env > config > default)")
 	// maxConcurrentLLM backs the process-wide LLM concurrency limiter in
 	// internal/client: the root agent and every subagent share one bound, so
 	// parallel agents queue instead of stampeding the provider's
 	// account-level concurrency limit (429s).
-	maxConcurrentLLM := flag.Int("max-concurrent-llm-requests", 6, "Process-wide cap on concurrent in-flight LLM requests across all agents and subagents (0 = unlimited)")
+	maxConcurrentLLM := flag.Int("max-concurrent-llm-requests", appconfig.DefaultMaxConcurrentLLMRequests, "Process-wide cap on concurrent in-flight LLM requests across all agents and subagents (0 = unlimited); config.json \"max-concurrent-llm-requests\" applies unless the flag is passed")
 
 	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent histories to disk (overrides session and config).")
-	enableSqzReq := flag.Bool("enable-sqz", false, "Compress bash tool output with the external 'sqz' binary if available.")
-	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append this text to the final system prompt.")
+	enableSqzReq := flag.Bool("enable-sqz", false, "Compress bash tool output with the external 'sqz' binary if available; config.json \"enable-sqz\" applies unless the flag is passed")
+	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append this text to the final system prompt; config.json \"append-system-prompt\" applies unless the flag is passed")
 	versionReq := flag.Bool("version", false, "Print the version and exit.")
 	unsupervisedReq := flag.Bool("i-promise-i-have-backups-and-will-not-file-issues", false, "UNSUPPORTED: run every tool without user confirmation.")
 	forceRevaluateReq := flag.Bool("force-revaluate-dangerous-commands", false, forceRevaluateUsage)
 	askForUserApprovalReq := flag.Bool("ask-for-user-approval", false, askForUserApprovalUsage)
-	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support.")
+	enableImagesReq := flag.Bool("enable-images", false, "Force-enable image attachments even if the backend does not advertise vision support; config.json \"enable-images\" applies unless the flag is passed")
 	continueReq := flag.Bool("continue", false, "Resume the most recently updated session, regardless of which project directory it was started in.")
 	continueProjectReq := flag.Bool("continue-project", false, "Resume the most recently updated session for the current project (git repo root of the working directory, or the working directory outside a repo); mutually exclusive with -continue.")
-	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar.")
+	showCWDReq := flag.Bool("show-cwd", true, "Show the git branch / working directory in the status bar; config.json \"show-cwd\" applies unless the flag is passed")
 	themeReq := flag.String("theme", "", "Plugin theme id ('plugin:name' or bare name); env: LATE_THEME.")
 	promptReq := flag.String("prompt", "", "Start the agent immediately with this prompt.")
-	logitBiasReq := flag.String("logit-bias", "", "Main-agent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
-	suppressThinkingWordsReq := flag.Bool("suppress-thinking-words", false, "Bias anti-overthinking tokens (requires the same model for main agent and subagents).")
-	subagentLogitBiasReq := flag.String("subagent-logit-bias", "", "Subagent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs.")
+	logitBiasReq := flag.String("logit-bias", "", "Main-agent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs; config.json \"logit-bias\" applies unless the flag is passed")
+	suppressThinkingWordsReq := flag.Bool("suppress-thinking-words", false, "Bias anti-overthinking tokens (requires the same model for main agent and subagents); config.json \"suppress-thinking-words\" applies unless the flag is passed")
+	subagentLogitBiasReq := flag.String("subagent-logit-bias", "", "Subagent token bias: JSON object or comma-separated TOKEN_ID:BIAS pairs; config.json \"subagent-logit-bias\" applies unless the flag is passed")
 
 	// Compaction (staged rollout of the jev-compaction port): off = no
 	// scoring at all; shadow = score tool outputs + shadow log only
@@ -164,20 +168,10 @@ func main() {
 	// Record which flags were explicitly passed on the command line. The app
 	// config loads AFTER flag.Parse below, so flag.Visit (which reports only
 	// command-line-set flags) is the only reliable "explicit flag > config"
-	// precedence signal for resolvers such as ResolveSubagentTimeout.
+	// precedence signal for every resolver of a CLI-equivalent setting
+	// (ResolveSubagentTimeout, ResolveBashTimeout, ResolveUseTools, ...).
 	explicitFlags := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
-
-	// Activate the process-wide LLM concurrency limiter before anything else
-	// runs: every client created below (main agent, subagents, model
-	// switcher) shares this one bound, so it must be configured before the
-	// first request can be issued.
-	client.SetLLMConcurrency(*maxConcurrentLLM)
-
-	tool.SetSqzEnabled(*enableSqzReq)
-	// Shell tool bound: 0/negative (--bash-timeout=0) disables it —
-	// ShellTool.Execute treats a non-positive timeout as unbounded.
-	tool.SetShellTimeout(*bashTimeout)
 
 	if *versionReq {
 		fmt.Printf("late %s\n", common.Version)
@@ -307,53 +301,11 @@ func main() {
 		}
 	}
 
-	// Determine system prompt
-	// Priority: --system-prompt-file > --system-prompt > LATE_SYSTEM_PROMPT env var
-	var systemPrompt string
-
-	if *systemPromptFileReq != "" {
-		content, err := os.ReadFile(*systemPromptFileReq)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading system prompt file: %v\n", err)
-			os.Exit(1)
-		}
-		systemPrompt = string(content)
-	} else if *systemPromptReq != "" {
-		systemPrompt = *systemPromptReq
-	} else if envPrompt := os.Getenv("LATE_SYSTEM_PROMPT"); envPrompt != "" {
-		systemPrompt = envPrompt
-	} else {
-		content, _ := assets.PromptsFS.ReadFile("prompts/instruction-orchestrator.md")
-		systemPrompt = string(content)
-	}
-
-	if *injectCWDReq {
-		cwd, err := os.Getwd()
-		if err == nil {
-			systemPrompt = common.ReplacePlaceholders(systemPrompt, map[string]string{
-				"${{CWD}}": cwd,
-			})
-		}
-	}
-
-	if *gemmaThinkingReq {
-		systemPrompt = "<|think|>" + systemPrompt
-	}
-
-	if !*enableBashReq {
-		systemPrompt = common.ReplacePlaceholders(systemPrompt,
-			map[string]string{
-				"${{NOTICE}}": "Bash is disabled. You must not attempt to use execute any bash commands. Doing so will result in an error.",
-			})
-	}
-
-	if runtime.GOOS == "windows" {
-		systemPrompt += "\n\n## Platform Note\nYou are running on **Windows** and commands execute in **PowerShell**. Prefer PowerShell-native commands and syntax:\n- Prefer `Get-ChildItem` (or `dir`) for directory listing\n- Prefer `Get-Content` for reading files\n- Prefer `Remove-Item` for deleting files/directories\n- Prefer `Copy-Item` and `Move-Item` for copy/move operations\n- Prefer `New-Item -ItemType Directory` for explicit directory creation\n- Use PowerShell quoting/escaping rules and avoid Unix-only shell syntax\n- Do NOT use bash/sh-specific features unless explicitly required"
-	}
-
-	if *appendSystemPromptReq != "" {
-		systemPrompt = systemPrompt + *appendSystemPromptReq
-	}
+	// The system prompt is assembled after appconfig.LoadConfig below: its
+	// inputs (--system-prompt/-file/-append, --inject-cwd, --gemma-thinking,
+	// --enable-bash) are CLI-equivalent settings resolved with the mandatory
+	// flag > config > default precedence, which needs the loaded config.
+	// Nothing between the flag block and LoadConfig consumes the prompt.
 
 	// Sessions setup
 
@@ -467,6 +419,121 @@ func main() {
 		}
 	}
 
+	// ------------------------------------------------------------------
+	// CLI-equivalent settings (flag > config > default).
+	//
+	// Every setting below mirrors a command-line flag one-to-one; its
+	// config.json key is the flag name in kebab-case. Each appconfig
+	// resolver implements the mandatory precedence — explicitly passed
+	// flag (explicitFlags, recorded from flag.Visit above) > config.json
+	// > built-in default — and returns an optional warning surfaced on
+	// stderr like every other invalid config entry.
+	// ------------------------------------------------------------------
+	reportWarning := func(warning string) {
+		if warning != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+		}
+	}
+
+	// Activate the process-wide LLM concurrency limiter before the first
+	// client is created (the main agent, every subagent, and the model
+	// switcher share this one bound). Resolved here — not at flag.Parse
+	// time — because config.json can lower or lift the flag's built-in
+	// default; nothing between the flag block and here issues LLM requests.
+	resolvedMaxConcurrentLLM, maxConcurrentLLMWarning := appconfig.ResolveMaxConcurrentLLMRequests(appConfig, explicitFlags["max-concurrent-llm-requests"], *maxConcurrentLLM)
+	reportWarning(maxConcurrentLLMWarning)
+	client.SetLLMConcurrency(resolvedMaxConcurrentLLM)
+
+	resolvedEnableSqz, _ := appconfig.ResolveEnableSqz(appConfig, explicitFlags["enable-sqz"], *enableSqzReq)
+	tool.SetSqzEnabled(resolvedEnableSqz)
+
+	// Shell tool bound: 0/negative (--bash-timeout=0) disables it —
+	// ShellTool.Execute treats a non-positive timeout as unbounded.
+	resolvedBashTimeout, bashTimeoutWarning := appconfig.ResolveBashTimeout(appConfig, explicitFlags["bash-timeout"], *bashTimeout)
+	reportWarning(bashTimeoutWarning)
+	tool.SetShellTimeout(resolvedBashTimeout)
+
+	// System prompt group. Priority (identical to the flags): file > text >
+	// LATE_SYSTEM_PROMPT env > built-in; the append is always applied last.
+	resolvedSystemPrompt, _ := appconfig.ResolveSystemPrompt(appConfig, explicitFlags["system-prompt"], *systemPromptReq)
+	resolvedSystemPromptFile, _ := appconfig.ResolveSystemPromptFile(appConfig, explicitFlags["system-prompt-file"], *systemPromptFileReq)
+	resolvedAppendSystemPrompt, _ := appconfig.ResolveAppendSystemPrompt(appConfig, explicitFlags["append-system-prompt"], *appendSystemPromptReq)
+	resolvedInjectCWD, _ := appconfig.ResolveInjectCWD(appConfig, explicitFlags["inject-cwd"], *injectCWDReq)
+	resolvedGemmaThinking, _ := appconfig.ResolveGemmaThinking(appConfig, explicitFlags["gemma-thinking"], *gemmaThinkingReq)
+	resolvedEnableBash, _ := appconfig.ResolveEnableBash(appConfig, explicitFlags["enable-bash"], *enableBashReq)
+
+	// Subagent group.
+	resolvedEnableSubagents, _ := appconfig.ResolveEnableSubagents(appConfig, explicitFlags["enable-subagents"], *enableSubagentsReq)
+	resolvedSubagentMaxTurns, subagentMaxTurnsWarning := appconfig.ResolveSubagentMaxTurns(appConfig, explicitFlags["subagent-max-turns"], *subagentMaxTurns)
+	reportWarning(subagentMaxTurnsWarning)
+	resolvedSubagentIdleTimeout, subagentIdleTimeoutWarning := appconfig.ResolveSubagentIdleTimeout(appConfig, explicitFlags["subagent-idle-timeout"], *subagentIdleTimeout)
+	reportWarning(subagentIdleTimeoutWarning)
+	resolvedSubagentIdleKillAfter, subagentIdleKillAfterWarning := appconfig.ResolveSubagentIdleKillAfter(appConfig, explicitFlags["subagent-idle-kill-after"], *subagentIdleKillAfter)
+	reportWarning(subagentIdleKillAfterWarning)
+
+	// Streaming / model group.
+	resolvedMaxStreamRetries, maxStreamRetriesWarning := appconfig.ResolveMaxStreamRetries(appConfig, explicitFlags["max-stream-retries"], *maxStreamRetries, maxStreamRetriesEnvSet, maxStreamRetriesDefault)
+	reportWarning(maxStreamRetriesWarning)
+	resolvedEnableImages, _ := appconfig.ResolveEnableImages(appConfig, explicitFlags["enable-images"], *enableImagesReq)
+	resolvedSuppressThinkingWords, _ := appconfig.ResolveSuppressThinkingWords(appConfig, explicitFlags["suppress-thinking-words"], *suppressThinkingWordsReq)
+	resolvedLogitBias, _ := appconfig.ResolveLogitBias(appConfig, explicitFlags["logit-bias"], *logitBiasReq)
+	resolvedSubagentLogitBias, _ := appconfig.ResolveSubagentLogitBias(appConfig, explicitFlags["subagent-logit-bias"], *subagentLogitBiasReq)
+
+	// Session / TUI group.
+	resolvedShowCWD, _ := appconfig.ResolveShowCWD(appConfig, explicitFlags["show-cwd"], *showCWDReq)
+	resolvedUseTools, _ := appconfig.ResolveUseTools(appConfig, explicitFlags["use-tools"], *useToolsReq)
+
+	// Determine system prompt
+	// Priority: --system-prompt-file > --system-prompt > LATE_SYSTEM_PROMPT
+	// env var (each of the first two is itself resolved flag > config >
+	// default above, so a config file beats a config text and either flag
+	// beats either config entry).
+	var systemPrompt string
+
+	if resolvedSystemPromptFile != "" {
+		content, err := os.ReadFile(resolvedSystemPromptFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading system prompt file: %v\n", err)
+			os.Exit(1)
+		}
+		systemPrompt = string(content)
+	} else if resolvedSystemPrompt != "" {
+		systemPrompt = resolvedSystemPrompt
+	} else if envPrompt := os.Getenv("LATE_SYSTEM_PROMPT"); envPrompt != "" {
+		systemPrompt = envPrompt
+	} else {
+		content, _ := assets.PromptsFS.ReadFile("prompts/instruction-orchestrator.md")
+		systemPrompt = string(content)
+	}
+
+	if resolvedInjectCWD {
+		cwd, err := os.Getwd()
+		if err == nil {
+			systemPrompt = common.ReplacePlaceholders(systemPrompt, map[string]string{
+				"${{CWD}}": cwd,
+			})
+		}
+	}
+
+	if resolvedGemmaThinking {
+		systemPrompt = "<|think|>" + systemPrompt
+	}
+
+	if !resolvedEnableBash {
+		systemPrompt = common.ReplacePlaceholders(systemPrompt,
+			map[string]string{
+				"${{NOTICE}}": "Bash is disabled. You must not attempt to use execute any bash commands. Doing so will result in an error.",
+			})
+	}
+
+	if runtime.GOOS == "windows" {
+		systemPrompt += "\n\n## Platform Note\nYou are running on **Windows** and commands execute in **PowerShell**. Prefer PowerShell-native commands and syntax:\n- Prefer `Get-ChildItem` (or `dir`) for directory listing\n- Prefer `Get-Content` for reading files\n- Prefer `Remove-Item` for deleting files/directories\n- Prefer `Copy-Item` and `Move-Item` for copy/move operations\n- Prefer `New-Item -ItemType Directory` for explicit directory creation\n- Use PowerShell quoting/escaping rules and avoid Unix-only shell syntax\n- Do NOT use bash/sh-specific features unless explicitly required"
+	}
+
+	if resolvedAppendSystemPrompt != "" {
+		systemPrompt = systemPrompt + resolvedAppendSystemPrompt
+	}
+
 	// Resolve the global subagent run budget with precedence
 	// explicit --subagent-timeout flag > config.json "subagent_timeout" >
 	// DefaultSubagentTimeout (24h). A non-positive resolved budget ("0" or
@@ -477,25 +544,36 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", subagentTimeoutWarning)
 	}
 
-	// Parse explicit user logit bias overrides if provided
+	// Parse the resolved main-agent logit bias override if provided. A
+	// malformed FLAG value keeps the historical hard error (the user typed
+	// it on this very command line); a malformed CONFIG value warns and
+	// proceeds without a bias, like every other invalid config entry.
 	var explicitUserLogitBias map[string]int
-	if *logitBiasReq != "" {
-		parsed, err := client.ParseLogitBias(*logitBiasReq)
+	if resolvedLogitBias != "" {
+		parsed, err := client.ParseLogitBias(resolvedLogitBias)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing --logit-bias: %v\n", err)
-			os.Exit(1)
+			if explicitFlags["logit-bias"] {
+				fmt.Fprintf(os.Stderr, "Error parsing --logit-bias: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: ignoring invalid config.json logit-bias: %v\n", err)
+		} else {
+			explicitUserLogitBias = parsed
 		}
-		explicitUserLogitBias = parsed
 	}
 
 	var explicitSubagentLogitBias map[string]int
-	if *subagentLogitBiasReq != "" {
-		parsed, err := client.ParseLogitBias(*subagentLogitBiasReq)
+	if resolvedSubagentLogitBias != "" {
+		parsed, err := client.ParseLogitBias(resolvedSubagentLogitBias)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing --subagent-logit-bias: %v\n", err)
-			os.Exit(1)
+			if explicitFlags["subagent-logit-bias"] {
+				fmt.Fprintf(os.Stderr, "Error parsing --subagent-logit-bias: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: ignoring invalid config.json subagent-logit-bias: %v\n", err)
+		} else {
+			explicitSubagentLogitBias = parsed
 		}
-		explicitSubagentLogitBias = parsed
 	}
 
 	// Resolve subagent history persistence opt-in
@@ -529,7 +607,7 @@ func main() {
 		BaseURL:      resolvedOpenAIConfig.BaseURL,
 		APIKey:       resolvedOpenAIConfig.APIKey,
 		Model:        resolvedOpenAIConfig.Model,
-		EnableImages: *enableImagesReq,
+		EnableImages: resolvedEnableImages,
 		LogitBias:    explicitUserLogitBias,
 		AppVersion:   common.Version,
 	}
@@ -548,7 +626,7 @@ func main() {
 	showTodoPane := appConfig.ResolveShowTodoPane()
 
 	// Validate --suppress-thinking-words: only allowed in homogeneous setups
-	if err := validateSuppressThinkingWords(*suppressThinkingWordsReq, resolvedClientConfig.Model, resolvedSubagentConfig.Model, appConfig); err != nil {
+	if err := validateSuppressThinkingWords(resolvedSuppressThinkingWords, resolvedClientConfig.Model, resolvedSubagentConfig.Model, appConfig); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: --suppress-thinking-words is currently only supported when orchestrator and subagents use the same model: %v\n", err)
 		os.Exit(1)
 	}
@@ -565,14 +643,17 @@ func main() {
 			BaseURL:      resolvedSubagentConfig.BaseURL,
 			APIKey:       resolvedSubagentConfig.APIKey,
 			Model:        resolvedSubagentConfig.Model,
-			EnableImages: *enableImagesReq,
+			EnableImages: resolvedEnableImages,
 			LogitBias:    explicitSubagentLogitBias,
 			AppVersion:   common.Version,
 		})
 	}
 
 	// Flag overrides
-	if !*enableBashReq {
+	// The bash master switch ANDs with enabled_tools.bash (per-tool
+	// granularity): either being false disables the bash tool, exactly as
+	// the -enable-bash=false flag always has.
+	if !resolvedEnableBash {
 		enabledTools["bash"] = false
 	}
 
@@ -588,7 +669,7 @@ func main() {
 	mainTools["write_file"] = false
 	mainTools["target_edit"] = false
 
-	sess := session.New(c, historyPath, history, systemPrompt, *useToolsReq)
+	sess := session.New(c, historyPath, history, systemPrompt, resolvedUseTools)
 	if loadedSessionMeta != nil {
 		sess.SetSubagentMetadata(loadedSessionMeta.SubagentSeq, loadedSessionMeta.SaveSubagentHistories)
 		if loadedSessionMeta.WorkingDir != "" {
@@ -895,7 +976,7 @@ func main() {
 	// Idle watchdog policy applies to the root agent too: an orchestrator
 	// stuck with no stream progress, tool, or nested spawn reports idle (and,
 	// with --subagent-idle-kill-after, cancels its own run).
-	rootAgent.SetIdlePolicy(*subagentIdleTimeout, *subagentIdleKillAfter)
+	rootAgent.SetIdlePolicy(resolvedSubagentIdleTimeout, resolvedSubagentIdleKillAfter)
 
 	model := tui.NewModel(rootAgent, renderer, appConfig)
 	model.SetActiveThemeStyles(themeBytes)
@@ -912,7 +993,7 @@ func main() {
 			if setting.Model == resolvedClientConfig.Model {
 				bias = c.LogitBias()
 			}
-			sess.SetClient(newModelClient(ctx, setting, *enableImagesReq, bias))
+			sess.SetClient(newModelClient(ctx, setting, resolvedEnableImages, bias))
 			return nil
 		}
 	}
@@ -1029,7 +1110,7 @@ func main() {
 		resolvedSubagentConfig.Model != resolvedOpenAIConfig.Model {
 		model.SubagentInfo = resolvedSubagentConfig.Model
 	}
-	model.ShowCWD = *showCWDReq
+	model.ShowCWD = resolvedShowCWD
 	// Set ShowTodoPane BEFORE the SetSize calls below: SetSize -> updateLayout
 	// reserves the side-pane width for terminals >= 85 cols and silently
 	// closes the pane again below that threshold — the same guard as the
@@ -1121,7 +1202,7 @@ func main() {
 			ctx = context.WithValue(ctx, common.SkipConfirmationKey, true)
 			ctx = context.WithValue(ctx, common.ForceRevaluateKey, true)
 		}
-		ctx = context.WithValue(ctx, common.MaxStreamRetriesKey, *maxStreamRetries)
+		ctx = context.WithValue(ctx, common.MaxStreamRetriesKey, resolvedMaxStreamRetries)
 		rootAgent.SetContext(ctx)
 
 		// Set middlewares (see buildMiddlewares for ordering rationale).
@@ -1132,7 +1213,7 @@ func main() {
 
 		// Wait only in this background goroutine: the TUI remains usable while
 		// connections and discovery finish, but --prompt needs their results.
-		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, *suppressThinkingWordsReq, explicitUserLogitBias, explicitSubagentLogitBias)
+		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, resolvedSuppressThinkingWords, explicitUserLogitBias, explicitSubagentLogitBias)
 
 		if *promptReq != "" {
 			p.Send(tui.StartPromptMsg(*promptReq))
@@ -1172,7 +1253,7 @@ func main() {
 		}()
 	}
 
-	if *enableSubagentsReq {
+	if resolvedEnableSubagents {
 		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string, timeoutOverride *time.Duration) (string, error) {
 			// Effective wall-clock budget for this run. Context layering:
 			// parent ctx (cancellation) ⊇ run budget (deadline) — runCtx is
@@ -1202,7 +1283,7 @@ func main() {
 						BaseURL:      setting.URL,
 						APIKey:       setting.Key,
 						Model:        setting.Model,
-						EnableImages: *enableImagesReq,
+						EnableImages: resolvedEnableImages,
 						LogitBias:    biasForSubagent,
 						AppVersion:   common.Version,
 					})
@@ -1213,7 +1294,7 @@ func main() {
 				currentSubagentClient = subagentClient
 			}
 
-			child, err := agent.NewSubagentOrchestrator(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, *injectCWDReq, *gemmaThinkingReq, *subagentMaxTurns, effectiveSessionID, saveSubagentHistories, rootAgent, p)
+			child, err := agent.NewSubagentOrchestrator(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, resolvedInjectCWD, resolvedGemmaThinking, resolvedSubagentMaxTurns, effectiveSessionID, saveSubagentHistories, rootAgent, p)
 			if err != nil {
 				return "", err
 			}
@@ -1257,7 +1338,7 @@ func main() {
 			if sa, ok := child.(interface {
 				SetIdlePolicy(idle, killAfter time.Duration)
 			}); ok {
-				sa.SetIdlePolicy(*subagentIdleTimeout, *subagentIdleKillAfter)
+				sa.SetIdlePolicy(resolvedSubagentIdleTimeout, resolvedSubagentIdleKillAfter)
 			}
 
 			// The child streams on its own session, so the parent shows no
