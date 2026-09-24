@@ -108,7 +108,13 @@ type Record struct {
 // in-memory record intact (the session keeps working; only cross-restart
 // persistence for that record is lost) and is not reported — the no-error
 // shape matches Put's existing signature, and open-time failures are where
-// callers warn and degrade to the in-memory store.
+// callers warn and degrade to the in-memory store. The backing file is
+// deliberately never fsynced and no descriptor is held between appends
+// (each persist opens, writes, and closes): a process crash can lose at
+// most the records of the appends still in the OS page cache, and the
+// torn-tail repair below covers the mid-line residue. Durability against a
+// machine crash is accepted debt for an append-only JSONL log of
+// re-retrievable originals — exactly the trade ShadowLog.Append makes.
 type Store struct {
 	mu      sync.Mutex
 	records map[string]*Record

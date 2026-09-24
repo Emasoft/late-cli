@@ -382,7 +382,8 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		scored++
 		report.MessagesScored++
 
-		// Reference flush_run pattern: consecutive below-threshold segments
+		// Reference flush_run pattern (shared with the tool-output path via
+		// compaction.BuildElidedRun): consecutive below-threshold segments
 		// group into ONE run sharing a single record and pointer; kept
 		// segments flush the pending run and keep their exact text in place.
 		// Pointer lines stand exactly where the runs stood, so
@@ -403,28 +404,10 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 			if len(run) == 0 {
 				return
 			}
-			var text strings.Builder
-			segIDs := make([]string, 0, len(run))
-			for _, seg := range run {
-				text.WriteString(seg.Text)
-				segIDs = append(segIDs, seg.ID)
-			}
-			runText := text.String()
-			id := compaction.ContentID(runText, "", "r")
-			tokens := 0
-			for _, seg := range run {
-				tokens += seg.Tokens
-			}
-			summary := compaction.Summarise(runText, compaction.SummaryMaxChars)
-			pointer := compaction.FormatPointer(compaction.Pointer{
-				ID:      id,
-				Lines:   &[2]int{run[0].LineStart, run[len(run)-1].LineEnd},
-				Tokens:  tokens,
-				Summary: summary,
-			})
-			pointers = append(pointers, pointer)
-			stored += len(runText)
-			elidedSegs += len(run)
+			er := compaction.BuildElidedRun(run, "")
+			pointers = append(pointers, er.Pointer)
+			stored += len(er.Text)
+			elidedSegs += er.Segments
 			if !opts.ShadowOnly {
 				// The record mirrors the reference store.py Record for a
 				// history-elided run: kind elided_segment, origin
@@ -434,17 +417,17 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 				// attributes back to. CreatedTurn stays 0 — turn plumbing
 				// does not exist yet.
 				store.PutRecord(compaction.Record{
-					ID:          id,
-					Text:        runText,
+					ID:          er.ID,
+					Text:        er.Text,
 					Kind:        compaction.RecordKindElidedSegment,
 					Origin:      compaction.Origin{Source: compaction.OriginSourceHistory},
-					Tokens:      tokens,
+					Tokens:      er.Tokens,
 					CreatedTurn: 0,
-					Summary:     summary,
-					SegmentIDs:  segIDs,
+					Summary:     er.Summary,
+					SegmentIDs:  er.SegmentIDs,
 				})
 			}
-			b.WriteString(pointer)
+			b.WriteString(er.Pointer)
 			b.WriteString("\n")
 			run = run[:0]
 		}

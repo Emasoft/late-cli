@@ -4,11 +4,18 @@
 // ongoing task, so a later stage can elide the low-value tail of the context
 // window instead of cramming everything in.
 //
-// Stage 1 (this package today) is SHADOW-ONLY: it segments tool outputs,
-// scores the segments through the System One decisions protocol, and appends
-// one JSONL line per decision to a shadow log. Nothing in the agent loop
-// changes yet — the tool layer is wired in a later stage; Replay() turns the
-// accumulated log into the numbers that decision will need.
+// Stage 1 (ScoreToolOutput) segments tool outputs, scores the segments
+// through the System One decisions protocol, and appends one JSONL line per
+// decision to a shadow log; Replay() turns the accumulated log into the
+// numbers a threshold decision needs. Stage 2 (EnableRelocation +
+// CompactToolOutput) additionally elides low-scoring segments into the
+// persistent record Store and replaces each run with an [[elided …]]
+// pointer line that the expand tool (internal/tool) resolves back — the
+// executor consults the pipeline for oversized tool results before they
+// enter history, and session.CompactContext reuses the same scorer, gate
+// vocabulary, and store for full-history compaction. Shadow mode
+// (compaction-mode "shadow") is still report-only: stage 2 only runs when
+// relocation is armed.
 //
 // Fail-open contract: scoring is best-effort. Any item that cannot be scored
 // (provider outage, bad answer, oversized item) comes back with a score of

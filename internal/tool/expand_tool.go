@@ -46,7 +46,10 @@ type expandOutcomeStore interface {
 //
 // (content-addressed ids, r:<8 hex>) — or, from older builds,
 //
-//	[[elided id=elide-3 lines=12 tokens=310 "first sixty chars …"]]
+//	[[elided id=elide-3 lines=12-31 tokens=310 "first sixty chars …"]]
+//
+// (legacy counter ids; the pre-reference count form "lines=12" is not
+// parseable and never was — the id alone is what matters here)
 //
 // and calling this tool with such an id returns the full original text.
 // Passing a whole pointer line instead of the bare id works too: the id is

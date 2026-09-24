@@ -184,6 +184,71 @@ func Reconstruct(text string, store *Store) string {
 	})
 }
 
+// ElidedRun is the shared flush_run product (the reference pipeline's
+// flush_run): one run of consecutive elided segments reduced to the pieces
+// both relocation surfaces need — the store record's fields, the pointer
+// line, and the run's stats. The pipeline's tool-output path
+// (CompactToolOutput) and the session's history walk
+// (session.CompactContext) build their runs with BuildElidedRun, so the id
+// scheme, the token/summary math, and the pointer format cannot drift
+// between tool-output compaction and history compaction.
+type ElidedRun struct {
+	// ID is the run's content id: ContentID(Text, salt, "r").
+	ID string
+	// Text is the concatenated original run text — what the store keeps
+	// and what the expand tool returns.
+	Text string
+	// Tokens is the run's summed segment token count.
+	Tokens int
+	// Segments is the number of source segments the run grouped.
+	Segments int
+	// Summary is Summarise(Text, SummaryMaxChars) — the pointer's preview.
+	Summary string
+	// SegmentIDs lists the contributing segment ids in run order (the
+	// outcomes ledger's attribution).
+	SegmentIDs []string
+	// Pointer is the formatted [[elided …]] pointer line for the run, with
+	// no trailing newline; callers append their own separator.
+	Pointer string
+}
+
+// BuildElidedRun reduces one run of consecutive elided segments (run is
+// non-empty) to its record/pointer product. salt namespaces the content id
+// (ContentID of the run text): the tool-output path salts with the tool
+// name, the history walk salts with "" (per-surface content addressing).
+// The pointer's lines come from the run's first and last segment line span
+// in the original text.
+func BuildElidedRun(run []Segment, salt string) ElidedRun {
+	var text strings.Builder
+	segIDs := make([]string, 0, len(run))
+	for _, seg := range run {
+		text.WriteString(seg.Text)
+		segIDs = append(segIDs, seg.ID)
+	}
+	runText := text.String()
+	tokens := 0
+	for _, seg := range run {
+		tokens += seg.Tokens
+	}
+	summary := Summarise(runText, SummaryMaxChars)
+	id := ContentID(runText, salt, contentIDPrefix)
+	pointer := FormatPointer(Pointer{
+		ID:      id,
+		Lines:   &[2]int{run[0].LineStart, run[len(run)-1].LineEnd},
+		Tokens:  tokens,
+		Summary: summary,
+	})
+	return ElidedRun{
+		ID:         id,
+		Text:       runText,
+		Tokens:     tokens,
+		Segments:   len(run),
+		Summary:    summary,
+		SegmentIDs: segIDs,
+		Pointer:    pointer,
+	}
+}
+
 // ElidedSegment is one RUN of consecutive segments removed from a tool
 // result (or history message) by relocation. ID/Lines/Tokens/Summary
 // describe the pointer that replaced the run; Text is the concatenated
@@ -268,12 +333,13 @@ func (p *Pipeline) relocationArmed() (*Store, float64) {
 // enter history.
 //
 // Runs: consecutive below-floor segments are grouped into ONE run (the
-// reference pipeline's flush_run pattern) sharing a single record and a
-// single pointer — the record's text is the concatenated run, its id is
-// ContentID(runText, toolName, "r"), and the pointer carries the run's
-// [first, last] line range in the original output. Pointer lines stand
-// exactly where the runs stood, so Reconstruct(compacted, store) restores
-// the original byte for byte.
+// reference pipeline's flush_run pattern, shared with the history walk via
+// BuildElidedRun) sharing a single record and a single pointer — the
+// record's text is the concatenated run, its id is ContentID(runText,
+// toolName, "r"), and the pointer carries the run's [first, last] line
+// range in the original output. Pointer lines stand exactly where the runs
+// stood, so Reconstruct(compacted, store) restores the original byte for
+// byte.
 //
 // Two gate guards run before and after the per-segment decisions:
 //
@@ -365,56 +431,39 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 	var run []Segment
 
 	// flushRun relocates the accumulated run of consecutive elided segments
-	// (the reference pipeline's flush_run): the concatenated run text goes
-	// into the store under its content id, and one pointer line — run line
-	// range, summed tokens, 120-char summary — takes the run's place in the
-	// output.
+	// (the reference pipeline's flush_run, via the shared BuildElidedRun):
+	// the concatenated run text goes into the store under its content id,
+	// and one pointer line — run line range, summed tokens, 120-char
+	// summary — takes the run's place in the output.
 	flushRun := func() {
 		if len(run) == 0 {
 			return
 		}
-		var text strings.Builder
-		segIDs := make([]string, 0, len(run))
-		for _, seg := range run {
-			text.WriteString(seg.Text)
-			segIDs = append(segIDs, seg.ID)
-		}
-		runText := text.String()
-		id := ContentID(runText, toolName, contentIDPrefix)
-		tokens := 0
-		for _, seg := range run {
-			tokens += seg.Tokens
-		}
-		summary := Summarise(runText, SummaryMaxChars)
+		er := BuildElidedRun(run, toolName)
 		// The record carries what the reference attaches to every stored
 		// run (store.py Record): its origin — "tool:<name>", the only
 		// surface this path knows — token count, pointer summary, and the
 		// contributing segment ids the outcomes ledger attributes back to.
 		// Turn stays 0: turn plumbing does not exist yet.
 		store.PutRecord(Record{
-			ID:         id,
-			Text:       runText,
+			ID:         er.ID,
+			Text:       er.Text,
 			Kind:       RecordKindElidedSegment,
 			Origin:     Origin{Source: OriginSourceToolPrefix + toolName},
-			Tokens:     tokens,
-			Summary:    summary,
-			SegmentIDs: segIDs,
+			Tokens:     er.Tokens,
+			Summary:    er.Summary,
+			SegmentIDs: er.SegmentIDs,
 		})
 		e := ElidedSegment{
-			ID:       id,
+			ID:       er.ID,
 			Lines:    [2]int{run[0].LineStart, run[len(run)-1].LineEnd},
-			Tokens:   tokens,
-			Segments: len(run),
-			Summary:  summary,
-			Text:     runText,
+			Tokens:   er.Tokens,
+			Segments: er.Segments,
+			Summary:  er.Summary,
+			Text:     er.Text,
 		}
 		out.Elided = append(out.Elided, e)
-		b.WriteString(FormatPointer(Pointer{
-			ID:      e.ID,
-			Lines:   &[2]int{e.Lines[0], e.Lines[1]},
-			Tokens:  e.Tokens,
-			Summary: e.Summary,
-		}))
+		b.WriteString(er.Pointer)
 		b.WriteString("\n")
 		run = run[:0]
 	}
