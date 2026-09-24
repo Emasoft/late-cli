@@ -79,11 +79,11 @@ func stubDecisionsServer(t *testing.T, scoreFor func(ref string) float64) (*http
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		scores := make(map[string]float64, len(req.Questions))
+		answers := make(map[string]any, len(req.Questions))
 		for ref := range req.Questions {
-			scores[ref] = scoreFor(ref)
+			answers[ref] = map[string]any{"type": "noul", "noul": scoreFor(ref)}
 		}
-		resp, err := json.Marshal(map[string]any{"answers": scores})
+		resp, err := json.Marshal(map[string]any{"answers": answers})
 		if err != nil {
 			t.Errorf("marshal decisions response: %v", err)
 			w.WriteHeader(http.StatusBadRequest)

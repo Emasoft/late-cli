@@ -68,49 +68,98 @@ const (
 	// agent for hours.
 	retryAfterCeiling = 5 * time.Minute
 	// requestOverheadTokens is a conservative estimate of the fixed JSON
-	// skeleton around the state and questions (model, field names, braces).
+	// skeleton around the state and questions (model, task, the questions
+	// object, braces and field names).
 	requestOverheadTokens = 48
+	// perItemWireTokens is a conservative flat allowance for the JSON keys
+	// and braces around one state item and its question ("ref"/"text",
+	// "type"/"instructions"/"criteria") that the text and ref estimates do
+	// not count.
+	perItemWireTokens = 16
 	// maxDecisionStatusBodyBytes bounds how much of an error response body
 	// is read before parsing.
 	maxDecisionStatusBodyBytes = 8192
 	// maxDecisionResponseBytes bounds a 200 response body: answers echo only
-	// refs and scores, so anything near this bound is hostile.
+	// refs and small noul objects, so anything near this bound is hostile.
 	maxDecisionResponseBytes = 8 << 20
 )
 
-// noulQuestion builds the single System One question asked per item: a
-// "noul" free-form numeric answer scoring the segment's essentiality.
-func noulQuestion(task string) decisionQuestion {
+// noulQuestionFor builds the one question the client asks per item, named
+// for that item: the reference's ADMIT_QUESTION (pipeline.py), ported
+// verbatim to the AdmitQuestion* constants in retrieve.go, with scorer.py's
+// _ref_question "Considering item <ref> only:" prefix — the batch shares one
+// state, so the question text is the only thing that tells the model which
+// of the batch's items a given answer is about.
+func noulQuestionFor(ref string) decisionQuestion {
 	return decisionQuestion{
-		Type:   "noul",
-		Prompt: "Score 0.0-1.0 how essential this segment is for the ongoing task: " + task,
+		Type:         "noul",
+		Instructions: "Considering item " + ref + " only: " + AdmitQuestionInstructions,
+		Criteria: decisionCriteria{
+			True:  AdmitQuestionTrue,
+			False: AdmitQuestionFalse,
+		},
 	}
 }
 
-// Wire types for the System One decisions protocol:
+// budgetQuestionTokens estimates one per-ref question payload's token cost
+// from a representative short ref — the same "i0" stand-in the reference's
+// planner uses (scorer.py: estimate_tokens(
+// _ref_question(question, "i0").to_payload())). ScoreBatch adds each item's
+// own ref on top, so a long id still counts against the budget.
+func budgetQuestionTokens() int {
+	b, err := json.Marshal(noulQuestionFor("i0"))
+	if err != nil {
+		// json.Marshal cannot fail on this plain-string struct; the fallback
+		// merely keeps the budget estimate conservative.
+		return 128
+	}
+	return common.EstimateTokenCount(string(b))
+}
+
+// Wire types for the System One decisions protocol — the reference's
+// openrouter.py ask() body, scorer.py build_state, and types.py
+// Noul.to_payload:
 //
-//	POST {"model": …, "state": {"task": …, "items": {ref: {text}}},
-//	      "questions": {ref: {"type": "noul", "prompt": …}}}
-//	→    {"answers": {ref: <score>}, "usage": {…}}
+//	POST {"model": …, "state": {"task": …, "items": [{"ref": …, "text": …}]},
+//	      "questions": {ref: {"type": "noul", "instructions": …,
+//	                          "criteria": {"true": …, "false": …}}}}
+//	→    {"answers": {ref: {"type": "noul", "noul": <float>}}, "usage": {…}}
+//
+// state.items is an ARRAY of {ref, text} pairs (the reference builds it
+// positionally), not a map keyed by ref, and the task travels only in
+// state.task — the question instructions never embed it.
 type decisionRequest struct {
 	Model     string                      `json:"model"`
 	State     decisionState               `json:"state"`
 	Questions map[string]decisionQuestion `json:"questions"`
 }
 
+// decisionState is one batch's shared state: the task digest plus the
+// batch's items, in request order.
 type decisionState struct {
-	Task  string               `json:"task"`
-	Items map[string]stateItem `json:"items"`
+	Task  string      `json:"task"`
+	Items []stateItem `json:"items"`
 }
 
-// stateItem is the wire form of an Item (only the text crosses the wire).
+// stateItem is one entry of the state's items array: the item's ref (the
+// question/answer key) and the text being scored.
 type stateItem struct {
+	Ref  string `json:"ref"`
 	Text string `json:"text"`
 }
 
+// decisionQuestion is the wire form of a Noul question: instructions plus
+// the true/false criteria the answer's probability weighs.
 type decisionQuestion struct {
-	Type   string `json:"type"`
-	Prompt string `json:"prompt"`
+	Type         string           `json:"type"`
+	Instructions string           `json:"instructions"`
+	Criteria     decisionCriteria `json:"criteria"`
+}
+
+// decisionCriteria carries the two criterion descriptions of a Noul question.
+type decisionCriteria struct {
+	True  string `json:"true"`
+	False string `json:"false"`
 }
 
 type decisionResponse struct {
@@ -220,8 +269,10 @@ type packed struct {
 }
 
 // ScoreBatch scores every item for the given task with one "noul" question
-// per item ("Score 0.0-1.0 how essential this segment is for the ongoing
-// task: <task>"), batched under the protocol ceilings: at most
+// per item ("Considering item <ref> only: <admit instructions>" — the
+// reference's ADMIT_QUESTION, ported to the AdmitQuestion* constants), with
+// the task traveling only in state.task, batched under the protocol ceilings:
+// at most
 // MaxItemsPerRequest items and MaxStateTokens estimated tokens per request
 // (batches are formed in lexicographic item-ID order, so the split is
 // deterministic).
@@ -264,10 +315,13 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 		return scores, errors.Join(errs...)
 	}
 
-	question := noulQuestion(task)
-	questionTokens := common.EstimateTokenCount(question.Prompt)
-	itemCost := func(itemTokens int) int {
-		return itemTokens + questionTokens
+	// The per-question token cost is estimated once from a representative
+	// payload (the reference's planner stands in the ref "i0"); each item
+	// then adds its own ref and a flat wire allowance, so long ids and the
+	// per-item JSON keys still count against the budget.
+	questionTokens := budgetQuestionTokens()
+	itemCost := func(itemTokens int, ref string) int {
+		return itemTokens + questionTokens + common.EstimateTokenCount(ref) + perItemWireTokens
 	}
 	overhead := requestOverheadTokens + common.EstimateTokenCount(task) + questionTokens
 
@@ -280,11 +334,7 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 		if len(batch) == 0 {
 			return
 		}
-		batchItems := make(map[string]Item, len(batch))
-		for _, p := range batch {
-			batchItems[p.id] = p.it
-		}
-		answered, answerErrs, reqErr := c.scoreBatchRequest(ctx, task, question, batchItems)
+		answered, answerErrs, reqErr := c.scoreBatchRequest(ctx, task, batch)
 		for _, p := range batch {
 			switch {
 			case reqErr != nil:
@@ -308,7 +358,7 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 		if tok <= 0 {
 			tok = common.EstimateTokenCount(it.Text)
 		}
-		if cost := overhead + itemCost(tok); cost > MaxStateTokens {
+		if cost := overhead + itemCost(tok, id); cost > MaxStateTokens {
 			// A single item that cannot fit even alone in a request is a
 			// budget violation (the reference's JevBudgetError: raised
 			// before sending). It is skipped per item — the fail-open keep
@@ -321,11 +371,11 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 			})
 			continue
 		}
-		if len(batch) >= MaxItemsPerRequest || batchTokens+itemCost(tok) > MaxStateTokens {
+		if len(batch) >= MaxItemsPerRequest || batchTokens+itemCost(tok, id) > MaxStateTokens {
 			flush()
 		}
 		batch = append(batch, packed{id: id, it: it, tok: tok})
-		batchTokens += itemCost(tok)
+		batchTokens += itemCost(tok, id)
 	}
 	flush()
 
@@ -336,19 +386,21 @@ func (c *DecisionClient) ScoreBatch(ctx context.Context, task string, items map[
 // the parsed scores plus any per-item answer errors. A non-nil request error
 // means the whole batch failed (after retries — except auth and validation,
 // which come back on the first attempt, never retried); per-item errors mark
-// individual unusable answers.
-func (c *DecisionClient) scoreBatchRequest(ctx context.Context, task string, question decisionQuestion, batch map[string]Item) (map[string]float64, map[string]error, error) {
+// individual unusable answers. The batch's shared state carries the task plus
+// the items as a {ref, text} array; each ref gets its own question naming it
+// (noulQuestionFor, the reference's _ref_question).
+func (c *DecisionClient) scoreBatchRequest(ctx context.Context, task string, batch []packed) (map[string]float64, map[string]error, error) {
 	if c.Unavailable() {
 		// Poisoned mid-call (an earlier batch in this same ScoreBatch hit
 		// an auth rejection): fail the remaining batches without touching
 		// the network — the caller fail-opens each item.
 		return nil, nil, authError(0, opScoreBatch, errScoringDisabled)
 	}
-	items := make(map[string]stateItem, len(batch))
+	items := make([]stateItem, len(batch))
 	questions := make(map[string]decisionQuestion, len(batch))
-	for id, it := range batch {
-		items[id] = stateItem{Text: it.Text}
-		questions[id] = question
+	for i, p := range batch {
+		items[i] = stateItem{Ref: p.id, Text: p.it.Text}
+		questions[p.id] = noulQuestionFor(p.id)
 	}
 	body, err := json.Marshal(decisionRequest{
 		Model:     c.backend.Backend.Model,
@@ -366,9 +418,9 @@ func (c *DecisionClient) scoreBatchRequest(ctx context.Context, task string, que
 		}
 		answered, answerErrs, err := c.attempt(ctx, body)
 		if err == nil {
-			for id := range batch {
-				if _, ok := answered[id]; !ok && answerErrs[id] == nil {
-					answerErrs[id] = fmt.Errorf("decision response missing answer")
+			for _, p := range batch {
+				if _, ok := answered[p.id]; !ok && answerErrs[p.id] == nil {
+					answerErrs[p.id] = fmt.Errorf("decision response missing answer")
 				}
 			}
 			return answered, answerErrs, nil
@@ -605,9 +657,10 @@ func (c *DecisionClient) retryDelay(attempt int, retryAfter time.Duration) time.
 	return delay
 }
 
-// parseAnswers converts the raw answer map into scores, tolerating numeric
-// and string-number payloads and clamping into [0,1]. Unusable answers land
-// in the returned per-item error map instead of failing the batch.
+// parseAnswers converts the raw answer map into scores, tolerating the
+// protocol's noul answer objects and, for local gateways, bare numeric and
+// string-number payloads, clamped into [0,1]. Unusable answers land in the
+// returned per-item error map instead of failing the batch.
 func parseAnswers(raw map[string]json.RawMessage) (map[string]float64, map[string]error) {
 	answered := make(map[string]float64, len(raw))
 	errs := make(map[string]error)
@@ -622,12 +675,23 @@ func parseAnswers(raw map[string]json.RawMessage) (map[string]float64, map[strin
 	return answered, errs
 }
 
-// parseScore parses one answer payload: a JSON number, or a string holding
-// one, clamped into [0,1].
+// parseScore parses one answer payload: the protocol's noul answer object
+// ({"type":"noul","noul":<number>} — types.py parse_answer), a bare JSON
+// number, or a string holding one (the bare forms stay tolerated for local
+// gateways and test stubs), clamped into [0,1]. A noul-typed object without
+// a usable "noul" number falls through and is rejected — it must not decode
+// as a silent 0 (an elision).
 func parseScore(v json.RawMessage) (float64, error) {
 	trimmed := bytes.TrimSpace(v)
 	if len(trimmed) == 0 {
 		return 0, fmt.Errorf("empty answer")
+	}
+	var noul struct {
+		Type string   `json:"type"`
+		Noul *float64 `json:"noul"`
+	}
+	if err := json.Unmarshal(trimmed, &noul); err == nil && noul.Type == "noul" && noul.Noul != nil {
+		return clampScore(*noul.Noul), nil
 	}
 	var f float64
 	if err := json.Unmarshal(trimmed, &f); err == nil {

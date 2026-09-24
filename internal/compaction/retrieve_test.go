@@ -251,8 +251,17 @@ func TestRetrieve_TaskFramingReachesTheWire(t *testing.T) {
 			t.Errorf("scoring task %q does not contain %q", task, want)
 		}
 	}
-	if got := captured.Req.State.Items["r:a"].Text; got != "summary a" {
-		t.Errorf("scored item text = %q, want the digest SUMMARY, not the original", got)
+	var scored *stateItem
+	for i := range captured.Req.State.Items {
+		if captured.Req.State.Items[i].Ref == "r:a" {
+			scored = &captured.Req.State.Items[i]
+		}
+	}
+	if scored == nil {
+		t.Fatal("the request carried no state.items entry for r:a")
+	}
+	if scored.Text != "summary a" {
+		t.Errorf("scored item text = %q, want the digest SUMMARY, not the original", scored.Text)
 	}
 }
 
