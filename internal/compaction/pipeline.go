@@ -67,6 +67,13 @@ type Pipeline struct {
 	authReason string
 	authWarned bool
 	warnTo     io.Writer
+
+	// warnFn, when installed, receives the same one-time auth warning
+	// INSTEAD of warnTo: the TUI wiring installs it (SetWarningSink) so a
+	// mid-session poisoning surfaces as a toast instead of a raw stderr
+	// write painting over the alt-screen. nil (the default, and every
+	// headless/CLI flow) keeps the warnTo behavior.
+	warnFn func(msg string)
 }
 
 // PipelineOptions tunes the pipeline; zero values are production defaults.
@@ -127,11 +134,32 @@ func (p *Pipeline) noteAuthFailure(reason string) {
 	p.authReason = reason
 	if !p.authWarned {
 		p.authWarned = true
-		fmt.Fprintf(p.warnTo, "Warning: compaction scoring disabled for this session (%v)\n", reason)
+		// Live-console surface: the installed warning sink (TUI toast) when
+		// present, the warnTo writer (os.Stderr) otherwise — the exact
+		// pre-sink behavior for headless flows and tests.
+		if p.warnFn != nil {
+			p.warnFn(fmt.Sprintf("Warning: compaction scoring disabled for this session (%v)\n", reason))
+		} else {
+			fmt.Fprintf(p.warnTo, "Warning: compaction scoring disabled for this session (%v)\n", reason)
+		}
 		// Durable record of the poisoning (the warning is ephemeral):
 		// best-effort, never fails the pipeline.
 		common.LogErrorf("compaction", "scoring disabled for this session (auth): %v", reason)
 	}
+}
+
+// SetWarningSink installs fn as the live-console surface for the pipeline's
+// one-time auth-poison warning: noteAuthFailure routes its note to fn instead
+// of warnTo (os.Stderr), so a TUI session can surface the warning as a toast
+// without raw text painting over the alt-screen. Passing nil removes the sink
+// and restores the stderr fallback. The main() wiring installs it together
+// with the retrieval-skip warning's diagSink; the -check-compaction
+// preflight and every headless flow run with no sink installed and keep the
+// stderr behavior.
+func (p *Pipeline) SetWarningSink(fn func(msg string)) {
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	p.warnFn = fn
 }
 
 // DisableAuth is noteAuthFailure's exported form, for the Step 16 startup

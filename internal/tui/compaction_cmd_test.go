@@ -227,7 +227,13 @@ func TestJevCompactContextEndToEnd(t *testing.T) {
 
 	sess := session.New(nil, filepath.Join(t.TempDir(), "history.json"), []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("Please analyze this build log.")},
-		{Role: "assistant", Content: client.TextContent(strings.Repeat("verbose analysis ", 200))},
+		// The compaction candidate: assistant content annotating a tool
+		// call (a pure-prose assistant message is never compacted).
+		{
+			Role:      "assistant",
+			Content:   client.TextContent(strings.Repeat("verbose analysis ", 200)),
+			ToolCalls: []client.ToolCall{{Index: 0, ID: "call_1", Type: "function", Function: client.FunctionCall{Name: "Bash", Arguments: `{"cmd":"make build"}`}}},
+		},
 	}, "system prompt", false)
 	scorer := &fakeHistoryScorer{score: 0}
 	store := compaction.NewStore()

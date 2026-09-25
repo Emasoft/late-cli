@@ -167,6 +167,17 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 	}
 
 	if _, ok := msg.(clearToastMsg); ok {
+		// Stale expiry tick: toasts overlap often (hook diagnostics fire in
+		// bursts, the 413 guidance toast lasts 8s), and a tea.Tick scheduled
+		// by the PREVIOUS toast can land while a NEWER toast is still alive.
+		// Clearing unconditionally let that old tick kill the new toast
+		// early. Every toast-set rewrites ToastExpireTime, so while "now" is
+		// still before that expiry, the arriving tick cannot be the one the
+		// current toast scheduled — ignore it; the current toast owns its
+		// own clear tick.
+		if m.ToastMessage != "" && time.Now().UnixMilli() < m.ToastExpireTime {
+			return m, nil
+		}
 		m.ToastMessage = ""
 		m.ToastWarning = false
 		m.updateViewport()
@@ -899,6 +910,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 						m.Focused.SystemPrompt(),
 						m.Focused.ToolDefinitions(),
 					)
+					// A rewind rewrote this agent's history: re-arm the
+					// one-shot 413 payload-recovery compaction, exactly like
+					// /new does. Without this, a conversation that already
+					// burned its recovery pass keeps a 413 permanent even
+					// after the user rolled back to a smaller history.
+					focusedState.PayloadRecoveryUsed = false
 
 					m.ToastMessage = "conversation rewound"
 					m.ToastWarning = false
@@ -1551,7 +1568,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		m.ToastMessage = msg.Text
 		m.ToastWarning = msg.Warning
 		m.ToastExpireTime = time.Now().UnixMilli() + 3000
-		return m, func() tea.Msg { return clearToastMsg{} }
+		// The toast carries its own expiry above: schedule the clear tick
+		// instead of clearing on the next loop iteration. The old
+		// immediate-clear command erased the toast the moment Bubble Tea ran
+		// the command — one rendered frame — making the toast invisible even
+		// though the expiry was set for 3s.
+		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+			return clearToastMsg{}
+		})
 
 	case ToastMsg:
 		m.ToastMessage = msg.Text
