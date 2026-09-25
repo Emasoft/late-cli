@@ -123,6 +123,19 @@ func parseConfigContent(path string, content []byte) (*Config, error) {
 		}
 	}
 
+	// The user's strict rule — unknown entries are positioned errors with a
+	// did-you-mean suggestion — extends to the keys INSIDE every models[]
+	// entry: encoding/json would otherwise silently drop a hand-edited typo
+	// there (the typed decode only notices it under DisallowUnknownFields,
+	// without a useful position). Value-RANGE problems (e.g. a
+	// jev-autocompact-percent of 400) stay in the warn-and-fall-back path,
+	// consistent with the global key's warning pattern; strictness here
+	// covers key NAMES only.
+	if modelsEntry, ok := lastEntryByKey(entries, "models"); ok {
+		if err := checkModelsEntryKeys(path, content, modelsEntry); err != nil {
+			return nil, err
+		}
+	}
 	var cfg Config
 	dec := json.NewDecoder(bytes.NewReader(content))
 	dec.DisallowUnknownFields()
@@ -428,6 +441,145 @@ func validateEnumValues(path string, content []byte, entries []configEntry) erro
 		}
 	}
 	return nil
+}
+
+// knownModelEntryKeys is the set of valid keys inside one models[] entry,
+// mirrored from ModelSetting's json tags (kept in sync by docs_test.go's
+// reflection guard on the documented schema).
+var knownModelEntryKeys = map[string]bool{
+	"id":                      true,
+	"url":                     true,
+	"key":                     true,
+	"model":                   true,
+	"jev-autocompact-percent": true,
+}
+
+// lastEntryByKey returns the last recorded top-level entry with the given
+// key (encoding/json's duplicate-key semantics: the last occurrence wins and
+// is what the typed decode keeps, so validating it matches what survives).
+func lastEntryByKey(entries []configEntry, key string) (configEntry, bool) {
+	var found configEntry
+	ok := false
+	for _, entry := range entries {
+		if entry.key == key {
+			found, ok = entry, true
+		}
+	}
+	return found, ok
+}
+
+// checkModelsEntryKeys walks the raw models[] array and validates every
+// object's keys against the known ModelSetting key set: an unknown key
+// inside an entry is a positioned did-you-mean error, just like the
+// top-level unknown-key walk (R3). The array is re-parsed with a Decoder so
+// each entry's exact byte range within the document is known (raw = the
+// source bytes, entryStart = InputOffset - len(raw)) and the nested key
+// offsets are then absolute document offsets — encoding/json does not report
+// positions for nested fields itself. agent_models needs no equivalent pass:
+// it is a map[string]string whose keys are agent roles (data, never schema),
+// so it has no unknown-key concept.
+func checkModelsEntryKeys(path string, content []byte, models configEntry) error {
+	dec := json.NewDecoder(bytes.NewReader(models.raw))
+	if tok, err := dec.Token(); err != nil {
+		// Unreachable in practice: the syntax pass validated the document.
+		return wrapSyntaxError(path, content, err)
+	} else if delim, isDelim := tok.(json.Delim); !isDelim || delim != '[' {
+		// Not an array: the typed decode owns that error (with its own
+		// positioned rendering); nothing to walk here.
+		return nil
+	}
+	for dec.More() {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return wrapSyntaxError(path, content, err)
+		}
+		// Offsets inside models.raw are relative to the models value; the
+		// entry's document offset is models.valueStart (where raw's first
+		// byte lives) + the entry's offset within raw.
+		entryStart := models.valueStart + int(dec.InputOffset()) - len(raw)
+		if err := checkOneModelsEntry(path, content, raw, entryStart, modelsEntryLabel(raw)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// modelsEntryLabel derives the human name of one raw models[] entry for
+// error messages: its id when set, else its model name, else the generic
+// "entry" — the same identifier AutocompactWarnings uses.
+func modelsEntryLabel(raw json.RawMessage) string {
+	var m ModelSetting
+	if err := json.Unmarshal(raw, &m); err == nil {
+		if m.ID != "" {
+			return m.ID
+		}
+		if m.Model != "" {
+			return m.Model
+		}
+	}
+	return "entry"
+}
+
+// checkOneModelsEntry validates the keys of one raw models[] entry object
+// whose first byte sits at entryStart in the document. A nested key's
+// absolute offset is entryStart + (offset of the key within raw), so the
+// reported line/column is the key's position in the user's editor. Null
+// entries (and non-object values, whose handling the typed decode owns)
+// carry no keys to validate. label names the entry in errors (its id, model
+// name, or its array position).
+func checkOneModelsEntry(path string, content, raw []byte, entryStart int, label string) error {
+	if string(raw) == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return wrapSyntaxError(path, content, err)
+	}
+	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '{' {
+		return nil
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return wrapSyntaxError(path, content, err)
+		}
+		key, isString := tok.(string)
+		if !isString {
+			return wrapSyntaxError(path, content, fmt.Errorf("expected an object key, found %s", describeJSONToken(tok)))
+		}
+		keyStart := entryStart + int(dec.InputOffset()) - len(key) - 2 // minus the two quotes
+		if !knownModelEntryKeys[key] {
+			return unknownModelEntryKeyError(path, content, key, keyStart, label)
+		}
+		// Values need no key-level validation here: the typed decode's
+		// positioned type errors cover wrong types, and an out-of-range
+		// jev-autocompact-percent value warns (Config.AutocompactWarnings),
+		// the same as the global key.
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return wrapSyntaxError(path, content, err)
+		}
+	}
+	return nil
+}
+
+// unknownModelEntryKeyError renders the R3 error for an unknown key inside a
+// models[] entry: a did-you-mean suggestion against the known entry keys
+// when reasonably similar, otherwise the full sorted list — the same shape
+// as the top-level unknownKeyError, with the message naming the entry.
+func unknownModelEntryKeyError(path string, content []byte, key string, keyStart int, label string) error {
+	names := make([]string, 0, len(knownModelEntryKeys))
+	for name := range knownModelEntryKeys {
+		names = append(names, name)
+	}
+	if suggestion := closestMatch(key, names); suggestion != "" {
+		return newConfigParseError(path, content, keyStart,
+			"models[%s] entry %q is not a valid entry key. Did you mean %q?", label, key, suggestion)
+	}
+	sort.Strings(names)
+	return newConfigParseError(path, content, keyStart,
+		"models[%s] entry %q is not a valid entry key. Valid entry keys are: %s", label, key, strings.Join(names, ", "))
 }
 
 // invalidEnumValueError renders the R3 enum error: a Did-you-mean suggestion

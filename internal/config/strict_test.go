@@ -442,16 +442,131 @@ func TestParseConfigContent_AllKeysWithSynonymsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestParseConfigContent_UnknownNestedEntryIsRejected pins the
-// DisallowUnknownFields backstop for nested sections (models entries).
+// TestParseConfigContent_UnknownNestedEntryIsRejected pins the models[] walk
+// as the positioned replacement for the DisallowUnknownFields backstop for
+// models entries: an unknown key inside an entry is a located error (the
+// generic decode path reported the same typo without a usable position).
 func TestParseConfigContent_UnknownNestedEntryIsRejected(t *testing.T) {
 	content := `{"models": [{"url": "http://p:8080", "key": "k", "model": "m", "urll": "typo"}]}`
 	_, err := parseConfigContent("/x/config.json", []byte(content))
 	if err == nil {
 		t.Fatal("expected an unknown nested entry error")
 	}
-	if !strings.Contains(err.Error(), `"urll" is not a valid config.json entry`) {
-		t.Fatalf("error = %q, want the nested unknown-entry message", err.Error())
+	want := `error in /x/config.json at line 1, column ` + strconv.Itoa(runeColumn(content, `"urll"`)) +
+		`: models[m] entry "urll" is not a valid entry key. Did you mean "url"?`
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
+	}
+}
+
+// TestParseConfigContent_ModelsEntryKeyExactR3Message pins the models[] walk:
+// an unknown key inside an entry is a positioned did-you-mean error naming
+// the entry — the same strictness as the top-level unknown-key walk, which
+// encoding/json alone cannot position. "urll" is a realistic typo of the
+// known entry key "url".
+func TestParseConfigContent_ModelsEntryKeyExactR3Message(t *testing.T) {
+	content := `{
+  "models": [
+    {
+      "id": "local",
+      "urll": "http://localhost:8080",
+      "key": "",
+      "model": "qwen3.6-35b-a3b"
+    }
+  ]
+}`
+	cfg, err := parseConfigContent("/Users/u/config.json", []byte(content))
+	if err == nil {
+		t.Fatalf("parseConfigContent() = %#v, want an unknown models-entry-key error", cfg)
+	}
+	if cfg != nil {
+		t.Fatal("parseConfigContent() returned a config alongside the models-entry-key error")
+	}
+	want := `error in /Users/u/config.json at line ` + strconv.Itoa(lineOf(content, `"urll"`)) +
+		`, column ` + strconv.Itoa(runeColumn(content, `"urll"`)) +
+		`: models[local] entry "urll" is not a valid entry key. Did you mean "url"?`
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
+	}
+	var parseErr *ConfigParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("error = %T, want *ConfigParseError", err)
+	}
+}
+
+// TestParseConfigContent_ModelsEntryKeySuggestsAutocompactKey pins the
+// underscore typo of the newly added per-model key: the models[] walk knows
+// "jev-autocompact-percent" (and only that spelling), so a hand-edited
+// "jev-autocompact_percent" inside an entry suggests the kebab-case key.
+func TestParseConfigContent_ModelsEntryKeySuggestsAutocompactKey(t *testing.T) {
+	content := `{
+  "models": [
+    {
+      "id": "frontier",
+      "url": "https://api.deepseek.com",
+      "key": "sk-x",
+      "model": "deepseek-flash",
+      "jev-autocompact_percent": 55
+    }
+  ]
+}`
+	_, err := parseConfigContent("/x/config.json", []byte(content))
+	if err == nil {
+		t.Fatal("expected an unknown models-entry-key error")
+	}
+	want := `error in /x/config.json at line ` + strconv.Itoa(lineOf(content, `"jev-autocompact_percent"`)) +
+		`, column ` + strconv.Itoa(runeColumn(content, `"jev-autocompact_percent"`)) +
+		`: models[frontier] entry "jev-autocompact_percent" is not a valid entry key. Did you mean "jev-autocompact-percent"?`
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
+	}
+}
+
+// TestParseConfigContent_ModelsEntryKeyNoSuggestionListsValidKeys pins the
+// no-reasonable-suggestion branch of the models[] walk: the full sorted
+// valid-entry-keys list, still positioned at the offending key and naming
+// the entry.
+func TestParseConfigContent_ModelsEntryKeyNoSuggestionListsValidKeys(t *testing.T) {
+	content := `{"models": [{"id": "prov", "zzzzzzz": 1}]}`
+	_, err := parseConfigContent("/x/config.json", []byte(content))
+	if err == nil {
+		t.Fatal("expected an unknown models-entry-key error")
+	}
+	want := `error in /x/config.json at line ` + strconv.Itoa(lineOf(content, `"zzzzzzz"`)) +
+		`, column ` + strconv.Itoa(runeColumn(content, `"zzzzzzz"`)) +
+		`: models[prov] entry "zzzzzzz" is not a valid entry key. Valid entry keys are: id, jev-autocompact-percent, key, model, url`
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
+	}
+}
+
+// TestParseConfigContent_ModelsEntryKeysAccepted pins the happy path of the
+// models[] walk: every known entry key — including the per-model
+// jev-autocompact-percent override — parses in every entry, and the values
+// survive the decode. (Out-of-range VALUES keep the warning path; strictness
+// here covers key names only.)
+func TestParseConfigContent_ModelsEntryKeysAccepted(t *testing.T) {
+	content := `{
+  "models": [
+    {"id": "a", "url": "http://a:8080", "key": "ka", "model": "ma", "jev-autocompact-percent": 55},
+    {"id": "b", "url": "http://b:8080", "key": "", "model": "mb"}
+  ]
+}`
+	cfg, err := parseConfigContent("/x/config.json", []byte(content))
+	if err != nil {
+		t.Fatalf("parseConfigContent() error = %v", err)
+	}
+	if len(cfg.Models) != 2 {
+		t.Fatalf("models = %#v, want 2 entries", cfg.Models)
+	}
+	if cfg.Models[0].JevAutocompactPercent != 55 {
+		t.Fatalf("per-model override did not survive: %#v", cfg.Models[0])
+	}
+	if got, ok := cfg.Models[0].AutocompactPercentOverride(); !ok || got != 55 {
+		t.Fatalf("AutocompactPercentOverride() = (%d, %v), want (55, true)", got, ok)
+	}
+	if _, ok := cfg.Models[1].AutocompactPercentOverride(); ok {
+		t.Fatal("an entry without the key must not report an override")
 	}
 }
 

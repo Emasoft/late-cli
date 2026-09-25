@@ -1696,6 +1696,139 @@ func TestConfig_AutocompactJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestModelSetting_AutocompactPercentOverride pins the per-model override
+// accessor: 1-100 is the override, 0/unset (and anything out of range) means
+// "no override — use the global".
+func TestModelSetting_AutocompactPercentOverride(t *testing.T) {
+	cases := []struct {
+		name      string
+		setting   ModelSetting
+		wantValue int
+		wantOK    bool
+	}{
+		{name: "unset is not an override", setting: ModelSetting{}, wantValue: 0, wantOK: false},
+		{name: "one is the smallest override", setting: ModelSetting{JevAutocompactPercent: 1}, wantValue: 1, wantOK: true},
+		{name: "fifty-five honored", setting: ModelSetting{JevAutocompactPercent: 55}, wantValue: 55, wantOK: true},
+		{name: "hundred is the largest override", setting: ModelSetting{JevAutocompactPercent: 100}, wantValue: 100, wantOK: true},
+		{name: "negative is ignored", setting: ModelSetting{JevAutocompactPercent: -5}, wantValue: 0, wantOK: false},
+		{name: "over hundred is ignored", setting: ModelSetting{JevAutocompactPercent: 250}, wantValue: 0, wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.setting.AutocompactPercentOverride()
+			if ok != tc.wantOK || got != tc.wantValue {
+				t.Fatalf("AutocompactPercentOverride() = (%d, %v), want (%d, %v)", got, ok, tc.wantValue, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestConfig_AutocompactPercentForAgent pins the resolution order for the
+// JEV auto-compaction trigger: the agent's model entry override (1-100) >
+// the global jev-autocompact-percent > nothing else (the caller passes the
+// already-normalized global). The lookup is Config.GetModelForAgent, so
+// agent_models routing (stable id or legacy model name) decides which entry
+// applies.
+func TestConfig_AutocompactPercentForAgent(t *testing.T) {
+	cfg := &Config{
+		JevAutocompactPercent: 99, // the global threshold
+		Models: []ModelSetting{
+			{ID: "small-ctx", URL: "http://a:8080", Key: "k", Model: "model-a", JevAutocompactPercent: 55},
+			{ID: "huge-ctx", URL: "http://b:8080", Key: "k", Model: "model-b", JevAutocompactPercent: 100},
+			{ID: "no-override", URL: "http://c:8080", Key: "k", Model: "model-c"},
+			{ID: "bad-override", URL: "http://d:8080", Key: "k", Model: "model-d", JevAutocompactPercent: 400},
+		},
+		AgentModels: map[string]string{
+			"orchestrator": "no-override",
+			"researcher":   "small-ctx",
+			"coder":        "huge-ctx",
+			"reviewer":     "bad-override",
+			"legacy":       "model-a", // legacy name-based routing still resolves
+		},
+	}
+
+	cases := []struct {
+		agentType string
+		want      int
+	}{
+		{"researcher", 55},   // valid per-model override wins
+		{"coder", 100},       // boundary values are honored too
+		{"orchestrator", 99}, // no override: the global applies
+		{"reviewer", 99},     // out-of-range override is ignored: the global applies
+		{"legacy", 55},       // name-based agent_models routing resolves the entry
+		{"unrouted", 99},     // agent type with no agent_models entry: the global
+	}
+	for _, tc := range cases {
+		t.Run(tc.agentType, func(t *testing.T) {
+			if got := cfg.AutocompactPercentForAgent(tc.agentType, 99); got != tc.want {
+				t.Fatalf("AutocompactPercentForAgent(%q, 99) = %d, want %d", tc.agentType, got, tc.want)
+			}
+		})
+	}
+
+	// A different global flows through whenever no override applies.
+	if got := cfg.AutocompactPercentForAgent("researcher", 70); got != 55 {
+		t.Fatalf("override must win over a non-default global: got %d, want 55", got)
+	}
+	if got := cfg.AutocompactPercentForAgent("orchestrator", 70); got != 70 {
+		t.Fatalf("no override must pass the global through: got %d, want 70", got)
+	}
+}
+
+// TestConfig_AutocompactPercentForAgentNilSafe pins the nil-receiver and
+// degenerate-input guards: a nil config, a config without the models
+// sections, and an empty agent type all fall back to the global.
+func TestConfig_AutocompactPercentForAgentNilSafe(t *testing.T) {
+	if got := (*Config)(nil).AutocompactPercentForAgent("orchestrator", 99); got != 99 {
+		t.Fatalf("nil config = %d, want the global 99", got)
+	}
+	if got := (&Config{}).AutocompactPercentForAgent("orchestrator", 99); got != 99 {
+		t.Fatalf("empty config = %d, want the global 99", got)
+	}
+	cfg := &Config{Models: []ModelSetting{{ID: "m", JevAutocompactPercent: 55}}}
+	if got := cfg.AutocompactPercentForAgent("orchestrator", 99); got != 99 {
+		t.Fatalf("no agent_models routing = %d, want the global 99", got)
+	}
+	if got := cfg.AutocompactPercentForAgent("", 99); got != 99 {
+		t.Fatalf("empty agent type = %d, want the global 99", got)
+	}
+}
+
+// TestConfig_AutocompactWarnings pins the startup warning path for
+// out-of-range per-model jev-autocompact-percent values: one warning per bad
+// entry, naming the model (id, else model name) and the value, and saying
+// the global applies. Valid and unset values never warn.
+func TestConfig_AutocompactWarnings(t *testing.T) {
+	cfg := &Config{
+		Models: []ModelSetting{
+			{ID: "good", Model: "model-good", JevAutocompactPercent: 55},
+			{ID: "too-low", Model: "model-low", JevAutocompactPercent: -3},
+			{Model: "no-id-bad", JevAutocompactPercent: 101},
+			{ID: "unset", Model: "model-unset"},
+		},
+	}
+	warnings := cfg.AutocompactWarnings()
+	if len(warnings) != 2 {
+		t.Fatalf("AutocompactWarnings() = %#v, want exactly 2 warnings", warnings)
+	}
+	first := warnings[0]
+	for _, substring := range []string{"too-low", "-3", "global"} {
+		if !strings.Contains(first, substring) {
+			t.Fatalf("warning %q does not mention %q", first, substring)
+		}
+	}
+	if !strings.Contains(warnings[1], "no-id-bad") || !strings.Contains(warnings[1], "101") {
+		t.Fatalf("second warning %q must name the model (no id set) and the bad value 101", warnings[1])
+	}
+
+	if got := (&Config{}).AutocompactWarnings(); got != nil {
+		t.Fatalf("config without models = %#v, want nil", got)
+	}
+	if got := (*Config)(nil).AutocompactWarnings(); got != nil {
+		t.Fatalf("nil config = %#v, want nil", got)
+	}
+}
+
 // The degradation guard is covered by TestLoadConfig_StrictErrorsAbort
 // (every content error is fatal with a nil config) and
 // TestSaveConfig_RefusesDegradedConfig (the Degraded defense-in-depth

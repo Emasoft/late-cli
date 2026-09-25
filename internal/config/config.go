@@ -69,6 +69,16 @@ type ModelSetting struct {
 	URL   string `json:"url"`
 	Key   string `json:"key"`
 	Model string `json:"model"`
+
+	// JevAutocompactPercent is the per-model override of the global
+	// autocompact trigger: different models have different context sizes, so
+	// the same "compact at N% of the window" level is not right for every
+	// model. It reuses the top-level jev-autocompact-percent key name inside
+	// the entry. 0/unset = use the global; values 1-100 are honored and win
+	// over the global for every agent whose agent_models entry routes to
+	// this model (see Config.AutocompactPercentForAgent); out-of-range
+	// values warn at startup and are ignored (see Config.AutocompactWarnings).
+	JevAutocompactPercent int `json:"jev-autocompact-percent,omitempty"`
 }
 
 // Reference returns the stable value stored in agent_models. Model is retained
@@ -78,6 +88,18 @@ func (m ModelSetting) Reference() string {
 		return m.ID
 	}
 	return m.Model
+}
+
+// AutocompactPercentOverride reports the entry's per-model autocompact
+// trigger override. The second return is true only for a valid percentage
+// (1-100): 0/unset means "no override — use the global", and an out-of-range
+// value is ignored with a startup warning (Config.AutocompactWarnings), so
+// both resolve to the global threshold.
+func (m ModelSetting) AutocompactPercentOverride() (int, bool) {
+	if m.JevAutocompactPercent >= 1 && m.JevAutocompactPercent <= 100 {
+		return m.JevAutocompactPercent, true
+	}
+	return 0, false
 }
 
 const (
@@ -1302,6 +1324,57 @@ func (cfg *Config) GetModelForAgent(agentType string) (ModelSetting, bool) {
 		}
 	}
 	return ModelSetting{}, false
+}
+
+// AutocompactWarnings returns one warning per models[] entry whose
+// jev-autocompact-percent value parses (otherwise the strict parse aborts)
+// but is outside the valid 1-100 range. The global threshold applies for that
+// model until the entry is fixed, exactly like an out-of-range global
+// jev-autocompact-percent warns and falls back to the default. The warnings
+// name the model entry (its id, or its model name when no id is set) and the
+// bad value so the user can locate the offending line. A nil config has no
+// entries and returns nil.
+func (cfg *Config) AutocompactWarnings() []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	for _, m := range cfg.Models {
+		v := m.JevAutocompactPercent
+		if v == 0 || (v >= 1 && v <= 100) {
+			continue
+		}
+		name := m.ID
+		if name == "" {
+			name = m.Model
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"ignoring invalid config.json models[%s] jev-autocompact-percent %d; using the global jev-autocompact-percent for this model",
+			name, v))
+	}
+	return warnings
+}
+
+// AutocompactPercentForAgent resolves the effective JEV auto-compaction
+// trigger percentage for one agent type. Resolution order: the
+// agent_models-routed model entry's per-model override (when valid, 1-100) >
+// the global jev-autocompact-percent (already validated and normalized by
+// ResolveAutocompact) > DefaultJevAutocompactPercent, which the caller passes
+// as the global. A nil config or an agent type with no model entry just uses
+// the global. The percent keys off the agent's own model because that is
+// whose context window fills.
+func (cfg *Config) AutocompactPercentForAgent(agentType string, global int) int {
+	if cfg == nil || agentType == "" {
+		return global
+	}
+	setting, ok := cfg.GetModelForAgent(agentType)
+	if !ok {
+		return global
+	}
+	if override, ok := setting.AutocompactPercentOverride(); ok {
+		return override
+	}
+	return global
 }
 
 // SaveConfig atomically writes the configuration back to config.json.
