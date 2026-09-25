@@ -339,6 +339,17 @@ func TestResolveDurationSettings(t *testing.T) {
 					want:        2 * time.Minute,
 				},
 				{
+					// A flag passed explicitly at its own default value (e.g.
+					// -bash-timeout 10m) must still beat the config entry:
+					// flag.Visit reports it, so the resolver never reaches the
+					// config layer.
+					name:        "flag explicit at its default value wins over config",
+					raw:         "1h",
+					cliExplicit: true,
+					cliValue:    r.def,
+					want:        r.def,
+				},
+				{
 					name: "config parses to the configured duration",
 					raw:  "45m",
 					want: 45 * time.Minute,
@@ -407,6 +418,15 @@ func TestResolveSubagentMaxTurns(t *testing.T) {
 			cliExplicit: true,
 			cliValue:    7,
 			want:        7,
+		},
+		{
+			// Explicitly passing -subagent-max-turns 500 (the flag's own
+			// default) still wins over a config entry.
+			name:        "flag explicit at its default value wins over config",
+			cfg:         &Config{SubagentMaxTurns: intPtr(42)},
+			cliExplicit: true,
+			cliValue:    DefaultSubagentMaxTurns,
+			want:        DefaultSubagentMaxTurns,
 		},
 		{
 			name:        "explicit zero flag wins over config (unlimited)",
@@ -481,6 +501,17 @@ func TestResolveMaxStreamRetries(t *testing.T) {
 			want:        5,
 		},
 		{
+			// The env layer is consulted only when the flag was NOT passed:
+			// an explicit flag at its own default value (which the env set as
+			// the flag default) still wins over both env and config.
+			name:        "flag explicit at its default value wins over env and config",
+			cfg:         &Config{MaxStreamRetries: intPtr(9)},
+			cliExplicit: true,
+			cliValue:    envBudget,
+			envSet:      true,
+			want:        envBudget,
+		},
+		{
 			name:   "env wins over config",
 			cfg:    &Config{MaxStreamRetries: intPtr(9)},
 			envSet: true,
@@ -547,6 +578,15 @@ func TestResolveMaxConcurrentLLMRequests(t *testing.T) {
 			cliExplicit: true,
 			cliValue:    8,
 			want:        8,
+		},
+		{
+			// Explicitly passing -max-concurrent-llm-requests 6 (the flag's
+			// own default) still wins over a config entry.
+			name:        "flag explicit at its default value wins over config",
+			cfg:         &Config{MaxConcurrentLLMRequests: intPtr(2)},
+			cliExplicit: true,
+			cliValue:    DefaultMaxConcurrentLLMRequests,
+			want:        DefaultMaxConcurrentLLMRequests,
 		},
 		{
 			name: "config set is honored",

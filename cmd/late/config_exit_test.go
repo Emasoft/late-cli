@@ -198,4 +198,43 @@ func TestFlagOrder_EarlyFlagsWorkWithBrokenConfig(t *testing.T) {
 			t.Fatalf("stderr = %q, want the exact config path", stderr)
 		}
 	})
+
+	// -replay-shadow deliberately runs BEFORE LoadConfig (documented in
+	// main.go: a read-only diagnostic must not take LoadConfig's side
+	// effects, so it never reads config.json). A broken config therefore
+	// cannot block the replay: it must print its report (in the harness's
+	// fresh HOME there is no shadow log, so the nothing-scored note) and
+	// exit 0 without any config error on stderr.
+	t.Run("-replay-shadow ignores a broken config", func(t *testing.T) {
+		stdout, stderr, code := runMain(t, []string{"-replay-shadow=0.10,0.35"})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stdout: %q, stderr: %q)", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "No shadow log at") {
+			t.Fatalf("stdout = %q, want the nothing-scored note", stdout)
+		}
+		if strings.Contains(stderr, "not a valid config.json entry") {
+			t.Fatalf("stderr = %q, want no config error on the replay path", stderr)
+		}
+	})
+
+	// -check-compaction resolves the config like a normal run (the check
+	// must vet exactly the backend the session would use), so a broken
+	// config exits 1 with the rendered error BEFORE the preflight starts —
+	// the same strict-config exit as a plain startup, never a misleading
+	// "no backend" report caused by the config being unreadable.
+	t.Run("-check-compaction exits 1 on a broken config before the preflight", func(t *testing.T) {
+		stdout, stderr, code := runMain(t, []string{"-check-compaction"})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr)
+		}
+		if !strings.Contains(stderr, `"compaction_mode" is not a valid config.json entry`) {
+			t.Fatalf("stderr = %q, want the rendered config error", stderr)
+		}
+		// The preflight's own report must never print: the process exited
+		// before runCompactionCheck could run.
+		if strings.TrimSpace(stdout) != "" {
+			t.Fatalf("stdout = %q, want no preflight report", stdout)
+		}
+	})
 }

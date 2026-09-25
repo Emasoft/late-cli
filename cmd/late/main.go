@@ -1054,7 +1054,15 @@ func main() {
 			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog)
 		// The TUI's one-shot 413 payload-recovery compaction only fires when
 		// compaction can actually shrink history: mode "enabled" (after the
-		// shadow fallback above), not shadow report-only runs.
+		// shadow fallback above, which downgrades to shadow when the
+		// backend is unavailable — compactionMode is re-read here, so the
+		// fallback is honored), not shadow report-only runs.
+		//
+		// Ordering invariant: this assignment runs before tea.NewProgram
+		// below, and the TUI can only observe a 413 after a run starts —
+		// which requires a submitted message through the live program. So
+		// no event can trigger the recovery before the flag is set: the
+		// startup race is closed by construction, not by synchronization.
 		model.CompactionApplies = compactionMode == appconfig.CompactionModeEnabled
 	}
 
@@ -1067,12 +1075,24 @@ func main() {
 	// feature for the session.
 	var retrievalWarnOnce sync.Once
 	var retrievalHookFor func(s *session.Session) func(context.Context)
+	// diagSink reads the mid-session diagnostics sink at hook-run time: diag
+	// (below, after the TUI program exists) assigns it, so closures created
+	// here — before the program starts — route their warnings through the
+	// live TUI instead of raw stderr. The write happens before p.Run() and
+	// before any agent run can start (runs begin only when the TUI submits
+	// a message), so the assignment happens-before every read. nil (CLI
+	// flows, bootstrap) keeps the os.Stderr fallback.
+	var diagSink func(msg string)
 	if compactionRetrieval && compactionPipeline != nil {
 		retrievalHookFor = func(s *session.Session) func(context.Context) {
 			return func(ctx context.Context) {
 				if _, err := s.InjectRetrieved(ctx, compactionPipeline, compactionStore,
 					compaction.DefaultRetrieveK, compaction.DefaultRetrieveBudgetTokens, compaction.DefaultRetrieveThreshold); err != nil {
 					retrievalWarnOnce.Do(func() {
+						if diagSink != nil {
+							diagSink(fmt.Sprintf("Warning: compaction retrieval skipped (%v); later turns retry\n", err))
+							return
+						}
 						fmt.Fprintf(os.Stderr, "Warning: compaction retrieval skipped (%v); later turns retry\n", err)
 					})
 				}
@@ -1171,6 +1191,15 @@ func main() {
 	diag := func(msg string) {
 		common.LogError("diagnostic", strings.TrimRight(msg, "\n"))
 		p.Send(tui.DiagnosticMsg{Text: strings.TrimRight(msg, "\n")})
+	}
+	// Publish the sink to closures created before the program existed (see
+	// diagSink above), and give the compaction pipeline's one-time
+	// auth-poison warning the same route: it can fire mid-session (first
+	// scoring call after a key is revoked) and must not paint raw stderr
+	// over the alt-screen either.
+	diagSink = diag
+	if compactionPipeline != nil {
+		compactionPipeline.SetWarningSink(diag)
 	}
 
 	// toolSync serializes plugin/MCP tool-registry refreshes triggered by

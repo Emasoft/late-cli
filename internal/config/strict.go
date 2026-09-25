@@ -94,6 +94,14 @@ func lineCol(content []byte, offset int) (line, col int) {
 // (R3), and post-decode enum validation (R3). Any problem returns a
 // *ConfigParseError and no config.
 func parseConfigContent(path string, content []byte) (*Config, error) {
+	// A leading UTF-8 byte-order mark carries no information but is common
+	// in files saved by Windows editors (Notepad "UTF-8 with BOM", PowerShell
+	// Out-File). encoding/json rejects it with a cryptic "invalid character
+	// ï" error on a character the user cannot even see, so strip it before
+	// parsing; every reported offset below is then relative to the stripped
+	// content, which is what an editor shows.
+	content = bytes.TrimPrefix(content, []byte("\xef\xbb\xbf"))
+
 	if err := checkJSONSyntax(content); err != nil {
 		return nil, wrapSyntaxError(path, content, err)
 	}
@@ -132,31 +140,101 @@ func parseConfigContent(path string, content []byte) (*Config, error) {
 // including trailing garbage after the top-level value and an empty file —
 // surfaces before any semantic checks. R2: the returned json.SyntaxError
 // carries the byte offset of the exact offending character.
+//
+// encoding/json's Token() stream also happily consumes CONCATENATED
+// top-level values (NDJSON-style), which json.Unmarshal-based passes reject.
+// Left alone, a second document appended after the config object would be
+// silently ignored by the typed decode, which reads only the first value —
+// the config would load with part of its entries dropped. So this pass pins
+// down where the first top-level value ends (delim depth) and rejects every
+// non-whitespace byte after a top-level OBJECT as trailing data. After a
+// non-object root the remaining bytes are left alone: the walk's
+// "must contain a JSON object, found X" error names the real problem.
 func checkJSONSyntax(content []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(content))
 	sawToken := false
+	depth := 0
 	for {
-		if _, err := dec.Token(); err != nil {
+		tok, err := dec.Token()
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				if !sawToken {
 					return errors.New("unexpected end of JSON input")
+				}
+				if depth > 0 {
+					// Truncated before the top-level value closed.
+					return io.ErrUnexpectedEOF
 				}
 				return nil
 			}
 			return err
 		}
 		sawToken = true
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{', '[':
+				depth++
+				continue
+			case ',', ':':
+				continue
+			case '}', ']':
+				depth--
+				if depth > 0 {
+					// A nested container closed; the first top-level value
+					// is still open.
+					continue
+				}
+			}
+		default:
+			if depth > 0 {
+				// A scalar inside the first top-level value.
+				continue
+			}
+		}
+		// depth == 0 here: tok closed the first top-level value, or tok is a
+		// top-level scalar. Only after an OBJECT (the only valid config root)
+		// is the rest of the document checked for trailing data.
+		if d, ok := tok.(json.Delim); ok && d == '}' {
+			for i := int(dec.InputOffset()); i < len(content); i++ {
+				switch content[i] {
+				case ' ', '\t', '\n', '\r':
+				default:
+					return &trailingDataError{offset: i}
+				}
+			}
+		}
+		return nil
 	}
+}
+
+// trailingDataError marks non-whitespace content found after the top-level
+// object. wrapSyntaxError renders it as a positioned ConfigParseError.
+type trailingDataError struct {
+	offset int
+}
+
+func (e *trailingDataError) Error() string {
+	return "unexpected trailing data after the top-level object"
 }
 
 // wrapSyntaxError converts a syntax-check failure into a positioned
 // ConfigParseError.
 func wrapSyntaxError(path string, content []byte, err error) error {
+	var tde *trailingDataError
+	if errors.As(err, &tde) {
+		return newConfigParseError(path, content, tde.offset,
+			"unexpected trailing data after the top-level object; remove everything after the final '}'")
+	}
+	var parseErr *ConfigParseError
+	if errors.As(err, &parseErr) {
+		return parseErr
+	}
 	var synErr *json.SyntaxError
 	if errors.As(err, &synErr) {
 		return newConfigParseError(path, content, int(synErr.Offset), "%s", synErr.Error())
 	}
-	if errors.Is(err, io.ErrUnexpectedEOF) {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 		// Truncated input: the most useful position is the end of the file.
 		return newConfigParseError(path, content, len(content), "unexpected end of JSON input")
 	}
