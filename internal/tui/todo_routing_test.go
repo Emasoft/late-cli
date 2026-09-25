@@ -221,3 +221,47 @@ func TestTodoPaneClickInsideGainsFocus(t *testing.T) {
 		t.Fatal("left click inside the todo pane must focus it")
 	}
 }
+
+// TestKeyReleaseNeverScrollsOrUnfocusesTodoPane pins the release-event fix:
+// tea.KeyReleaseMsg implements tea.KeyMsg, so on terminals that report
+// release events (kitty keyboard protocol) a release of "j" used to match the
+// pane's nav switch a second time — double-scrolling — and a release of
+// other keys could still reach downstream handlers. Releases must be inert.
+func TestKeyReleaseNeverScrollsOrUnfocusesTodoPane(t *testing.T) {
+	m := newTodoKeyRoutingModel(t, 30)
+	m.TodoPaneFocused = true
+	m.TodoScrollOffset = 10
+
+	updated, _ := m.Update(tea.KeyReleaseMsg(tea.Key{Code: rune('j'), Text: "j"}))
+	next := updated.(Model)
+
+	if !next.TodoPaneFocused {
+		t.Fatal("a key release must never unfocus the pane")
+	}
+	if next.TodoScrollOffset != 10 {
+		t.Fatalf("todo offset = %d after a key release, want unchanged 10 (no double scroll)", next.TodoScrollOffset)
+	}
+	if got := next.Input.Value(); got != "" {
+		t.Fatalf("input = %q after a key release, want nothing typed", got)
+	}
+}
+
+// TestTodoPaneFocusReleasesOnMultiRunePrintableKey covers dead-key /
+// combining-sequence input: some keyboards deliver "e"+U+0301 as ONE event
+// whose Key.Text holds multiple runes. That is typing — the pane must release
+// focus so the text lands in the chat input, exactly like a single-rune key.
+func TestTodoPaneFocusReleasesOnMultiRunePrintableKey(t *testing.T) {
+	m := newTodoKeyRoutingModel(t, 30)
+	m.TodoPaneFocused = true
+	m.TodoScrollOffset = 10
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: 'e', Text: "é"}))
+	next := updated.(Model)
+
+	if next.TodoPaneFocused {
+		t.Fatal("a multi-rune printable key (composed é) must release the pane focus")
+	}
+	if next.TodoScrollOffset != 10 {
+		t.Fatalf("todo offset = %d, want unchanged 10", next.TodoScrollOffset)
+	}
+}

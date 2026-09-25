@@ -262,11 +262,16 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			// character both unfocuses and types. bubbletea v2 populates
 			// Key.Text only for printable characters (the exact bytes the
 			// textarea inserts), so esc/ctrl/alt/pgup-style keystrokes never
-			// match here and keep the pane focused.
+			// match here and keep the pane focused. Combining/dead-key
+			// sequences deliver multi-rune Text ("e"+U+0301 in one event) —
+			// any printable rune in it is typing, so release on the first.
 			if press, ok := keyMsg.(tea.KeyPressMsg); ok &&
 				press.Mod&(tea.ModCtrl|tea.ModAlt|tea.ModMeta|tea.ModHyper|tea.ModSuper) == 0 {
-				if runes := []rune(press.Text); len(runes) == 1 && !unicode.IsControl(runes[0]) {
-					m.TodoPaneFocused = false
+				for _, r := range []rune(press.Text) {
+					if !unicode.IsControl(r) {
+						m.TodoPaneFocused = false
+						break
+					}
 				}
 			}
 		}
