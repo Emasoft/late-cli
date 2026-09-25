@@ -858,9 +858,13 @@ func formatUptime(d time.Duration) string {
 // /infobar and persisted as config show-info-bar. It reuses the status bar
 // base style family and renders the following " · "-separated segments:
 //
-//	late <version> · <project folder> · <provider/profile ref · model> ·
-//	ctx <context bar> · subagents: N running · skills: N (~T tok) ·
-//	~N tokens to threshold · up <elapsed>
+//	late <version>[ · b<build number>][ · <commit>] · <project folder> ·
+//	<provider/profile ref · model> · ctx <context bar> · subagents: N running ·
+//	skills: N (~T tok) · ~N tokens to threshold · up <elapsed>
+//
+// The version segment uses the short build identity (version, then the
+// build number as "b<N>", then the short commit — no build date); each
+// unknown piece degrades silently to just the version.
 //
 // Data sources and approximations:
 //   - "used" tokens: the focused agent's AppState.CumulativeTokenCount — the
@@ -885,7 +889,7 @@ func (m *Model) infoBarView() string {
 
 	var parts []string
 	parts = append(parts,
-		brandStyle.Render("late ")+valueStyle.Render("v"+common.Version),
+		brandStyle.Render("late ")+valueStyle.Render("v"+common.VersionDisplayShort()),
 	)
 	if m.CWD != "" {
 		parts = append(parts, valueStyle.Render(filepath.Base(m.CWD)))

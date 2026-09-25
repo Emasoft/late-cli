@@ -488,7 +488,25 @@ build_repo() {
       fi
     fi
   else
-    if ! (cd "$REPO" && go build -o bin/late ./cmd/late); then
+    # No make available: replicate the Makefile's build stamping directly —
+    # same version default (read from the Makefile), build number (commit
+    # count), short commit, and UTC build date. Missing git degrades the
+    # commit and build number to "unknown" (never fails).
+    local version commit build_number build_date ldflags
+    version="${LATE_DEV_VERSION:-}"
+    if [ -z "$version" ] && [ -f "$REPO/Makefile" ]; then
+      version="$(sed -n 's/^VERSION?=[[:space:]]*//p' "$REPO/Makefile" | head -n 1 || true)"
+    fi
+    commit="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || true)"
+    if [ -z "$commit" ]; then commit="unknown"; fi
+    build_number="$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || true)"
+    if [ -z "$build_number" ]; then build_number="unknown"; fi
+    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ldflags="-X late/internal/common.BuildNumber=${build_number} -X late/internal/common.Commit=${commit} -X late/internal/common.BuildDate=${build_date}"
+    if [ -n "$version" ]; then
+      ldflags="-X late/internal/common.Version=${version} ${ldflags}"
+    fi
+    if ! (cd "$REPO" && go build -ldflags "$ldflags" -o bin/late ./cmd/late); then
       die "go build failed"
     fi
   fi
@@ -791,7 +809,7 @@ opt_pinned() {
 }
 
 opt_tarball() {
-  local slug="$1" label="$2" note="$3" url root d
+  local slug="$1" label="$2" note="$3" url root d build_date build_number
   require_go
   echo ""
   info "Source: ${label} — build ${slug}@main, install as copy"
@@ -831,10 +849,17 @@ opt_tarball() {
     die "tarball from ${slug} contains no cmd/late — refusing to install"
   fi
   info "Building ${slug}@main in $(basename "$root") (GOOS=${GOOS} GOARCH=${GOARCH})"
+  build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Tarballs carry no .git: the build number and commit stamp as "unknown"
+  # (the source defaults) while the UTC build date is still stamped like
+  # `make build` does.
+  build_number="unknown"
   if ! (
     cd "$root" || exit 1
-    # Tarballs carry no .git (no VCS stamping needed). If go.sum is absent
-    # (it is normally tracked), let go resolve checksums into the temp copy.
+    # Tarballs carry no .git, so the commit keeps its "unknown" default;
+    # the UTC build date is still stamped like `make build` does. If
+    # go.sum is absent (it is normally tracked), let go resolve checksums
+    # into the temp copy.
     if [ -f go.mod ] && [ ! -f go.sum ]; then
       export GOFLAGS="-mod=mod"
     fi
@@ -843,9 +868,13 @@ opt_tarball() {
     # -trimpath strips the random mktemp dir from the binary so two builds
     # of the same commit are byte-identical (idempotent reinstalls).
     if [ "$GOOS" != "unknown" ] && [ "$GOARCH" != "unknown" ]; then
-      env GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "${LATE_TMP}/late" ./cmd/late
+      env GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath \
+        -ldflags "-X late/internal/common.BuildNumber=${build_number} -X late/internal/common.BuildDate=${build_date}" \
+        -o "${LATE_TMP}/late" ./cmd/late
     else
-      go build -trimpath -o "${LATE_TMP}/late" ./cmd/late
+      go build -trimpath \
+        -ldflags "-X late/internal/common.BuildNumber=${build_number} -X late/internal/common.BuildDate=${build_date}" \
+        -o "${LATE_TMP}/late" ./cmd/late
     fi
   ); then
     die "build of ${slug}@main failed — refusing to install"

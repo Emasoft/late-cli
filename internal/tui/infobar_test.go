@@ -177,7 +177,7 @@ func TestInfoBarRenderContents(t *testing.T) {
 
 	plain := ansi.Strip(m.infoBarView())
 
-	if !strings.Contains(plain, "late v"+common.Version) {
+	if !strings.Contains(plain, "late v"+common.VersionDisplayShort()) {
 		t.Errorf("expected version segment in %q", plain)
 	}
 	if !strings.Contains(plain, "myproject") {
@@ -239,8 +239,60 @@ func TestInfoBarSegmentsOmittedWhenUnknown(t *testing.T) {
 	if !strings.Contains(plain, "solo-model") {
 		t.Errorf("expected fallback orchestrator model name in %q", plain)
 	}
-	if !strings.Contains(plain, "late v"+common.Version) {
+	if !strings.Contains(plain, "late v"+common.VersionDisplayShort()) {
 		t.Errorf("expected version segment in %q", plain)
+	}
+}
+
+// TestInfoBarVersionSegmentShowsBuildAndCommit pins the short-form version
+// segment: version · b<build number> · <commit> when both are stamped (the
+// common package vars are settable, which is the build-tag-free injection
+// point), with silent per-piece degradation when a piece is unknown. The
+// build date never appears in the info bar.
+func TestInfoBarVersionSegmentShowsBuildAndCommit(t *testing.T) {
+	origVersion, origBuildNum, origCommit, origBuildDate := common.Version, common.BuildNumber, common.Commit, common.BuildDate
+	defer func() {
+		common.Version, common.BuildNumber, common.Commit, common.BuildDate = origVersion, origBuildNum, origCommit, origBuildDate
+	}()
+
+	common.Version = "2.0.0-rc.1"
+	common.BuildNumber = "1239"
+	common.Commit = "2fe0e83"
+	common.BuildDate = "2026-09-25T10:57:00+02:00"
+
+	m := NewModel(&mockOrchestrator{}, nil, &config.Config{})
+	m.ShowInfoBar = true
+	m.Width = 120
+	m.ModelName = "m"
+
+	plain := ansi.Strip(m.infoBarView())
+	// Pinned verbatim: the "v" prefix composes with the short identity —
+	// one "v", no doubled "·" separators.
+	if !strings.Contains(plain, "late v2.0.0-rc.1 · b1239 · 2fe0e83") {
+		t.Errorf("expected short-form version segment with build number and commit in %q", plain)
+	}
+	if strings.Contains(plain, "built") || strings.Contains(plain, "2026-09-25") {
+		t.Errorf("info bar must not show the build date: %q", plain)
+	}
+
+	// Unknown build number degrades silently to version + commit.
+	common.BuildNumber = "unknown"
+	plain = ansi.Strip(m.infoBarView())
+	if !strings.Contains(plain, "late v2.0.0-rc.1 · 2fe0e83") {
+		t.Errorf("expected version segment without the build number in %q", plain)
+	}
+	if strings.Contains(plain, "b1239") {
+		t.Errorf("unknown build number must not render: %q", plain)
+	}
+
+	// Unknown commit too degrades silently to the bare version segment.
+	common.Commit = "unknown"
+	plain = ansi.Strip(m.infoBarView())
+	if !strings.Contains(plain, "late v2.0.0-rc.1") {
+		t.Errorf("expected bare version segment when the commit is unknown: %q", plain)
+	}
+	if strings.Contains(plain, "· 2fe0e83") {
+		t.Errorf("unknown commit must not render: %q", plain)
 	}
 }
 
