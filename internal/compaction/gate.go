@@ -55,6 +55,15 @@ const TripwireMaxElideFraction = "max_elide_fraction"
 // TripwireAction is the shadow-log action recorded on a tripwire entry.
 const TripwireAction = "tripwire"
 
+// unelidableScore is the score ceiling that marks an item unelidable: the
+// protected origins' minimum effective score (protectedScore clamps their
+// items' scores up to it) and the scorer's fail-open keep score are both
+// exactly it. Scores live in [0, 1], so an item at the ceiling can never sit
+// strictly below an elide floor in [0, 1] — no gate setting can elide it.
+// AtomicDecisionScores extends that guarantee to cut paragraphs: a group
+// with one sibling at the ceiling is pinned to keep.
+const unelidableScore = 1.0
+
 // OriginSourceSkillTool is the Origin.Source of records relocated from
 // activate_skill tool results ("tool:activate_skill") — and the origin whose
 // tool results are protected from elision altogether: activate_skill's
@@ -69,10 +78,12 @@ const SkillToolName = "activate_skill"
 
 // protectedOrigins maps the Origin.Source values whose content must never be
 // elided to the minimum effective score their items may carry. The floor is
-// 1.0: a score clamped up to 1.0 can never sit strictly below any keep
-// threshold in (0, 1], so the item is unelidable at any gate setting.
+// unelidableScore (1.0): a score clamped up to it can never sit strictly
+// below any keep threshold in (0, 1], so the item is unelidable at any gate
+// setting — and AtomicDecisionScores pins a cut paragraph containing such a
+// sibling to keep as well.
 var protectedOrigins = map[string]float64{
-	OriginSourceSkillTool: 1.0,
+	OriginSourceSkillTool: unelidableScore,
 }
 
 // originScoreFloor returns the minimum effective score for items originating

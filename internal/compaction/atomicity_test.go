@@ -235,3 +235,104 @@ func truncateForTest(s string) string {
 	}
 	return s[:200] + "…"
 }
+
+// TestAtomicDecisionScores_ProtectedSiblingPinsGroupKeep pins the
+// protection-override rule: a sibling at the unelidable score ceiling (the
+// 1.0 score protectedScore clamps activate_skill results to, or the
+// fail-open keep score) pins its whole cut paragraph to keep — even when a
+// normal sibling scores far below its own floor. The naive min-floor reduce
+// would INVERT protection here: min(1.0-floor sibling, 0.35-floor sibling)
+// = 0.35, and the protected piece would elide along with its low-scoring
+// sibling. It also pins the recorded decision inputs, so the shadow
+// log's score-vs-floor replay reproduces the keep a mutating run makes.
+func TestAtomicDecisionScores_ProtectedSiblingPinsGroupKeep(t *testing.T) {
+	segs := []Segment{
+		{ID: "seg-1", Group: 1}, // protected sibling: score clamped to the ceiling
+		{ID: "seg-2", Group: 1}, // normal sibling scoring below its floor
+		{ID: "seg-3"},           // ungrouped control: decides alone
+	}
+	decide, decFloors := AtomicDecisionScores(segs,
+		[]float64{unelidableScore, 0.1, 0.1},
+		[]float64{0.35, 0.35, 0.35})
+	if decide == nil {
+		t.Fatal("AtomicDecisionScores() = nil, want decisions")
+	}
+	for i := 0; i < 2; i++ {
+		if decide[i] != unelidableScore {
+			t.Errorf("decide[%d] = %v, want the unelidable ceiling %v (the group is pinned to keep)", i, decide[i], unelidableScore)
+		}
+		if decFloors[i] != 0.35 {
+			t.Errorf("decFloors[%d] = %v, want the group-minimum floor 0.35", i, decFloors[i])
+		}
+	}
+	// The ungrouped control keeps its own inputs — and still elides.
+	if decide[2] != 0.1 || decFloors[2] != 0.35 {
+		t.Errorf("ungrouped control = (%v, %v), want (0.1, 0.35)", decide[2], decFloors[2])
+	}
+
+	elide := AtomicElideDecisions(segs,
+		[]float64{unelidableScore, 0.1, 0.1},
+		[]float64{0.35, 0.35, 0.35})
+	if elide[0] || elide[1] {
+		t.Error("a group holding an unelidable sibling must never elide")
+	}
+	if !elide[2] {
+		t.Error("the ungrouped low scorer must still elide")
+	}
+
+	// Replay consistency: the pinned decision inputs re-decide as keep.
+	if decide[0] < decFloors[0] {
+		t.Error("the recorded decision inputs must replay as keep (score >= floor)")
+	}
+
+	// The fail-open keep score (keepScore — also the ceiling) pins the
+	// group the same way: a piece the scorer could not answer keeps its
+	// whole paragraph instead of eliding with a low sibling.
+	elide = AtomicElideDecisions(segs,
+		[]float64{keepScore, 0.1, 0.9},
+		[]float64{0.35, 0.35, 0.35})
+	if elide[0] || elide[1] {
+		t.Error("a fail-open keep score must pin its group to keep")
+	}
+	if elide[2] {
+		t.Error("the ungrouped 0.9 control must stay kept")
+	}
+}
+
+// TestPipeline_CompactToolOutput_UnscoreablePieceKeepsParagraph is the
+// end-to-end shape of the unelidable pin: one piece of a cut oversized
+// paragraph comes back at the fail-open ceiling (the scorer refused it —
+// here, an explicit 1.0, the value ScoreBatch reports for unscoreable
+// items) while its siblings score low. The paragraph is ATOMIC and the
+// ceiling sibling is unelidable, so nothing is elided — the pre-pin
+// min-score reduce would have elided the whole paragraph, ceiling sibling
+// included.
+func TestPipeline_CompactToolOutput_UnscoreablePieceKeepsParagraph(t *testing.T) {
+	const threshold = 0.35
+	blob := oversizedJSONParagraph()
+	segs := SegmentSegments(blob, 0)
+	if len(segs) < 3 {
+		t.Fatalf("fixture sanity: %d segments, want ≥3", len(segs))
+	}
+
+	scores := map[string]float64{"seg-1": keepScore} // the ceiling sibling
+	for i := 2; i <= len(segs); i++ {
+		scores[fmt.Sprintf("seg-%d", i)] = 0.1 // low siblings
+	}
+	d := newDecisionsServer(t, fixedScoresHandler(scores))
+	store := NewStore()
+	p := NewPipeline(ResolvedBackend{Backend: Backend{Name: "test", URL: d.srv.URL, Model: "jev-latest"}, APIKey: "k"}, "k", nil, PipelineOptions{})
+	p.EnableRelocation(store, threshold)
+	applyTestGate(p, threshold, 1)
+
+	got, err := p.CompactToolOutput(context.Background(), "Bash", blob)
+	if err != nil {
+		t.Fatalf("CompactToolOutput() error = %v", err)
+	}
+	if len(got.Elided) != 0 || got.CompactText != blob {
+		t.Error("a paragraph holding a ceiling-score sibling must be kept byte-for-byte")
+	}
+	if store.Len() != 0 {
+		t.Error("nothing should have been stored")
+	}
+}
