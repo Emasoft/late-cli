@@ -1127,19 +1127,14 @@ func (m *Model) truncateWithEllipsis(s string, w int) string {
 	if w <= 3 {
 		return "..."
 	}
-
-	limit := w - 3
-	res := ""
-	currW := 0
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if currW+rw > limit {
-			break
-		}
-		res += string(r)
-		currW += rw
-	}
-	return res + "..."
+	// ansi.Truncate is escape-sequence aware: it measures the same visible
+	// width lipgloss.Width does, never cuts inside a CSI sequence (the old
+	// rune walker counted escape bytes as content and could split one),
+	// keeps any trailing style resets, and already accounts for the tail
+	// width, so the result stays <= w cells. Callers pass both plain and
+	// lipgloss-styled text (the status bar truncates rendered, styled
+	// status strings on narrow terminals).
+	return ansi.Truncate(s, w, "...")
 }
 
 func (m *Model) renderMarkdownBlock(content string, innerWidth int) string {
