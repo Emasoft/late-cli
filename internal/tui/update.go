@@ -1921,9 +1921,13 @@ const autocompactRearmPoints = 9
 // compaction pass when the focused agent's usage has crossed the configured
 // percentage (config jev-autocompact + jev-autocompact-percent, default 99)
 // of the context window — the same m.Focused.MaxTokens() source the info
-// bar's context bar uses. The run is guarded by Model.CompactionRunning and
-// fires once per crossing: the agent is disarmed until usage falls below
-// the re-arm level or a new session starts. Without a known context size
+// bar's context bar uses. The percent keys off the watched (focused) agent's
+// model, not the root's: that is whose context window fills, so a per-model
+// jev-autocompact-percent override inside its models[] entry (resolved by
+// Config.AutocompactPercentForAgent through agent_models) wins over the
+// global threshold. The run is guarded by Model.CompactionRunning and fires
+// once per crossing: the agent is disarmed until usage falls below the
+// re-arm level or a new session starts. Without a known context size
 // (MaxTokens() <= 0) there is no threshold to cross, so the trigger skips
 // silently.
 func (m *Model) maybeJevAutoCompact(s *AppState) tea.Cmd {
@@ -1936,7 +1940,13 @@ func (m *Model) maybeJevAutoCompact(s *AppState) tea.Cmd {
 		// threshold is undefined — skip silently.
 		return nil
 	}
+	// The global percent (validated at startup by ResolveAutocompact) is the
+	// fallback; the focused agent's model entry can override it. A nil
+	// AppConfig has no model registry, so only the global applies there.
 	percent := m.JevAutocompactPercent
+	if m.AppConfig != nil {
+		percent = m.AppConfig.AutocompactPercentForAgent(agentTypeForID(m.Focused.ID()), m.JevAutocompactPercent)
+	}
 	if percent <= 0 || percent > 100 {
 		percent = config.DefaultJevAutocompactPercent
 	}

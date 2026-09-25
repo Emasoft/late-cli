@@ -394,3 +394,109 @@ func TestNewModelPlumbsAutocompactConfig(t *testing.T) {
 			config.DefaultJevAutocompactPercent, m.JevAutocompact, m.JevAutocompactPercent)
 	}
 }
+
+// TestJevAutoCompactPerModelOverrideFiresAtOverride pins the per-model
+// override resolution in the trigger itself: a focused typed subagent whose
+// agent_models-routed model entry carries jev-autocompact-percent 55 fires
+// at 55% of the (mock 100-token) context, not at the global 99.
+func TestJevAutoCompactPerModelOverrideFiresAtOverride(t *testing.T) {
+	cfg := &config.Config{
+		JevAutocompact:        true,
+		JevAutocompactPercent: 99, // the global threshold
+		Models: []config.ModelSetting{
+			{ID: "small-ctx", URL: "http://a:8080", Key: "k", Model: "model-a", JevAutocompactPercent: 55},
+		},
+		AgentModels: map[string]string{"researcher": "small-ctx"},
+	}
+	m := NewModel(&mockOrchestrator{}, nil, cfg)
+	m.SetSize(80, 24)
+	m.Compactor = okRunner(session.CompactionReport{})
+	// Focus a typed subagent: agentTypeForID maps this id to "researcher".
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
+
+	// 54 of 100 tokens: below the 55% override — no fire.
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 54
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
+		t.Fatal("55% override must not fire at 54% usage")
+	}
+
+	// 55 of 100 tokens: exactly the override threshold — fire.
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 55
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd == nil {
+		t.Fatal("55% override must fire at exactly 55% usage")
+	}
+	if !m.CompactionRunning {
+		t.Fatal("firing must set CompactionRunning")
+	}
+}
+
+// TestJevAutoCompactPerModelOverrideRootAgent pins the same resolution for
+// the root agent: agentTypeForID("main") maps to "orchestrator", whose
+// agent_models entry carries the override.
+func TestJevAutoCompactPerModelOverrideRootAgent(t *testing.T) {
+	cfg := &config.Config{
+		JevAutocompact:        true,
+		JevAutocompactPercent: 99,
+		Models: []config.ModelSetting{
+			{ID: "big-ctx", URL: "http://a:8080", Key: "k", Model: "model-a", JevAutocompactPercent: 80},
+		},
+		AgentModels: map[string]string{"orchestrator": "big-ctx"},
+	}
+	m := NewModel(&mockOrchestrator{}, nil, cfg)
+	m.SetSize(80, 24)
+	m.Compactor = okRunner(session.CompactionReport{})
+	// Focus the root as the real TUI does (the root's ID maps to
+	// "orchestrator" through agentTypeForID).
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
+
+	// 70 of 100 tokens is below the 80% override but would already have
+	// fired under the 99% global.
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 70
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
+		t.Fatal("80% root override must not fire at 70% usage")
+	}
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 80
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd == nil {
+		t.Fatal("80% root override must fire at exactly 80% usage")
+	}
+}
+
+// TestJevAutoCompactFallsBackToGlobalWithoutOverride pins the fallback: when
+// the focused agent's model entry has no jev-autocompact-percent (or no
+// entry applies at all), the trigger uses the global percent — 99 here, so
+// 55% usage must not fire.
+func TestJevAutoCompactFallsBackToGlobalWithoutOverride(t *testing.T) {
+	cfg := &config.Config{
+		JevAutocompact:        true,
+		JevAutocompactPercent: 99,
+		Models: []config.ModelSetting{
+			{ID: "plain", URL: "http://a:8080", Key: "k", Model: "model-a"},
+		},
+		AgentModels: map[string]string{"researcher": "plain"},
+	}
+	m := NewModel(&mockOrchestrator{}, nil, cfg)
+	m.SetSize(80, 24)
+	m.Compactor = okRunner(session.CompactionReport{})
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 55
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
+		t.Fatal("without an override the global 99% must apply: no fire at 55%")
+	}
+
+	// A config with models but no agent_models routing falls back too.
+	cfgNoRouting := &config.Config{
+		JevAutocompact:        true,
+		JevAutocompactPercent: 99,
+		Models: []config.ModelSetting{
+			{ID: "overridden", URL: "http://a:8080", Key: "k", Model: "model-a", JevAutocompactPercent: 55},
+		},
+	}
+	m = NewModel(&mockOrchestrator{}, nil, cfgNoRouting)
+	m.SetSize(80, 24)
+	m.Compactor = okRunner(session.CompactionReport{})
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
+	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 55
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
+		t.Fatal("an unrouted model's override must never apply: no fire at 55%")
+	}
+}

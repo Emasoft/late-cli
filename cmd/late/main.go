@@ -416,6 +416,13 @@ func main() {
 	if _, _, autocompactWarning := appconfig.ResolveAutocompact(appConfig); autocompactWarning != "" {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", autocompactWarning)
 	}
+	// Per-model jev-autocompact-percent overrides use the same key inside
+	// each models[] entry; an out-of-range per-model value warns and falls
+	// back to the global threshold (it cannot fail the models[] key walk —
+	// that covers key names, not value ranges).
+	for _, modelWarning := range appConfig.AutocompactWarnings() {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", modelWarning)
+	}
 	enabledTools := make(map[string]bool)
 	if appConfig != nil {
 		for toolName, enabled := range appConfig.EnabledTools {

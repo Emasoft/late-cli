@@ -34,12 +34,16 @@ Late decodes `config.json` with `encoding/json`. What that means in practice:
   section where hand-edited typos hurt most.
 * **Unknown keys inside `models[]` entries are fatal and located** — every
   entry's keys are validated against the known set (`id`, `url`, `key`,
-  `model`), reporting an unknown key with its 1-based line and column, the
-  entry's name (its `id`, else its `model`), and a did-you-mean suggestion when
-  a known key is within edit distance 3:
+  `model`, `jev-autocompact-percent`), reporting an unknown key with its
+  1-based line and column, the entry's name (its `id`, else its `model`), and
+  a did-you-mean suggestion when a known key is within edit distance 3:
 
   ```
   error in /Users/u/Library/Application Support/late/config.json at line 6, column 7: models[local] entry "urll" is not a valid entry key. Did you mean "url"?
+  ```
+
+  ```
+  error in /Users/u/Library/Application Support/late/config.json at line 12, column 7: models[frontier] entry "jev-autocompact_percent" is not a valid entry key. Did you mean "jev-autocompact-percent"?
   ```
 
 * **Value-range problems only warn** — a value that parses but is out of range
@@ -73,7 +77,9 @@ The compaction block (score cutoff, context percentages, gate knobs, offline
 backend, auto-compaction, retrieval) plus the provider block. Note that
 `"compaction-backend": "offline"` selects the deterministic scripted scorer for
 demos and tests — no API key, no network — and must never become a production
-default.
+default. The `frontier` model entry also carries a per-model
+`jev-autocompact-percent` override: the agents routed to it auto-compact at
+70% of their window while every other agent uses the global 99%.
 
 ```json
 {
@@ -89,7 +95,8 @@ default.
       "id": "frontier",
       "url": "https://api.deepseek.com",
       "key": "sk-your-key",
-      "model": "deepseek-flash"
+      "model": "deepseek-flash",
+      "jev-autocompact-percent": 70
     },
     {
       "id": "local",
@@ -125,7 +132,7 @@ equivalent flag where one exists; Go's flag package accepts one or two dashes
 
 | Key | Type | Default | CLI flag | Description |
 | --- | --- | --- | --- | --- |
-| `models` | array | `[]` | — | Model registry for `/model` and `agent_models`; each entry is `{id, url, key, model}` (see below). |
+| `models` | array | `[]` | — | Model registry for `/model` and `agent_models`; each entry is `{id, url, key, model, jev-autocompact-percent}` (see below). |
 | `agent_models` | object | `{}` | — | Maps agent roles (`orchestrator`, `researcher`, `coder`, …) to a `models` entry `id` (or, legacy, its model name); persisted by `/model`. |
 | `openai_base_url` | string | `http://localhost:8080` | — | Base URL of the main OpenAI-compatible API; `OPENAI_BASE_URL` env overrides when set. |
 | `openai_api_key` | string | `""` | — | API key for the main provider; `OPENAI_API_KEY` env overrides when set. |
@@ -166,7 +173,7 @@ context-usage level that fires the auto-trigger.
 | `compaction-backend` | string | `""` | — | Where scores come from; only `"offline"` today (deterministic scripted scorer, demos/tests only); a set value wins over `JEV_API`/auto-detection; an invalid value warns and falls back to env resolution. |
 | `compaction-retrieval` | boolean | `false` | — | Read side of the record store: before every request the top-k relevant digest summaries are appended to the request's work area; inert (warns) unless `compaction-mode` is `enabled`. |
 | `jev-autocompact` | boolean | `false` | — | Run the full-history compaction (`/jev-compact-context` flow) automatically when context usage crosses `jev-autocompact-percent`. |
-| `jev-autocompact-percent` | number | `99` | — | Context-usage percentage that fires the auto-trigger; 1-100 valid, `0` = default, anything else warns and falls back. |
+| `jev-autocompact-percent` | number | `99` | — | Context-usage percentage that fires the auto-trigger; 1-100 valid, `0` = default, anything else warns and falls back. Each `models[]` entry can override it for the agents routed to that model (see the `models` entries schema below). |
 
 ### Legacy entries
 
@@ -187,6 +194,14 @@ Each element of the `models` array is an object:
 * `url` (string, required) — OpenAI-compatible base URL.
 * `key` (string, required, may be `""`) — API key; local servers need none.
 * `model` (string, required) — the model name the provider serves.
+* `jev-autocompact-percent` (number 1-100, optional, default = the global
+  `jev-autocompact-percent`) — per-model override of the auto-compaction
+  trigger: different models have different context sizes, so the percentage
+  at which compaction should fire is a property of the model, not just of the
+  installation. Resolution for any agent: its `agent_models`-routed model
+  entry's value (when valid) > the global `jev-autocompact-percent` > `99`.
+  Out-of-range values warn at startup and fall back to the global (the
+  models[] key walk covers key names, not value ranges).
 
 Unknown keys inside an entry are a fatal located error (see
 [How values are parsed and validated](#how-values-are-parsed-and-validated)) —
