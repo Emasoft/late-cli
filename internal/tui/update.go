@@ -100,8 +100,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.Mode == ViewChat && !m.EscConfirmPending && !m.ShowFilePicker {
 		switch event := msg.(type) {
-		case tea.KeyReleaseMsg:
-			return m, nil
 		case tea.KeyPressMsg:
 			if m.ShowTodoPane && m.TodoPaneFocused {
 				break // Let the todo pane handle its navigation keys below.
@@ -167,7 +165,33 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 		}
 	}
 
+	// Key releases carry no action anywhere in this UI: every key handler
+	// below dispatches on tea.KeyMsg — implemented by BOTH KeyPressMsg and
+	// KeyReleaseMsg — via String(), and a release carries the same String()
+	// as its press. On terminals that report release events (kitty keyboard
+	// protocol), unfiltered releases re-trigger whichever handler runs next:
+	// double-scrolling the todo pane, rewind, and commit-log views, and —
+	// worst — the esc release lands while EscConfirmPending is set (the
+	// chat-mode swallow further below is gated on !EscConfirmPending) and
+	// instantly cancels the "esc again to confirm" prompt before it can be
+	// answered. Nothing consumes KeyReleaseMsg, so drop it before any
+	// KeyMsg dispatch.
+	if _, ok := msg.(tea.KeyReleaseMsg); ok {
+		return m, nil
+	}
+
 	if _, ok := msg.(clearToastMsg); ok {
+		// Stale expiry tick: toasts overlap often (hook diagnostics fire in
+		// bursts, the 413 guidance toast lasts 8s), and a tea.Tick scheduled
+		// by the PREVIOUS toast can land while a NEWER toast is still alive.
+		// Clearing unconditionally let that old tick kill the new toast
+		// early. Every toast-set rewrites ToastExpireTime, so while "now" is
+		// still before that expiry, the arriving tick cannot be the one the
+		// current toast scheduled — ignore it; the current toast owns its
+		// own clear tick.
+		if m.ToastMessage != "" && time.Now().UnixMilli() < m.ToastExpireTime {
+			return m, nil
+		}
 		m.ToastMessage = ""
 		m.ToastWarning = false
 		m.updateViewport()
@@ -277,11 +301,16 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			// character both unfocuses and types. bubbletea v2 populates
 			// Key.Text only for printable characters (the exact bytes the
 			// textarea inserts), so esc/ctrl/alt/pgup-style keystrokes never
-			// match here and keep the pane focused.
+			// match here and keep the pane focused. Combining/dead-key
+			// sequences deliver multi-rune Text ("e"+U+0301 in one event) —
+			// any printable rune in it is typing, so release on the first.
 			if press, ok := keyMsg.(tea.KeyPressMsg); ok &&
 				press.Mod&(tea.ModCtrl|tea.ModAlt|tea.ModMeta|tea.ModHyper|tea.ModSuper) == 0 {
-				if runes := []rune(press.Text); len(runes) == 1 && !unicode.IsControl(runes[0]) {
-					m.TodoPaneFocused = false
+				for _, r := range []rune(press.Text) {
+					if !unicode.IsControl(r) {
+						m.TodoPaneFocused = false
+						break
+					}
 				}
 			}
 		}
@@ -923,6 +952,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 						m.Focused.SystemPrompt(),
 						m.Focused.ToolDefinitions(),
 					)
+					// A rewind rewrote this agent's history: re-arm the
+					// one-shot 413 payload-recovery compaction, exactly like
+					// /new does. Without this, a conversation that already
+					// burned its recovery pass keeps a 413 permanent even
+					// after the user rolled back to a smaller history.
+					focusedState.PayloadRecoveryUsed = false
 
 					m.ToastMessage = "conversation rewound"
 					m.ToastWarning = false
@@ -1633,7 +1668,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		m.ToastMessage = msg.Text
 		m.ToastWarning = msg.Warning
 		m.ToastExpireTime = time.Now().UnixMilli() + 3000
-		return m, func() tea.Msg { return clearToastMsg{} }
+		// The toast carries its own expiry above: schedule the clear tick
+		// instead of clearing on the next loop iteration. The old
+		// immediate-clear command erased the toast the moment Bubble Tea ran
+		// the command — one rendered frame — making the toast invisible even
+		// though the expiry was set for 3s.
+		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+			return clearToastMsg{}
+		})
 
 	case ToastMsg:
 		m.ToastMessage = msg.Text

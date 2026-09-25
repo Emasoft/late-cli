@@ -79,6 +79,28 @@ func TestReportDroppedEvents_FallbackWritesStderr(t *testing.T) {
 	}
 }
 
+// TestReportfCallableWhileMuHeld pins the deadlock hardening: reportf and
+// SetDiagnostics guard diagnosticsFn with a DEDICATED diagMu (the same
+// reasoning as the plugin manager's), not the orchestrator-wide mu. reportf
+// must therefore stay callable from code that already holds mu (or may hold
+// it in the future) — under the old mu.RLock the nested RLock below deadlocked
+// against this goroutine's held write lock.
+func TestReportfCallableWhileMuHeld(t *testing.T) {
+	o := NewBaseOrchestrator("diag-test", nil, nil, 0)
+
+	var got []string
+	o.SetDiagnostics(func(msg string) { got = append(got, msg) })
+	defer o.SetDiagnostics(nil)
+
+	o.mu.Lock()
+	o.reportf("diagnostic while holding mu\n")
+	o.mu.Unlock()
+
+	if len(got) != 1 || got[0] != "diagnostic while holding mu\n" {
+		t.Fatalf("sink = %q, want the reportf line routed while mu was held", got)
+	}
+}
+
 // TestExecute_DroppedEventsReportedThroughSink is the end-to-end pin: a
 // stalled event consumer (no reader for eventCh) forces progress-event
 // drops during a real turn, and the turn-end report goes to the sink as

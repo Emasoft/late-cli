@@ -98,11 +98,16 @@ type BaseOrchestrator struct {
 	// dropped-progress-events notice) when installed — main wires it to the
 	// live TUI so the notice surfaces as a warning toast instead of a raw
 	// fmt.Fprintf(os.Stderr, ...) that would paint text over the
-	// alt-screen. Guarded by mu like the other settable fields; nil (the
-	// default) falls back to os.Stderr. Subagent orchestrators are separate
-	// BaseOrchestrator instances, so each child gets the sink installed too
+	// alt-screen. Guarded by its own diagMu rather than mu — the same
+	// reasoning as the plugin manager's diagMu: reportf must stay callable
+	// from code that (now or later) already holds mu, and a nested RLock on
+	// the same RWMutex can deadlock against a queued writer. The sink is
+	// always invoked with NO lock held. nil (the default) falls back to
+	// os.Stderr. Subagent orchestrators are separate BaseOrchestrator
+	// instances, so each child gets the sink installed too
 	// (cmd/late/main.go propagates it alongside SetRetrievalHook).
 	diagnosticsFn func(msg string)
+	diagMu        sync.RWMutex
 
 	// idleKillReason records why the idle watchdog cancelled this run; guarded
 	// by mu. Empty unless the watchdog killed the run.
@@ -184,8 +189,8 @@ func (o *BaseOrchestrator) reportDroppedEvents() {
 // LAST installed sink wins. Must be called before the first run to apply to
 // it (or any time; reads are mutex-guarded, so installing mid-run is safe).
 func (o *BaseOrchestrator) SetDiagnostics(fn func(msg string)) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.diagMu.Lock()
+	defer o.diagMu.Unlock()
 	o.diagnosticsFn = fn
 }
 
@@ -193,9 +198,9 @@ func (o *BaseOrchestrator) SetDiagnostics(fn func(msg string)) {
 // diagnostics sink, or — when no sink is installed — to os.Stderr with the
 // exact same format string, pinning the pre-sink behavior.
 func (o *BaseOrchestrator) reportf(format string, args ...any) {
-	o.mu.RLock()
+	o.diagMu.RLock()
 	fn := o.diagnosticsFn
-	o.mu.RUnlock()
+	o.diagMu.RUnlock()
 	if fn != nil {
 		fn(fmt.Sprintf(format, args...))
 		return

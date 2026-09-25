@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
+
+	"late/internal/client"
 )
 
 // DiagnosticMsg carries mid-session diagnostics (hook timeouts, hook stderr,
@@ -63,5 +65,83 @@ func TestDiagnosticMsgEmptyTextIgnored(t *testing.T) {
 
 	if m.ToastMessage != "" || m.ToastWarning {
 		t.Fatalf("empty diagnostic produced toast %q (warning=%v), want nothing", m.ToastMessage, m.ToastWarning)
+	}
+}
+
+// TestStaleTickDoesNotClearNewerDiagnosticToast pins the overlap fix: hook
+// diagnostics fire in bursts, and each toast schedules its own 6s clear tick.
+// When a second toast replaces the first, the FIRST toast's tick still fires
+// later — it must not clear the second toast early. The clear handler now
+// ignores a clear while the current toast has not yet expired; only a tick
+// arriving at/after the live toast's own expiry (or a direct clear with no
+// live toast) clears it.
+func TestStaleTickDoesNotClearNewerDiagnosticToast(t *testing.T) {
+	m := NewModel(&mockOrchestrator{}, nil, nil)
+	m.SetSize(120, 30)
+
+	// First toast schedules its tick (cmd1 is not run — in production it
+	// fires 6s later, while newer toasts have replaced this one).
+	updated, cmd1 := m.Update(DiagnosticMsg{Text: "first diagnostic"})
+	m = updated.(Model)
+	if cmd1 == nil {
+		t.Fatal("the first toast must schedule a clear tick")
+	}
+
+	// A second diagnostic lands 1ms later (two hooks timing out together).
+	updated, cmd2 := m.Update(DiagnosticMsg{Text: "second diagnostic"})
+	m = updated.(Model)
+	if m.ToastMessage != "second diagnostic" {
+		t.Fatalf("ToastMessage = %q, want the second toast", m.ToastMessage)
+	}
+	if cmd2 == nil {
+		t.Fatal("the second toast must schedule its own clear tick")
+	}
+
+	// The stale tick from the FIRST toast fires now: the second toast must
+	// survive it (previously the unconditional clear killed it ~6s early).
+	updated, _ = m.Update(clearToastMsg{})
+	m = updated.(Model)
+	if m.ToastMessage != "second diagnostic" {
+		t.Fatalf("stale tick cleared the newer toast: got %q", m.ToastMessage)
+	}
+	if !m.ToastWarning {
+		t.Fatal("the surviving toast must keep its warning styling")
+	}
+
+	// Once the live toast's own expiry has passed (simulated by rewinding
+	// ToastExpireTime — the same wall-clock comparison the handler uses), a
+	// clear tick does clear it.
+	m.ToastExpireTime = time.Now().UnixMilli() - 1
+	updated, _ = m.Update(clearToastMsg{})
+	m = updated.(Model)
+	if m.ToastMessage != "" || m.ToastWarning {
+		t.Fatalf("expired toast not cleared: %q (warning=%v)", m.ToastMessage, m.ToastWarning)
+	}
+}
+
+// TestToastMsgReplacesDiagnosticToastWithoutStaleClear pins the same
+// guarantee across toast KINDS: the 8s 413-guidance ToastMsg can land while a
+// 6s diagnostic toast is alive, and the diagnostic's stale tick must not
+// truncate the guidance toast.
+func TestToastMsgReplacesDiagnosticToastWithoutStaleClear(t *testing.T) {
+	m := NewModel(&mockOrchestrator{}, nil, nil)
+	m.SetSize(120, 30)
+
+	updated, _ := m.Update(DiagnosticMsg{Text: "hook timed out"})
+	m = updated.(Model)
+
+	// 413 guidance arrives while the diagnostic toast is alive.
+	guidance := ToastMsg{Text: client.PayloadTooLargeGuidance, Warning: true, Duration: 8 * time.Second}
+	updated, _ = m.Update(guidance)
+	m = updated.(Model)
+	if m.ToastMessage != client.PayloadTooLargeGuidance {
+		t.Fatalf("ToastMessage = %q, want the 413 guidance", m.ToastMessage)
+	}
+
+	// The diagnostic toast's stale 6s tick must not clear the guidance.
+	updated, _ = m.Update(clearToastMsg{})
+	m = updated.(Model)
+	if m.ToastMessage != client.PayloadTooLargeGuidance {
+		t.Fatalf("stale diagnostic tick truncated the 413 guidance toast: got %q", m.ToastMessage)
 	}
 }

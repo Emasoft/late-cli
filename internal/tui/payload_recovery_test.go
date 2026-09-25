@@ -311,3 +311,44 @@ func TestCompactionSuccessStatusCarriesEstimateSuffix(t *testing.T) {
 		t.Fatalf("StatusText = %q, want the saved report before the suffix", got)
 	}
 }
+
+// TestRewindReArmsPayloadRecovery pins the rewind re-arm: a rewind rewrote
+// the focused agent's history, so the one-shot 413 recovery must re-arm for
+// it exactly like /new does. Without this, a conversation that already burned
+// its recovery pass keeps a later 413 unrecoverable even after the user
+// rolled back to a smaller history.
+func TestRewindReArmsPayloadRecovery(t *testing.T) {
+	runs := 0
+	m := newPayloadRecoveryModel(&runs)
+
+	// Burn the one shot on a first 413.
+	if compacted := runErrorEvent(t, m, m.Focused.ID(), payloadTooLargeErr()); !compacted {
+		t.Fatal("the first 413 must run the recovery compaction")
+	}
+	if !m.GetAgentState(m.Focused.ID()).PayloadRecoveryUsed {
+		t.Fatal("precondition: the one-shot guard must be set after the first 413")
+	}
+
+	// Rewind the focused (root) agent: the guard must clear.
+	m.RewindEntries = []RewindEntry{{Index: 0, Content: "earlier message"}}
+	m.RewindIndex = 0
+	m.Mode = ViewRewind
+	m.Input.SetValue("")
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	*m = updated.(Model)
+
+	if m.Mode != ViewChat {
+		t.Fatalf("Mode = %v, want ViewChat after the rewind", m.Mode)
+	}
+	if m.GetAgentState(m.Focused.ID()).PayloadRecoveryUsed {
+		t.Fatal("rewind must re-arm the one-shot 413 payload-recovery guard")
+	}
+
+	// And the re-armed trigger really fires again on the next 413.
+	if compacted := runErrorEvent(t, m, m.Focused.ID(), payloadTooLargeErr()); !compacted {
+		t.Fatal("after a rewind the next 413 must run the recovery compaction again")
+	}
+	if runs != 2 {
+		t.Fatalf("compaction runner invoked %d times, want 2 (once before, once after the rewind)", runs)
+	}
+}
