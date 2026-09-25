@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"late/internal/pathutil"
 )
@@ -54,6 +55,13 @@ type errorLogLine struct {
 }
 
 // ErrorLog is the append-only critical-error log. Safe for concurrent use.
+//
+// The log is deliberately append-only and NEVER rotated: it is a
+// post-mortem record ("what broke in that session"), not a telemetry
+// stream, and compaction/store failures are rare by design. Growth is
+// bounded on the write side instead — one message is capped at
+// maxErrorLogMessage — and the file stays small in practice; if it ever
+// outgrows its usefulness, delete it: late recreates it on the next append.
 type ErrorLog struct {
 	path string
 	mu   sync.Mutex
@@ -97,7 +105,9 @@ func (l *ErrorLog) Path() string {
 // "diagnostic", ...) and the message. The line is serialized first so a
 // marshal failure cannot leave a torn line behind; every failure — marshal,
 // open, write — is swallowed: logging is best-effort and must never fail the
-// operation it was called from. A nil log is a no-op.
+// operation it was called from. A nil log is a no-op. Messages longer than
+// maxErrorLogMessage are truncated (truncateErrorMessage) — the log is
+// never rotated, so one huge error must not dictate the file's growth.
 func (l *ErrorLog) Log(component, message string) {
 	if l == nil {
 		return
@@ -105,7 +115,7 @@ func (l *ErrorLog) Log(component, message string) {
 	line, err := json.Marshal(errorLogLine{
 		TS:        time.Now().UTC().Format(time.RFC3339),
 		Component: component,
-		Message:   message,
+		Message:   truncateErrorMessage(message),
 	})
 	if err != nil {
 		return // plain-string struct; defensive only
@@ -130,12 +140,39 @@ func (l *ErrorLog) Logf(component, format string, args ...any) {
 	l.Log(component, fmt.Sprintf(format, args...))
 }
 
+// maxErrorLogMessage caps one entry's message. The log is append-only and
+// never rotated (see ErrorLog), so one enormous error — a provider failure
+// embedding a full response body, say — must not dictate the file's
+// growth. Longer messages are cut at the cap with an explicit truncation
+// marker; the line stays valid single-line JSON.
+const maxErrorLogMessage = 16 << 10 // 16 KiB
+
+// truncateErrorMessage caps message at maxErrorLogMessage bytes, backing off
+// to a clean rune boundary so the capped text stays valid UTF-8, and appends
+// a marker naming how many bytes were dropped.
+func truncateErrorMessage(message string) string {
+	if len(message) <= maxErrorLogMessage {
+		return message
+	}
+	cut := message[:maxErrorLogMessage]
+	for len(cut) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(cut); r != utf8.RuneError || size > 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut + fmt.Sprintf(" …[+%d bytes truncated]", len(message)-len(cut))
+}
+
 // The process-wide critical-error log. Tests install a temp-path log with
 // SetErrorLog; production wiring opens the default once at startup.
+// errorLogInstalled records that SetErrorLog ran, so the lazily opened
+// default can never overwrite an explicit install (see publishProcessLog).
 var (
-	errorLogOnce sync.Once
-	errorLogMu   sync.Mutex
-	processLog   *ErrorLog
+	errorLogOnce      sync.Once
+	errorLogMu        sync.Mutex
+	processLog        *ErrorLog
+	errorLogInstalled bool
 )
 
 // SetErrorLog installs l as the process-wide critical-error log; nil
@@ -144,6 +181,7 @@ func SetErrorLog(l *ErrorLog) {
 	errorLogMu.Lock()
 	defer errorLogMu.Unlock()
 	processLog = l
+	errorLogInstalled = true
 	// A later lazy open must not clobber an explicit install.
 	errorLogOnce.Do(func() {})
 }
@@ -176,8 +214,19 @@ func ensureProcessLog() {
 		if err != nil {
 			return // no log this process; logging must not break anything
 		}
-		errorLogMu.Lock()
-		processLog = l
-		errorLogMu.Unlock()
+		publishProcessLog(l)
 	})
+}
+
+// publishProcessLog installs the lazily opened default log unless an
+// explicit SetErrorLog landed while the open was in flight — the install
+// wins, whatever the interleaving. Both writers hold errorLogMu, and the
+// sync.Once guarantees the lazy open runs at most once, so this closes the
+// one clobber window the lazy open used to have.
+func publishProcessLog(l *ErrorLog) {
+	errorLogMu.Lock()
+	defer errorLogMu.Unlock()
+	if !errorLogInstalled {
+		processLog = l
+	}
 }

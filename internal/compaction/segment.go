@@ -52,10 +52,13 @@ type Segment struct {
 	// segment was cut from: when splitOversized cuts one oversized
 	// paragraph into several pieces, every piece carries the same Group, so
 	// the elide decision can keep the paragraph ATOMIC — pieces of one
-	// paragraph must share a single elide decision (PropagateGroupDecisions),
-	// because eliding one piece of a cut paragraph corrupts the whole (a
-	// JSON blob split mid-structure and partially elided is unparseable).
-	// 0 means ungrouped — segments built outside SegmentSegments (hand-built
+	// paragraph must share a single elide decision (AtomicElideDecisions /
+	// AtomicDecisionScores), because eliding one piece of a cut paragraph
+	// corrupts the whole (a JSON blob split mid-structure and partially
+	// elided is unparseable). Ids are assigned per SegmentSegments call and
+	// every decision is computed over one call's segments (one tool output,
+	// one history message), so groups from different calls never mix. 0
+	// means ungrouped — segments built outside SegmentSegments (hand-built
 	// test fixtures) carry no grouping and behave exactly as before this
 	// field existed: each stands alone.
 	Group int
@@ -400,9 +403,11 @@ func splitOversized(s string, sp span, maxSegChars int) []span {
 // AtomicElideDecisions computes per-segment elide decisions with paragraph
 // atomicity: pieces cut from the same oversized paragraph (equal nonzero
 // Group — the pieces splitOversized produced) share ONE decision, made on
-// the paragraph's MINIMUM sibling score against the MINIMUM sibling floor.
-// See AtomicDecisionScores for the exact decision inputs; this returns just
-// the flags. A mismatched input triple yields nil (a caller bug).
+// the paragraph's MINIMUM sibling score against the MINIMUM sibling floor —
+// unless a sibling sits at the unelidable score ceiling, which keeps the
+// whole paragraph (see AtomicDecisionScores). See AtomicDecisionScores for
+// the exact decision inputs; this returns just the flags. A mismatched
+// input triple yields nil (a caller bug).
 func AtomicElideDecisions(segs []Segment, scores, floors []float64) []bool {
 	decide, decFloors := AtomicDecisionScores(segs, scores, floors)
 	if decide == nil {
@@ -440,6 +445,20 @@ func AtomicElideDecisions(segs []Segment, scores, floors []float64) []bool {
 // min-score < floor. The decision scores returned here are also what the
 // shadow log records, so score-vs-threshold replay reproduces the recorded
 // decisions. A mismatched input triple yields (nil, nil) — a caller bug.
+//
+// Unelidable pin: protection overrides the minimum. A sibling whose score
+// sits at unelidableScore (1.0) — a protected origin's clamped score
+// (protectedScore), or the scorer's fail-open keep score — can never be
+// elided at any gate setting, and the paragraph decides as one unit, so a
+// group holding such a sibling is PINNED to keep: every piece's decision
+// score becomes unelidableScore (its floor stays the group minimum). The
+// naive alternative — letting the min-floor rule carry protection — would
+// invert it: min(1.0, 0.35) = 0.35 drops the protection floor and the
+// protected piece would elide with its low-scoring sibling. Pinning the
+// decision score (not the floor) is what keeps the shadow log and every
+// replay read consistent: 1.0 is never strictly below a floor in [0, 1], so
+// recorded decisions, Stats, FalseNegativeRate, and ReplayTable all
+// reproduce the keep a mutating run would make.
 func AtomicDecisionScores(segs []Segment, scores, floors []float64) (decide, decFloors []float64) {
 	if len(segs) != len(scores) || len(segs) != len(floors) {
 		return nil, nil // defensive: a mismatched triple is a caller bug
@@ -447,12 +466,19 @@ func AtomicDecisionScores(segs []Segment, scores, floors []float64) (decide, dec
 	decide = append([]float64(nil), scores...)
 	decFloors = append([]float64(nil), floors...)
 
-	// Group reduce: minimum score and minimum floor per paragraph.
+	// Group reduce: minimum score and minimum floor per paragraph, plus the
+	// unelidable pin — any sibling at the unelidable score ceiling (a
+	// protected origin's clamped score, or the fail-open keep score) pins
+	// the whole group to keep.
 	type minima struct{ score, floor float64 }
 	groups := make(map[int]*minima)
+	pinned := make(map[int]bool)
 	for i, seg := range segs {
 		if seg.Group <= 0 {
 			continue
+		}
+		if scores[i] >= unelidableScore {
+			pinned[seg.Group] = true
 		}
 		m, ok := groups[seg.Group]
 		if !ok {
@@ -474,6 +500,15 @@ func AtomicDecisionScores(segs []Segment, scores, floors []float64) (decide, dec
 		m := groups[seg.Group]
 		decide[i] = m.score
 		decFloors[i] = m.floor
+		if pinned[seg.Group] {
+			// Protection is absolute and the paragraph decides as one
+			// unit, so the unit keeps. Recording the ceiling as the
+			// decision score — never the raw group minimum — keeps every
+			// score-vs-floor read (the recorded decision, Stats,
+			// FalseNegativeRate, ReplayTable) reproducing the keep a
+			// mutating run would make.
+			decide[i] = unelidableScore
+		}
 	}
 	return decide, decFloors
 }

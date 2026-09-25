@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestErrorLog_AppendsJSONLines pins the durable critical-error log: 0600
@@ -173,5 +174,171 @@ func TestErrorLog_ConcurrentAppends(t *testing.T) {
 	}
 	if count != 32 {
 		t.Errorf("parsed %d lines, want 32", count)
+	}
+}
+
+// TestTruncateErrorMessage pins the write-side growth bound: messages at or
+// under the cap pass through untouched; longer ones are cut to the cap,
+// stay valid UTF-8 (never torn mid-rune, whatever the boundary lands on),
+// keep their prefix, and name how many bytes were dropped.
+func TestTruncateErrorMessage(t *testing.T) {
+	if got := truncateErrorMessage("short"); got != "short" {
+		t.Errorf("truncateErrorMessage(short) = %q, want it unchanged", got)
+	}
+
+	big := strings.Repeat("x", maxErrorLogMessage+100)
+	got := truncateErrorMessage(big)
+	if !utf8.ValidString(got) {
+		t.Error("ASCII truncation produced invalid UTF-8")
+	}
+	if !strings.HasPrefix(got, strings.Repeat("x", 64)) {
+		t.Error("truncation dropped content before the cap")
+	}
+	if !strings.HasSuffix(got, " bytes truncated]") {
+		t.Errorf("truncated message %q… lacks the truncation marker", got[:32])
+	}
+	if want := maxErrorLogMessage + len(" …[+100 bytes truncated]"); len(got) != want {
+		t.Errorf("truncated message is %d bytes, want %d", len(got), want)
+	}
+
+	// A cap that lands mid-rune (3-byte runes: 16384 % 3 != 0) backs off to
+	// a clean boundary instead of emitting a torn sequence.
+	torn := strings.Repeat("日", maxErrorLogMessage/3+10)
+	got = truncateErrorMessage(torn)
+	if !utf8.ValidString(got) {
+		t.Error("rune-boundary truncation produced invalid UTF-8")
+	}
+	if !strings.HasPrefix(got, strings.Repeat("日", 64)) {
+		t.Error("rune-boundary truncation dropped content before the cap")
+	}
+	if !strings.HasSuffix(got, " bytes truncated]") {
+		t.Errorf("rune-boundary truncated message %q… lacks the truncation marker", got[:32])
+	}
+}
+
+// TestErrorLog_TruncatesHugeMessages pins the bound end to end: a message
+// far past the cap lands as ONE valid JSON line carrying the truncation
+// marker, and a normal message passes through untouched.
+func TestErrorLog_TruncatesHugeMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "late-errors.log")
+	l, err := OpenErrorLogAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l.Log("compaction", strings.Repeat("x", 4*maxErrorLogMessage)+" ends here")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e errorLogLine
+	if err := json.Unmarshal(data, &e); err != nil {
+		t.Fatalf("truncated line is not valid JSON: %v", err)
+	}
+	if e.Component != "compaction" {
+		t.Errorf("component = %q, want compaction", e.Component)
+	}
+	if !strings.HasSuffix(e.Message, " bytes truncated]") {
+		t.Errorf("truncated message lacks the truncation marker: %q…", e.Message[:min(64, len(e.Message))])
+	}
+
+	l.Log("compaction", "small and fine")
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"message":"small and fine"`) {
+		t.Errorf("small message was altered:\n%s", data)
+	}
+}
+
+// TestPublishProcessLog_InstallWinsOverLazyOpen pins the lazy-open race
+// fix: a default-log open finishing AFTER an explicit SetErrorLog must not
+// clobber the install. Before the fix, ensureProcessLog published the
+// default log unconditionally once its sync.Once body ran, so an install
+// landing inside the open window was silently reverted.
+func TestPublishProcessLog_InstallWinsOverLazyOpen(t *testing.T) {
+	oldLog, oldInstalled := processLog, errorLogInstalled
+	t.Cleanup(func() {
+		errorLogMu.Lock()
+		defer errorLogMu.Unlock()
+		processLog, errorLogInstalled = oldLog, oldInstalled
+	})
+
+	lazy, err := OpenErrorLogAt(filepath.Join(t.TempDir(), "lazy.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := OpenErrorLogAt(filepath.Join(t.TempDir(), "installed.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// SetErrorLog runs first (as it does in every test and in any wiring
+	// that installs a sink), then the lazy open's Once body finishes and
+	// publishes the default.
+	SetErrorLog(installed)
+	publishProcessLog(lazy)
+
+	errorLogMu.Lock()
+	got := processLog
+	errorLogMu.Unlock()
+	if got != installed {
+		t.Error("the lazy open clobbered an explicit SetErrorLog install")
+	}
+}
+
+// TestProcessWideErrorLog_ConcurrentInstallAndLog smoke-tests the global
+// helpers under concurrent use: SetErrorLog racing LogError must neither
+// panic nor tear lines (go test -race covers the memory model). Every
+// append lands in one of the two installed logs, and every line in either
+// file must parse as whole JSON.
+func TestProcessWideErrorLog_ConcurrentInstallAndLog(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.log")
+	pathB := filepath.Join(dir, "b.log")
+	a, err := OpenErrorLogAt(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenErrorLogAt(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := processLog
+	t.Cleanup(func() { SetErrorLog(old) })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			target := a
+			if n%2 == 1 {
+				target = b
+			}
+			for j := 0; j < 50; j++ {
+				SetErrorLog(target)
+				LogError("race", "concurrent install and append")
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for _, p := range []string{pathA, pathB} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line == "" {
+				continue
+			}
+			var e errorLogLine
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Errorf("torn or invalid line in %s: %q: %v", p, line, err)
+			}
+		}
 	}
 }
