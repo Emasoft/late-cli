@@ -477,6 +477,18 @@ type BootstrapStatusMsg struct {
 	NextToast   *ToastMsg
 }
 
+// DiagnosticMsg carries a mid-session diagnostic line into the TUI update
+// loop as a warning toast. It replaces the raw fmt.Fprintf(os.Stderr, ...)
+// writes that would paint text over the alt-screen: without this sink those
+// lines garble the footer status line and visually replace the agent-name
+// row. The compaction pipeline's warning sink (Pipeline.SetWarningSink) and
+// the retrieval-skip warning route here through main's diag closure when the
+// program is live; without a sink installed they fall back to os.Stderr
+// (CLI flows, tests).
+type DiagnosticMsg struct {
+	Text string
+}
+
 // FindOrchestrator recursively searches for an orchestrator by ID.
 func (m *Model) FindOrchestrator(id string) common.Orchestrator {
 	var search func(curr common.Orchestrator) common.Orchestrator

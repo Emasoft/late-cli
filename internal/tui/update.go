@@ -1577,6 +1577,30 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case DiagnosticMsg:
+		// Mid-session diagnostics (hook timeouts/errors, dropped-progress-
+		// event notices) surface as a WARNING toast instead of raw stderr
+		// writes, which would paint text over the alt-screen. A toast —
+		// unlike a stderr line — cannot duplicate or displace the footer
+		// status row. Empty text is ignored (nothing to report).
+		if msg.Text == "" {
+			return m, nil
+		}
+		text := msg.Text
+		// The toast lives in the status bar; a long hook error must not
+		// wrap or overflow it. Truncate to the terminal width with the
+		// same ellipsis helper the bar itself uses at render time.
+		if m.Width > 0 {
+			text = m.truncateWithEllipsis(text, m.Width)
+		}
+		m.ToastMessage = text
+		m.ToastWarning = true
+		m.ToastExpireTime = time.Now().UnixMilli() + 6000
+		m.updateViewport()
+		return m, tea.Tick(6*time.Second, func(t time.Time) tea.Msg {
+			return clearToastMsg{}
+		})
+
 	case OrchestratorEventMsg:
 		s := m.GetAgentState(msg.Event.OrchestratorID())
 		// restoredToast delivers the recovery toast through the existing
