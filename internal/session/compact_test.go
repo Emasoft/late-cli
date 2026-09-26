@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -1635,6 +1636,255 @@ func TestCompactContextPreservesActivateSkillResults(t *testing.T) {
 	}
 	if !strings.Contains(s.History[4].Content.Text, "[[elided id=") {
 		t.Error("the control tool result was not compacted")
+	}
+}
+
+// (P5) A tool result whose originating call was the expand tool is bytes the
+// agent explicitly asked back: the walk skips it before segmentation, so it
+// survives a mutating run byte-identical and never scored, while a control
+// result from another tool in the same run compacts normally.
+func TestCompactContextPreservesExpandResults(t *testing.T) {
+	expandResult := cmpLongText("expand", 6)
+	control := cmpLongText("bash", 6)
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("expand that pointer"), 1),
+		cmpStamped(cmpAssistantWithCalls("", []client.ToolCall{
+			{Index: 0, ID: "call_x", Type: "function", Function: client.FunctionCall{Name: tool.ExpandToolName, Arguments: `{"id":"r:deadbeef"}`}},
+			{Index: 1, ID: "call_b", Type: "function", Function: client.FunctionCall{Name: "Bash", Arguments: `{"cmd":"ls"}`}},
+		}), 2),
+		cmpStamped(cmpToolResult("call_x", expandResult), 3), // expand result — never compacted
+		cmpStamped(cmpToolResult("call_b", control), 4),      // control — compacted
+	}
+	s := newCompactSession(fixture)
+	scorer := &stubScorer{fallback: 0.0} // everything scored would be elided
+
+	report, err := s.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+
+	if got := s.History[3].Content.Text; got != expandResult {
+		t.Fatalf("the expand result was compacted:\n got %q\nwant %q",
+			truncateRunes(got, 200), truncateRunes(expandResult, 200))
+	}
+	// Only the control reached the scorer.
+	if scorer.calls != 1 {
+		t.Errorf("scorer calls = %d, want 1 (protected tool results are never scored)", scorer.calls)
+	}
+	if report.MessagesScored != 1 {
+		t.Errorf("MessagesScored = %d, want 1", report.MessagesScored)
+	}
+	if !strings.Contains(s.History[4].Content.Text, "[[elided id=") {
+		t.Error("the control tool result was not compacted")
+	}
+}
+
+// --- GateConfig on the walk: protected-kind floors and the tripwire ---------
+//
+// historyGate returns the reference-parity gate the walk tests share: keep
+// threshold 0.35, protected stacktrace/diff floors at 0.05, and
+// maxElideFraction controlling the tripwire (1 disables it — nothing can
+// exceed 100%).
+func historyGate(maxElideFraction float64) *compaction.GateConfig {
+	return &compaction.GateConfig{
+		KeepThreshold:    0.35,
+		MaxElideFraction: maxElideFraction,
+		ProtectedKinds: map[compaction.SegmentKind]float64{
+			compaction.KindStacktrace: 0.05,
+			compaction.KindDiff:       0.05,
+		},
+	}
+}
+
+// traceParagraph builds a single ~940-byte stacktrace-classified paragraph
+// (a Python Traceback header on the first line — the classifyKind stacktrace
+// signal), and plainParagraph a ~540-byte plain-prose one. Both stay under
+// the 1200-byte segment cap (no cutting) and over the 80-byte tiny floor (no
+// merging), so a tool result holding both segments exactly two segments.
+func traceParagraph() string {
+	return "Traceback (most recent call last):\n" +
+		strings.Repeat("  File \"lib/x.py\", line 10, in run\n", 25) +
+		"SomeError: boom\n"
+}
+
+func plainParagraph() string {
+	return strings.Repeat("plain prose token ", 30)
+}
+
+// (G1) With a gate, a protected-kind segment (stacktrace) is kept at a score
+// a flat path would elide: 0.2 sits below the flat 0.35 threshold but above
+// the 0.05 protected floor, so the gate run keeps the trace verbatim while
+// the flat control run elides it — and a nil gate reproduces the legacy
+// flat-threshold behavior unchanged.
+func TestCompactContextGateProtectedKindFloors(t *testing.T) {
+	result := traceParagraph() + "\n\n" + plainParagraph()
+	build := func() *Session {
+		fixture := []client.ChatMessage{
+			cmpStamped(cmpSystem("system prompt"), 0),
+			cmpStamped(cmpUser("what broke"), 1),
+			cmpStamped(cmpAssistantWithCalls("", []client.ToolCall{cmpToolCall("call_1")}), 2),
+			cmpStamped(cmpToolResult("call_1", result), 3),
+		}
+		return newCompactSession(fixture)
+	}
+	// Fail loudly if classification drifts: the fixture's first segment must
+	// be the stacktrace, the second plain text. Key the stub's exact-text
+	// scores on the segments' real texts (each includes its absorbed
+	// trailing blank-line separator, so it is not exactly traceParagraph()).
+	segs := compaction.SegmentSegments(result, minCompactChars)
+	if len(segs) != 2 {
+		t.Fatalf("fixture segments = %d, want 2 (trace + plain)", len(segs))
+	}
+	if segs[0].Kind != compaction.KindStacktrace || segs[1].Kind != compaction.KindText {
+		t.Fatalf("fixture kinds = %q, %q; want stacktrace, text", segs[0].Kind, segs[1].Kind)
+	}
+
+	scorer := &stubScorer{
+		scores:   map[string]float64{segs[0].Text: 0.2, segs[1].Text: 0.0},
+		fallback: 1.0,
+	}
+
+	// The gate run: the stacktrace survives at 0.2 (above its 0.05 floor,
+	// below the flat threshold a nil-gate walk would apply); the plain
+	// segment elides at 0.0.
+	gated := build()
+	report, err := gated.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{
+		Threshold: 0.35,
+		Gate:      historyGate(1),
+	})
+	if err != nil {
+		t.Fatalf("CompactContext(gate) error = %v", err)
+	}
+	if got := gated.History[3].Content.Text; !strings.Contains(got, traceParagraph()) {
+		t.Fatalf("the gate run elided the protected stacktrace at score 0.2:\n got %q", truncateRunes(got, 200))
+	}
+	if !strings.Contains(gated.History[3].Content.Text, "[[elided id=") {
+		t.Fatal("the gate run must still elide the plain segment below the threshold")
+	}
+	if report.Tripwires != 0 {
+		t.Errorf("Tripwires = %d, want 0 (the elided share is far under the fraction)", report.Tripwires)
+	}
+
+	// The flat control twin (nil gate — the legacy behavior): 0.2 < 0.35
+	// elides the stacktrace too.
+	flat := build()
+	if _, err := flat.CompactContext(context.Background(), scorer, NewCompactStore(), CompactionOptions{Threshold: 0.35}); err != nil {
+		t.Fatalf("CompactContext(nil gate) error = %v", err)
+	}
+	// "SomeError: boom" sits ~950 bytes into the trace — far past the 120-char
+	// pointer summary, so its absence means the trace body itself was elided.
+	if strings.Contains(flat.History[3].Content.Text, "SomeError: boom") {
+		t.Fatal("the nil-gate flat path must elide the trace at 0.2 (the behavior the gate overrides)")
+	}
+	if !strings.Contains(flat.History[3].Content.Text, "[[elided id=") {
+		t.Fatal("the flat control run must elide both segments into a pointer")
+	}
+}
+
+// readShadowEntries reads a JSONL shadow log and decodes every line.
+func readShadowEntries(t *testing.T, path string) []compaction.ShadowEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shadow log %s: %v", path, err)
+	}
+	var entries []compaction.ShadowEntry
+	for i, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var e compaction.ShadowEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("shadow log line %d is not valid JSON: %v (%q)", i, err, line)
+		}
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+// (G2) The gate's max-elide-fraction tripwire, per MESSAGE: a scorer that
+// wants to elide every segment of a message wants to drop 100% of its
+// tokens — past the 0.5 fraction it is distrusted, the message keeps
+// everything byte-identical, the report records the tripwire, and the
+// threaded shadow log receives one tripwire entry. A partial elision (a
+// quarter of the tokens) does not trip.
+func TestCompactContextGateTripwireElidesNothing(t *testing.T) {
+	shadowLog, err := compaction.NewShadowLogAt(filepath.Join(t.TempDir(), "shadow.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tripwire run: three plain segments, all scored 0.0.
+	fixture := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("dump"), 1),
+		cmpStamped(cmpAssistantWithCalls("", []client.ToolCall{cmpToolCall("call_1")}), 2),
+		cmpStamped(cmpToolResult("call_1", cmpLongText("trip", 3)), 3),
+	}
+	s := newCompactSession(fixture)
+	original := fixture[3].Content.Text
+
+	report, err := s.CompactContext(context.Background(), &stubScorer{fallback: 0.0}, NewCompactStore(), CompactionOptions{
+		Threshold: 0.35,
+		Gate:      historyGate(0.5),
+		ShadowLog: shadowLog,
+	})
+	if err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+	if got := s.History[3].Content.Text; got != original {
+		t.Fatalf("the tripwire must keep the message byte-identical:\n got %q\nwant %q",
+			truncateRunes(got, 200), truncateRunes(original, 200))
+	}
+	if report.Tripwires != 1 {
+		t.Errorf("Tripwires = %d, want 1", report.Tripwires)
+	}
+	if report.MessagesCompacted != 0 || report.SegmentsElided != 0 || report.TokensSaved != 0 {
+		t.Errorf("nothing may be elided after the tripwire, report = %+v", report)
+	}
+	entries := readShadowEntries(t, shadowLog.Path())
+	if len(entries) != 1 {
+		t.Fatalf("shadow log lines = %d, want 1 tripwire entry", len(entries))
+	}
+	e := entries[0]
+	if e.Type != compaction.EntryTypeTripwire || e.Action != compaction.TripwireAction {
+		t.Errorf("entry Type/Action = %q/%q, want %q/%q", e.Type, e.Action, compaction.EntryTypeTripwire, compaction.TripwireAction)
+	}
+	if e.SegmentID != "" {
+		t.Errorf("tripwire entry must carry no segment id, got %q", e.SegmentID)
+	}
+	if e.TaskHash != report.TaskHash || e.Tokens <= 0 {
+		t.Errorf("tripwire entry TaskHash/Tokens = %q/%d, want the report's hash and the message's tokens", e.TaskHash, e.Tokens)
+	}
+
+	// Partial-elision control: one of four segments elided (~a quarter of
+	// the tokens, under the 0.5 fraction) compacts normally and does not
+	// trip.
+	fixture2 := []client.ChatMessage{
+		cmpStamped(cmpSystem("system prompt"), 0),
+		cmpStamped(cmpUser("dump"), 1),
+		cmpStamped(cmpAssistantWithCalls("", []client.ToolCall{cmpToolCall("call_1")}), 2),
+		cmpStamped(cmpToolResult("call_1", cmpLongText("part", 4)), 3),
+	}
+	s2 := newCompactSession(fixture2)
+	segs2 := fixtureSegments(t, fixture2)
+	report2, err := s2.CompactContext(context.Background(), elideFirstScorer(segs2), NewCompactStore(), CompactionOptions{
+		Threshold: 0.35,
+		Gate:      historyGate(0.5),
+		ShadowLog: shadowLog,
+	})
+	if err != nil {
+		t.Fatalf("CompactContext(partial) error = %v", err)
+	}
+	if !strings.Contains(s2.History[3].Content.Text, "[[elided id=") {
+		t.Fatal("the partial elision must compact normally")
+	}
+	if report2.Tripwires != 0 {
+		t.Errorf("Tripwires = %d, want 0 (a quarter of the tokens is under the fraction)", report2.Tripwires)
+	}
+	if got, want := len(readShadowEntries(t, shadowLog.Path())), 1; got != want {
+		t.Errorf("shadow log lines = %d, want still %d (no tripwire for the partial run)", got, want)
 	}
 }
 

@@ -700,6 +700,12 @@ func main() {
 		// off, no backend resolved, or the offline scripted scorer is
 		// selected (nothing to probe — there is no network to reach).
 		compactionBackend *compaction.ResolvedBackend
+		// historyGate is the gate config the pipeline was applied (the same
+		// reference-parity safety semantics — keep threshold, elide-fraction
+		// tripwire, protected-kind floors) handed to the history compaction
+		// runner so the walk's keep/elide calls mirror the tool-output
+		// path's; nil when compaction is off or no pipeline was built.
+		historyGate *compaction.GateConfig
 	)
 	if compactionMode != appconfig.CompactionModeOff {
 		// Scoring source: the offline scripted scorer (compaction-backend
@@ -774,6 +780,10 @@ func main() {
 				compaction.KindDiff:       protectedFloor,
 			}
 			pipeline.ApplyGateConfig(gate)
+			// The history walk (/jev-compact-context + the auto-trigger)
+			// runs the same gate: identical keep/elide calls on both
+			// compaction paths, same source of truth for every knob.
+			historyGate = &gate
 			if compactionMode == appconfig.CompactionModeEnabled {
 				// The record store persists elided originals across
 				// restarts: [[elided …]] pointers saved into a session
@@ -908,7 +918,7 @@ func main() {
 			compactionStore = compaction.NewStore()
 		}
 		model.Compactor = historyCompactionRunner(sess, compactionPipeline.HistoryScorer(), compactionStore,
-			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog)
+			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog, historyGate)
 		// The TUI's one-shot 413 payload-recovery compaction only fires when
 		// compaction can actually shrink history: mode "enabled" (after the
 		// shadow fallback above, which downgrades to shadow when the
@@ -1352,12 +1362,18 @@ func formatReplayTable(rows []compaction.ReplayRow, ffr float64) string {
 // shadowLog receives one "history-run" summary line per run — shadow or
 // mutating, failed or clean — so runs are auditable next to the per-segment
 // decisions they produced; it may be nil (logging is unavailable), and an
-// append failure is a stderr warning, never a run failure.
-func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer, store session.ElideStore, shadow bool, threshold float64, shadowLog *compaction.ShadowLog) func(context.Context) (session.CompactionReport, error) {
+// append failure is a stderr warning, never a run failure. gate is the
+// pipeline's GateConfig: with it the walk makes the same per-kind-floor and
+// max-elide-fraction-tripwire calls the tool-output path makes (and threads
+// the shadow log down for the walk's own tripwire entries); nil keeps the
+// legacy flat-threshold walk (tests that pin that behavior pass nil).
+func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer, store session.ElideStore, shadow bool, threshold float64, shadowLog *compaction.ShadowLog, gate *compaction.GateConfig) func(context.Context) (session.CompactionReport, error) {
 	return func(ctx context.Context) (session.CompactionReport, error) {
 		report, err := sess.CompactContext(ctx, scorer, store, session.CompactionOptions{
 			Threshold:  threshold,
 			ShadowOnly: shadow,
+			Gate:       gate,
+			ShadowLog:  shadowLog,
 		})
 		if !shadow {
 			// The walk mutated (or partially mutated — a mid-walk scorer

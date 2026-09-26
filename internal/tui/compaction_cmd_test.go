@@ -396,9 +396,11 @@ func TestNewModelPlumbsAutocompactConfig(t *testing.T) {
 }
 
 // TestJevAutoCompactPerModelOverrideFiresAtOverride pins the per-model
-// override resolution in the trigger itself: a focused typed subagent whose
-// agent_models-routed model entry carries jev-autocompact-percent 55 fires
-// at 55% of the (mock 100-token) context, not at the global 99.
+// override resolution in the trigger itself: the trigger watches the ROOT
+// agent, so the root's agent_models-routed model entry carrying
+// jev-autocompact-percent 55 fires at 55% of the (mock 100-token) context —
+// even while a subagent is focused. (The compaction pass always rewrites the
+// root session's history, so only root usage can drive the trigger.)
 func TestJevAutoCompactPerModelOverrideFiresAtOverride(t *testing.T) {
 	cfg := &config.Config{
 		JevAutocompact:        true,
@@ -406,27 +408,104 @@ func TestJevAutoCompactPerModelOverrideFiresAtOverride(t *testing.T) {
 		Models: []config.ModelSetting{
 			{ID: "small-ctx", URL: "http://a:8080", Key: "k", Model: "model-a", JevAutocompactPercent: 55},
 		},
-		AgentModels: map[string]string{"researcher": "small-ctx"},
+		AgentModels: map[string]string{"orchestrator": "small-ctx"},
 	}
 	m := NewModel(&mockOrchestrator{}, nil, cfg)
 	m.SetSize(80, 24)
 	m.Compactor = okRunner(session.CompactionReport{})
-	// Focus a typed subagent: agentTypeForID maps this id to "researcher".
+	// The root's ID maps to "orchestrator" through agentTypeForID; focus a
+	// subagent to pin that the trigger keys off the root regardless.
+	m.Root = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
 	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
 
 	// 54 of 100 tokens: below the 55% override — no fire.
-	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 54
-	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
-		t.Fatal("55% override must not fire at 54% usage")
+	m.GetAgentState(m.Root.ID()).CumulativeTokenCount = 54
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Root.ID())); cmd != nil {
+		t.Fatal("55% root override must not fire at 54% usage")
 	}
 
 	// 55 of 100 tokens: exactly the override threshold — fire.
-	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 55
-	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd == nil {
+	m.GetAgentState(m.Root.ID()).CumulativeTokenCount = 55
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Root.ID())); cmd == nil {
 		t.Fatal("55% override must fire at exactly 55% usage")
 	}
 	if !m.CompactionRunning {
 		t.Fatal("firing must set CompactionRunning")
+	}
+}
+
+// TestJevAutoCompactWatchesRootRegardlessOfFocus drives the trigger through
+// the Update event path: the ROOT agent's usage crossing fires the
+// compaction while a subagent is focused (the runner compacts the root
+// session's history, so the disarm lands on the root's state), and a focused
+// subagent's own usage crossing never triggers it. Re-arm semantics stay on
+// the root's state.
+func TestJevAutoCompactWatchesRootRegardlessOfFocus(t *testing.T) {
+	m := NewModel(&mockOrchestrator{}, nil, &config.Config{JevAutocompact: true})
+	m.SetSize(80, 24)
+	m.Compactor = okRunner(session.CompactionReport{})
+	// Focus a subagent whose usage is already maxed: its context is not the
+	// one the trigger watches.
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
+	subagentState := m.GetAgentState(m.Focused.ID())
+	subagentState.CumulativeTokenCount = 100 // 100% of the mock's 100-token context
+
+	// A focused subagent's usage update crossing the threshold does NOT fire.
+	// (cmd is ignored here: the subagent turning busy legitimately returns
+	// spinner/tick commands — only the compaction guard matters.)
+	updated, _ := m.Update(OrchestratorEventMsg{Event: common.ContentEvent{
+		ID:    m.Focused.ID(),
+		Usage: client.Usage{TotalTokens: 100},
+	}})
+	next := updated.(Model)
+	if next.CompactionRunning {
+		t.Fatal("a focused subagent's usage crossing must never fire the root-history compaction")
+	}
+	if next.GetAgentState(next.Root.ID()).AutocompactDisarmed {
+		t.Fatal("the root must stay armed while only the subagent's usage crossed")
+	}
+
+	// The ROOT agent's usage crossing fires — regardless of focus.
+	updatedRoot, cmd := m.Update(OrchestratorEventMsg{Event: common.ContentEvent{
+		ID:    m.Root.ID(),
+		Usage: client.Usage{TotalTokens: 100}, // 100% of the mock's 100-token context
+	}})
+	next = updatedRoot.(Model)
+	if !next.CompactionRunning {
+		t.Fatal("root usage crossing must fire the compaction while a subagent is focused")
+	}
+	if cmd == nil {
+		t.Fatal("Update must return the compaction command")
+	}
+	rootState := next.GetAgentState(next.Root.ID())
+	if !rootState.AutocompactDisarmed {
+		t.Fatal("firing must disarm the ROOT agent's state, not the focused subagent's")
+	}
+	if rootState.StatusText != "compacting context..." {
+		t.Fatalf("the compacting status must land on the root's state, got %q", rootState.StatusText)
+	}
+
+	// Re-arm semantics live on the root: still disarmed above the threshold
+	// (the in-flight guard aside, one crossing fires once)...
+	m = next
+	rootState = m.GetAgentState(m.Root.ID())
+	m.CompactionRunning = false
+	if cmd := m.maybeJevAutoCompact(rootState); cmd != nil {
+		t.Fatal("a crossing must fire only once")
+	}
+	// ...then usage falls below the re-arm level (99-9 = 90% → under 90
+	// tokens): the root re-arms without firing, and the next crossing fires
+	// again.
+	rootState.CumulativeTokenCount = 50
+	if cmd := m.maybeJevAutoCompact(rootState); cmd != nil {
+		t.Fatal("the re-arm update must not fire (usage below the threshold)")
+	}
+	if rootState.AutocompactDisarmed {
+		t.Fatal("root usage below the re-arm level must re-arm the trigger")
+	}
+	rootState.CumulativeTokenCount = 100
+	if cmd := m.maybeJevAutoCompact(rootState); cmd == nil {
+		t.Fatal("a re-armed root crossing must fire again")
 	}
 }
 
@@ -445,18 +524,20 @@ func TestJevAutoCompactPerModelOverrideRootAgent(t *testing.T) {
 	m := NewModel(&mockOrchestrator{}, nil, cfg)
 	m.SetSize(80, 24)
 	m.Compactor = okRunner(session.CompactionReport{})
-	// Focus the root as the real TUI does (the root's ID maps to
-	// "orchestrator" through agentTypeForID).
-	m.Focused = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
+	// The trigger watches the ROOT agent: point Root (and Focused, as the
+	// real TUI does when the user is on the root tab) at the "main" ID that
+	// maps to "orchestrator" through agentTypeForID.
+	m.Root = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
+	m.Focused = m.Root
 
 	// 70 of 100 tokens is below the 80% override but would already have
 	// fired under the 99% global.
-	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 70
-	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd != nil {
+	m.GetAgentState(m.Root.ID()).CumulativeTokenCount = 70
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Root.ID())); cmd != nil {
 		t.Fatal("80% root override must not fire at 70% usage")
 	}
-	m.GetAgentState(m.Focused.ID()).CumulativeTokenCount = 80
-	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Focused.ID())); cmd == nil {
+	m.GetAgentState(m.Root.ID()).CumulativeTokenCount = 80
+	if cmd := m.maybeJevAutoCompact(m.GetAgentState(m.Root.ID())); cmd == nil {
 		t.Fatal("80% root override must fire at exactly 80% usage")
 	}
 }

@@ -115,6 +115,22 @@ func ProtectedTool(toolName string) bool {
 	return ok
 }
 
+// GateFloorFor returns the score under which a segment of kind may be
+// elided given a GateConfig: the protected floor when the kind has one,
+// else the config's KeepThreshold. It is the floor resolution the history
+// walk (session.CompactContext with a non-nil gate) applies per segment,
+// the package-level form of resolvedGate.floor for callers that hold the
+// config directly. A pipeline's effective keep threshold can differ from
+// the applied config's when EnableRelocation ran last, so pass a config
+// whose KeepThreshold is already the resolved threshold — main.go builds
+// the walk gate with exactly the resolved compaction threshold.
+func GateFloorFor(gate GateConfig, kind SegmentKind) float64 {
+	if f, ok := gate.ProtectedKinds[kind]; ok {
+		return f
+	}
+	return gate.KeepThreshold
+}
+
 // DefaultGateConfig returns the reference-parity gate configuration.
 func DefaultGateConfig() GateConfig {
 	return GateConfig{
