@@ -267,7 +267,7 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			// any printable rune in it is typing, so release on the first.
 			if press, ok := keyMsg.(tea.KeyPressMsg); ok &&
 				press.Mod&(tea.ModCtrl|tea.ModAlt|tea.ModMeta|tea.ModHyper|tea.ModSuper) == 0 {
-				for _, r := range []rune(press.Text) {
+				for _, r := range press.Text {
 					if !unicode.IsControl(r) {
 						m.TodoPaneFocused = false
 						break
