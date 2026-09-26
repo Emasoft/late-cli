@@ -123,8 +123,25 @@ func TestStreamAccumulator_NameUpdate(t *testing.T) {
 	}
 }
 
+// isolateSessionDir points the session layer's global SessionDir at a fresh
+// temp directory for the duration of the test. SaveSessionMeta derives the
+// .meta.json sidecar path from SessionDir() — the shared sessions directory —
+// and NOT from the history file's directory (production requires this: the
+// --continue lister scans the sessions dir for sidecars), so every test that
+// persists history (any Add*Message → saveAndNotify → UpdateSessionMetadata)
+// would otherwise write e.g. history.meta.json into the REAL
+// ~/.local/share/late/sessions. Redirecting SessionDir keeps all test writes
+// inside t.TempDir().
+func isolateSessionDir(t *testing.T) {
+	t.Helper()
+	oldDir := session.SessionDir
+	session.SessionDir = func() (string, error) { return t.TempDir(), nil }
+	t.Cleanup(func() { session.SessionDir = oldDir })
+}
+
 // TestExecuteToolCalls_NotFound verifies that missing tools produce an error message
 func TestExecuteToolCalls_NotFound(t *testing.T) {
+	isolateSessionDir(t)
 	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
 	histPath := filepath.Join(t.TempDir(), "history.json")
 	sess := session.New(c, histPath, nil, "", false)
@@ -149,6 +166,7 @@ func TestExecuteToolCalls_NotFound(t *testing.T) {
 
 // TestExecuteToolCalls_Denied verifies denied confirmation produces cancel message
 func TestExecuteToolCalls_Denied(t *testing.T) {
+	isolateSessionDir(t)
 	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
 	histPath := filepath.Join(t.TempDir(), "history.json")
 	sess := session.New(c, histPath, nil, "", true)
@@ -182,6 +200,7 @@ func TestExecuteToolCalls_Denied(t *testing.T) {
 // TestExecuteToolCalls_NoMiddlewareFailsClosed verifies shell commands cannot
 // run when confirmation middleware is missing.
 func TestExecuteToolCalls_NoMiddlewareFailsClosed(t *testing.T) {
+	isolateSessionDir(t)
 	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
 	histPath := filepath.Join(t.TempDir(), "history.json")
 	sess := session.New(c, histPath, nil, "", true)
@@ -374,3 +393,24 @@ func TestRegisterTools_TodoTools(t *testing.T) {
 	}
 }
 
+func TestRunLoop_PreCancelledContextDoesNotInvokeStartTurn(t *testing.T) {
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	histPath := filepath.Join(t.TempDir(), "history.json")
+	sess := session.New(c, histPath, nil, "", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var startTurnCalled bool
+	onStartTurn := func() {
+		startTurnCalled = true
+	}
+
+	_, err := RunLoop(ctx, sess, 1, nil, onStartTurn, nil, nil, nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if startTurnCalled {
+		t.Fatal("onStartTurn was invoked despite cancelled context")
+	}
+}

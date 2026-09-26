@@ -147,6 +147,7 @@ type ChatCompletionRequest struct {
 	ToolChoice    any              `json:"tool_choice,omitempty"`
 	LogitBias     map[string]int   `json:"logit_bias,omitempty"`
 	ExtraBody     map[string]any   `json:"extra_body,omitempty"`
+	OnConnect     func()           `json:"-"`
 }
 
 type ChatCompletionResponse struct {
