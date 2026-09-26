@@ -17,6 +17,15 @@ const DefaultOpenAIBaseURL = "http://localhost:8080"
 // config.json "subagent_timeout" entry provides a value.
 const DefaultSubagentTimeout = 24 * time.Hour
 
+// Permission modes for supervising potentially dangerous commands.
+// The effective mode is resolved by ResolvePermissionMode:
+// explicitly set CLI flag > config.json permission-mode entry >
+// PermissionModeAskForUserApproval.
+const (
+	PermissionModeAskForUserApproval = "ask-for-user-approval"
+	PermissionModeUnsupervised       = "i-promise-i-have-backups-and-will-not-file-issues"
+)
+
 type EnvLookup func(string) (string, bool)
 
 type OpenAISettings struct {
@@ -73,6 +82,12 @@ type Config struct {
 	// (DefaultSubagentTimeout). Precedence: an explicitly passed
 	// --subagent-timeout flag wins over this entry.
 	SubagentTimeout string `json:"subagent_timeout,omitempty"`
+
+	// PermissionMode selects how potentially dangerous commands are
+	// supervised. One of the PermissionMode* constants; empty means the
+	// default (ask-for-user-approval). Set via config file; the CLI flags
+	// of the same names override it.
+	PermissionMode string `json:"permission-mode,omitempty"`
 
 	// Legacy subagent fields for backward compatibility
 	SubagentBaseURL string `json:"subagent_base_url,omitempty"`
@@ -274,6 +289,42 @@ func ResolveSubagentTimeout(cfg *Config, cliExplicit bool, cliValue time.Duratio
 		return DefaultSubagentTimeout, fmt.Sprintf("ignoring invalid config.json subagent_timeout %q; using default 24h", cfg.SubagentTimeout)
 	}
 	return DefaultSubagentTimeout, ""
+}
+
+// ResolvePermissionMode returns the effective permission mode.
+// Precedence: exactly one explicitly-set CLI flag > config.json
+// permission-mode entry > PermissionModeAskForUserApproval. The flags
+// are mutually exclusive: setting more than one is an error. An
+// unrecognized config.json value yields a warning and falls back to
+// the safe default.
+func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag bool) (mode string, warning string, err error) {
+	set := 0
+	for _, v := range []bool{askFlag, unsupervisedFlag} {
+		if v {
+			set++
+		}
+	}
+	if set > 1 {
+		return "", "", fmt.Errorf("permission flags are mutually exclusive; pass at most one of -%s, -%s",
+			PermissionModeAskForUserApproval, PermissionModeUnsupervised)
+	}
+	switch {
+	case askFlag:
+		return PermissionModeAskForUserApproval, "", nil
+	case unsupervisedFlag:
+		return PermissionModeUnsupervised, "", nil
+	}
+	if cfg != nil && cfg.PermissionMode != "" {
+		switch cfg.PermissionMode {
+		case PermissionModeAskForUserApproval, PermissionModeUnsupervised:
+			return cfg.PermissionMode, "", nil
+		default:
+			return PermissionModeAskForUserApproval,
+				fmt.Sprintf("ignoring invalid config.json permission-mode %q; using %q", cfg.PermissionMode, PermissionModeAskForUserApproval),
+				nil
+		}
+	}
+	return PermissionModeAskForUserApproval, "", nil
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

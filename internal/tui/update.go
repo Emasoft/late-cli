@@ -2,8 +2,10 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"late/internal/assets"
+	"late/internal/client"
 	"late/internal/common"
 	"late/internal/config"
 	"late/internal/git"
@@ -1462,8 +1464,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 	case ToastMsg:
 		m.ToastMessage = msg.Text
 		m.ToastWarning = msg.Warning
-		m.ToastExpireTime = time.Now().UnixMilli() + 3000
-		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+		duration := msg.Duration
+		if duration <= 0 {
+			duration = 3 * time.Second
+		}
+		m.ToastExpireTime = time.Now().UnixMilli() + duration.Milliseconds()
+		return m, tea.Tick(duration, func(t time.Time) tea.Msg {
 			return clearToastMsg{}
 		})
 
@@ -1488,9 +1494,32 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 
 	case OrchestratorEventMsg:
 		s := m.GetAgentState(msg.Event.OrchestratorID())
+		// restoredToast delivers the recovery toast through the existing
+		// ToastMsg handler when the RecoveryEvent branch below reports that
+		// the retried attempt actually produced a response; it is returned
+		// after the event switch below.
+		var restoredToast tea.Cmd
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
+			if s.RetryVerb != "" {
+				s.StatusText = ""
+				if s.RetryVerb == retryVerbRejectedByAPI {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "request accepted after retry", Duration: 2 * time.Second}
+					}
+				} else {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "connection regained", Duration: 2 * time.Second}
+					}
+				}
+				s.RetryVerb = ""
+				s.StreamingStyledCache = ""
+				s.StreamingChunkCount = 0
+			}
+			if strings.Contains(s.StatusText, "retry ") {
+				s.StatusText = ""
+			}
 			s.StreamingState = event
 			if s.State != StateConfirmTool {
 				s.State = StateStreaming
@@ -1530,6 +1559,16 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				if s.State != StateConfirmTool {
 					s.State = StateThinking
 				}
+				// The agent is productive again: clear any error box pinned
+				// by a previous failure. Recovery is announced by the
+				// dedicated RecoveryEvent branch below (the orchestrator
+				// emits it when the retried attempt actually succeeds), so
+				// clearing the retry verb here is only a silent safety net
+				// for a dropped RecoveryEvent — no toast.
+				if s.Error != nil {
+					s.Error = nil
+				}
+				s.RetryVerb = ""
 				s.StatusText = "Working..."
 				s.StreamingState = common.ContentEvent{ID: event.ID}
 				// Clear streaming render cache for new turn
@@ -1539,6 +1578,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				s.State = StateIdle
 				s.StatusText = "Closed"
 				s.Closed = true
+				// A turn that ended closed must not produce a recovery
+				// toast on the next turn.
+				s.RetryVerb = ""
 				// If the focused agent closed, switch back to parent (if any) or root
 				if event.ID == m.Focused.ID() && s.State == StateIdle {
 					if m.Focused.Parent() != nil {
@@ -1557,12 +1599,68 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					s.StatusText = fmt.Sprintf("Error: %v", event.Error)
 					s.Error = event.Error
 				}
+				// A turn that ended in error must not produce a recovery
+				// toast on the next turn.
+				s.RetryVerb = ""
 				// We don't clear rendered history so user can see what happened
 			default:
 				s.State = StateIdle
 				s.StatusText = "Ready"
 				s.StreamingStyledCache = ""
 				s.StreamingChunkCount = 0
+			}
+			if event.ID == m.Focused.ID() {
+				m.updateViewport()
+			}
+		case common.RetryEvent:
+			// A stream attempt failed and the executor is retrying after
+			// event.Delay. The agent stays busy (the spinner keeps running)
+			// while retaining the partial output so it does not abruptly vanish.
+			s.Transcript.generation++
+			s.Transcript.busy = false
+			s.State = StateThinking
+			// The failure class decides the verb: an HTTP 400 is the API
+			// rejecting the request body, not a lost connection.
+			retryVerb := retryVerbConnectionLost
+			var retryStatusErr *client.StatusError
+			if errors.As(event.Err, &retryStatusErr) && retryStatusErr.StatusCode == http.StatusBadRequest {
+				retryVerb = retryVerbRejectedByAPI
+			}
+			// The status line is rendered once and never refreshed, so the
+			// wording deliberately uses the past tense: "after Xs backoff"
+			// is accurate once the wait completes, whereas "retrying in Xs"
+			// would imply a live countdown that never ticks and could linger
+			// on screen while the next attempt already streams.
+			s.StatusText = fmt.Sprintf("%s — retry %d/%d after %s backoff", retryVerb, event.Attempt, event.MaxAttempts, event.Delay.Truncate(100*time.Millisecond))
+			// Clear streaming render cache for the failed attempt
+			s.StreamingStyledCache = ""
+			s.StreamingChunkCount = 0
+			s.RetryVerb = retryVerb
+			if event.ID == m.Focused.ID() {
+				m.updateViewport()
+			}
+		case common.RecoveryEvent:
+			// The retried attempt actually produced a response — announce it
+			// immediately instead of guessing on the next turn's thinking
+			// event (which may never come before content streams).
+			s.Transcript.generation++
+			s.State = StateThinking
+			if s.RetryVerb != "" {
+				s.StatusText = ""
+				if s.RetryVerb == retryVerbRejectedByAPI {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "request accepted after retry", Duration: 2 * time.Second}
+					}
+				} else {
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "connection regained", Duration: 2 * time.Second}
+					}
+				}
+				s.RetryVerb = ""
+			} else {
+				// Recovery for an agent whose retry verb was already cleared
+				// (e.g. a stop raced the recovery): keep the status clean.
+				s.StatusText = ""
 			}
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
@@ -1576,6 +1674,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.PendingStop = false
 			s.State = StateIdle
 			s.StatusText = "Stopped"
+			// A turn that ended in a user stop must not produce a recovery
+			// toast on the next turn.
+			s.RetryVerb = ""
 			s.RenderedHistory = nil
 			s.StreamingStyledCache = ""
 			s.StreamingChunkCount = 0
@@ -1600,6 +1701,10 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}
+		}
+
+		if restoredToast != nil {
+			return m, restoredToast
 		}
 
 	case ConfirmRequestMsg:
@@ -1927,6 +2032,24 @@ func (m Model) navigateHistory(dir int) Model {
 }
 
 func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
+	drained := m.Focused.DrainQueuedMessages()
+	if len(drained) > 0 {
+		restored := strings.Join(drained, "\n")
+		curr := m.Input.Value()
+		if curr != "" {
+			m.Input.SetValue(restored + "\n" + curr)
+		} else {
+			m.Input.SetValue(restored)
+		}
+		m.Input.CursorEnd()
+
+		for i := len(drained) - 1; i >= 0; i-- {
+			if len(m.InputHistory) > 0 && m.InputHistory[len(m.InputHistory)-1] == drained[i] {
+				m.InputHistory = m.InputHistory[:len(m.InputHistory)-1]
+			}
+		}
+	}
+
 	focusedState := m.GetAgentState(m.Focused.ID())
 	if focusedState.State == StateConfirmTool && focusedState.PendingConfirm != nil {
 		focusedState.PendingConfirm.ResultCh <- "n"
@@ -1939,7 +2062,7 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.updateViewport()
 		return m, nil
 	}
-	if focusedState.State == StateThinking || focusedState.State == StateStreaming {
+	if focusedState.State == StateThinking || focusedState.State == StateStreaming || focusedState.State == StateStopping {
 		focusedState.PendingStop = true
 		focusedState.State = StateStopping
 		focusedState.StatusText = "Stopping..."
@@ -1947,6 +2070,9 @@ func (m Model) interruptFocusedAgent() (Model, tea.Cmd) {
 		m.Focused.Cancel()
 		m.updateViewport()
 		return m, nil
+	}
+	if len(drained) > 0 {
+		m.updateViewport()
 	}
 	return m, nil
 }

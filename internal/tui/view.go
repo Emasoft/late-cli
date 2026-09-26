@@ -504,6 +504,27 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 	return sb.String()
 }
 
+func formatAgentBreadcrumb(id string) string {
+	if id == "" || id == common.MainAgentID || id == "main" {
+		return "main"
+	}
+	if strings.Contains(id, "-subagent-") {
+		parts := strings.SplitN(id, "-subagent-", 2)
+		return fmt.Sprintf("%s #%s", parts[0], parts[1])
+	}
+	if strings.HasPrefix(id, "subagent-type-") {
+		trimmed := strings.TrimPrefix(id, "subagent-type-")
+		if idx := strings.LastIndex(trimmed, "-"); idx != -1 {
+			return fmt.Sprintf("%s #%s", trimmed[:idx], trimmed[idx+1:])
+		}
+		return trimmed
+	}
+	if strings.HasPrefix(id, "subagent-") {
+		return fmt.Sprintf("subagent #%s", strings.TrimPrefix(id, "subagent-"))
+	}
+	return id
+}
+
 func (m *Model) statusBarView() string {
 	w := max(m.Width, 1)
 
@@ -570,25 +591,49 @@ func (m *Model) statusBarView() string {
 	// Branch or CWD (whisper-muted, unobtrusive context)
 	if m.ShowCWD {
 		if m.GitBranch != "" {
-			branchPart := lipgloss.NewStyle().Foreground(mutedTextColor).Render(m.GitBranch)
+			branchPart := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor).Render("⎇ " + m.GitBranch)
 			leftItems = append(leftItems, branchPart)
 		} else if m.CWD != "" {
 			display := filepath.Base(m.CWD)
 			if display == "/" || display == "." {
 				display = m.CWD
 			}
-			repoPart := lipgloss.NewStyle().Foreground(mutedTextColor).Render(display)
+			repoPart := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor).Render(display)
 			leftItems = append(leftItems, repoPart)
 		}
 	}
 
-	leftSection := strings.Join(leftItems, statusDivider)
+	// Breadcrumbs (on the left, shown when focused on a subagent)
+	var pathParts []string
+	curr := m.Focused
+	for curr != nil {
+		pathParts = append([]string{curr.ID()}, pathParts...)
+		curr = curr.Parent()
+	}
+	if len(pathParts) <= 1 && m.Focused != nil && m.Root != nil && m.Focused.ID() != m.Root.ID() {
+		pathParts = []string{m.Root.ID(), m.Focused.ID()}
+	}
+	if len(pathParts) > 1 {
+		var styledParts []string
+		for i, id := range pathParts {
+			label := formatAgentBreadcrumb(id)
+			if i == len(pathParts)-1 {
+				styledParts = append(styledParts, breadcrumbActiveAgentStyle.Render(label))
+			} else {
+				styledParts = append(styledParts, breadcrumbAgentStyle.Render(label))
+			}
+		}
+		breadcrumbContent := strings.Join(styledParts, breadcrumbSeparatorStyle.Render(" › "))
+		leftItems = append(leftItems, breadcrumbContent)
+	}
+
+	leftSection := strings.Join(leftItems, "  ")
 
 	// Center: toast or active action text
 	var status string
 	hasToast := m.ToastMessage != "" && time.Now().UnixMilli() < m.ToastExpireTime
 	if m.BootstrapStatus != "" {
-		status = lipgloss.NewStyle().Foreground(subtextColor).Italic(true).Render(m.BootstrapStatus)
+		status = lipgloss.NewStyle().Foreground(subtextColor).Background(appBgColor).Italic(true).Render(m.BootstrapStatus)
 	} else if hasToast {
 		if m.ToastWarning {
 			status = statusWarningStyle.Render(m.ToastMessage)
@@ -599,7 +644,7 @@ func (m *Model) statusBarView() string {
 		if s.State == StateConfirmTool {
 			status = statusWarningStyle.Render(statusText)
 		} else {
-			status = lipgloss.NewStyle().Foreground(subtextColor).Italic(true).Render(statusText)
+			status = lipgloss.NewStyle().Foreground(subtextColor).Background(appBgColor).Italic(true).Render(statusText)
 		}
 	}
 
@@ -620,29 +665,18 @@ func (m *Model) statusBarView() string {
 		}
 	}
 
-	// Right: Attachments, Context, Breadcrumbs, Help
+	// Right: Context, Attachments
 	var rightItems []string
-	if len(m.AttachedFiles) > 0 {
-		rightItems = append(rightItems, statusAttachedStyle.Render(fmt.Sprintf("%d files", len(m.AttachedFiles))))
-	}
-
 	maxTokens := m.Focused.MaxTokens()
 	if s.CumulativeTokenCount > 0 {
 		rightItems = append(rightItems, m.renderContextBar(s.CumulativeTokenCount, maxTokens))
 	}
-
-	// Breadcrumbs
-	var pathParts []string
-	curr := m.Focused
-	for curr != nil {
-		pathParts = append([]string{breadcrumbAgentStyle.Render(curr.ID())}, pathParts...)
-		curr = curr.Parent()
-	}
-	if len(pathParts) > 1 {
-		rightItems = append(rightItems, strings.Join(pathParts, breadcrumbSeparatorStyle.Render(" › ")))
+	if len(m.AttachedFiles) > 0 {
+		fileLabel := fmt.Sprintf("📎 %d files", len(m.AttachedFiles))
+		rightItems = append(rightItems, statusAttachedStyle.Render(fileLabel))
 	}
 
-	rightSection := strings.Join(rightItems, statusDivider)
+	rightSection := strings.Join(rightItems, "  ")
 
 	// Layout spacing
 	usableW := w - 2
@@ -1476,6 +1510,20 @@ func (m *Model) renderModelPickerView() {
 // text use the same clock; only this visible row is repainted on animation ticks.
 func (m *Model) renderActivityAt(text string, width int, now time.Time) string {
 	text = strings.Join(strings.Fields(text), " ")
+	if strings.HasPrefix(text, "interrupted") || strings.Contains(text, "interrupted · retrying") {
+		dots := []string{".", "..", "..."}[(now.UnixMilli()/350)%3]
+		base := strings.TrimPrefix(text, "↳")
+		base = strings.TrimPrefix(strings.TrimSpace(base), "↳")
+		base = strings.TrimSpace(base)
+		base = strings.TrimRight(strings.TrimSuffix(base, "..."), ".")
+		row := statusWarningStyle.Render("  ↳ " + base + dots)
+		truncated := ansi.Truncate(row, max(1, width), "")
+		rw := ansi.StringWidth(truncated)
+		if rw < width {
+			truncated += lipgloss.NewStyle().Background(appBgColor).Render(strings.Repeat(" ", width-rw))
+		}
+		return truncated
+	}
 	frames := spinner.Dot
 	frame := int(now.UnixNano()/int64(frames.FPS)) % len(frames.Frames)
 	marker := lipgloss.NewStyle().Foreground(primaryColor).Background(appBgColor).Render(strings.TrimSpace(frames.Frames[frame]))

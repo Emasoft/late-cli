@@ -145,11 +145,6 @@ var (
 				BorderBackground(appBgColor).
 				Foreground(textColor)
 
-	statusDivider = lipgloss.NewStyle().
-			Foreground(activeBorder).
-			Background(appBgColor).
-			Render(" │ ")
-
 	statusKeyStyle = lipgloss.NewStyle().
 			Foreground(subtextColor).
 			Background(appBgColor).
@@ -180,4 +175,9 @@ var (
 	breadcrumbAgentStyle = lipgloss.NewStyle().
 				Foreground(textColor).
 				Background(appBgColor)
+
+	breadcrumbActiveAgentStyle = lipgloss.NewStyle().
+					Foreground(textColor).
+					Bold(true).
+					Background(appBgColor)
 )
