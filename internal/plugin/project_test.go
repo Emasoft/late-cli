@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 )
+
 // writeBarePlugin creates a minimal plugin directory with a native-Late
 // package.json at the given path and returns the directory. It is
 // intentionally a different name from the rich
@@ -208,6 +209,10 @@ func TestDiscover_IgnoresNodeModulesAndCache(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInstallFromLocal_Project(t *testing.T) {
+	// Sandbox the user config dir: this flow records state in the global
+	// plugin state file (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -245,6 +250,10 @@ func TestInstallFromLocal_Project(t *testing.T) {
 }
 
 func TestInstallFromLocal_Global(t *testing.T) {
+	// Sandbox the user config dir: this flow records state in the global
+	// plugin state file (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -269,6 +278,10 @@ func TestInstallFromLocal_Global(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLink_Project(t *testing.T) {
+	// Sandbox the user config dir: Link records state in the global plugin
+	// state file (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -289,6 +302,10 @@ func TestLink_Project(t *testing.T) {
 }
 
 func TestLink_Global(t *testing.T) {
+	// Sandbox the user config dir: Link records state in the global plugin
+	// state file (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -313,6 +330,11 @@ func TestLink_Global(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemovePlugin_Project(t *testing.T) {
+	// Sandbox the user config dir: installing/removing a local plugin
+	// records and clears state in the global plugin state file
+	// (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -349,6 +371,11 @@ func TestRemovePlugin_Project(t *testing.T) {
 }
 
 func TestRemovePlugin_Global(t *testing.T) {
+	// Sandbox the user config dir: installing/removing a local plugin
+	// records and clears state in the global plugin state file
+	// (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -463,10 +490,10 @@ func TestHasProjectDir_Methods(t *testing.T) {
 
 func TestParseProjectFlag(t *testing.T) {
 	tests := []struct {
-		name      string
-		args      []string
-		wantProj  bool
-		wantRest  string
+		name     string
+		args     []string
+		wantProj bool
+		wantRest string
 	}{
 		{
 			name:     "no flag, has source",
@@ -531,7 +558,6 @@ func TestParseProjectFlag(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // PluginPathInDir
 // ---------------------------------------------------------------------------
@@ -571,6 +597,11 @@ func writeScopedPluginLike(t *testing.T, dir, scopedName string) string {
 }
 
 func TestRemovePlugin_ScopedLink_CleansEmptyScopeParent(t *testing.T) {
+	// Sandbox the user config dir: installing/removing a local plugin
+	// records and clears state in the global plugin state file
+	// (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	sourceDir := t.TempDir()
 	writeScopedPluginLike(t, sourceDir, "@late/scoped-plugin")
@@ -598,6 +629,11 @@ func TestRemovePlugin_ScopedLink_CleansEmptyScopeParent(t *testing.T) {
 }
 
 func TestRemovePlugin_ScopedLink_KeepsNonEmptyScopeParent(t *testing.T) {
+	// Sandbox the user config dir: installing/removing a local plugin
+	// records and clears state in the global plugin state file
+	// (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	srcA := t.TempDir()
 	srcB := t.TempDir()
@@ -636,6 +672,11 @@ func TestRemovePlugin_ScopedLink_KeepsNonEmptyScopeParent(t *testing.T) {
 // installs — the `dir` parameter flows through pm.TargetDir(project), but
 // without an explicit test the project's branch is never asserted.
 func TestRemovePlugin_Project_ScopedLink_CleansEmptyScopeParent(t *testing.T) {
+	// Sandbox the user config dir: installing/removing a local plugin
+	// records and clears state in the global plugin state file
+	// (plugins.json), which must be a throwaway here.
+	sandboxUserConfig(t)
+
 	globalDir := t.TempDir()
 	projectDir := t.TempDir()
 	sourceDir := t.TempDir()
@@ -686,22 +727,12 @@ func writeSkillPlugin(t *testing.T, dir, pluginName, skillName string) {
 func TestHandlePluginRemove_PurgesStaleSkillSymlink(t *testing.T) {
 	globalDir := t.TempDir()
 	sourceDir := t.TempDir()
-	xdgRoot := t.TempDir()
+	_, skillsDir := sandboxUserConfig(t)
 
-	// Sandbox `lateSkillsDir()` so the test cannot damage the user's real
-	// `~/.config/late/skills` if our internal invariants drift. Go's
-	// `os.UserConfigDir()` honors `XDG_CONFIG_HOME` on every Unix-like
-	// target (Linux, macOS, BSD) per the freedesktop spec; pinning only
-	// this variable is sufficient and avoids sideways effects on
-	// `os.UserHomeDir()`/`isSuspiciousPluginPath` that overriding HOME
-	// would introduce.
-	t.Setenv("XDG_CONFIG_HOME", xdgRoot)
-	skillsDir := filepath.Join(xdgRoot, "late", "skills")
-	if err := os.MkdirAll(skillsDir, 0755); err != nil {
-		t.Fatalf("mkdir skills dir: %v", err)
-	}
+	// Guard: lateSkillsDir() must resolve inside the sandbox — this is the
+	// invariant that keeps the test off the developer's real user config.
 	if resolved, _ := lateSkillsDir(); resolved != skillsDir {
-		t.Fatalf("lateSkillsDir() = %q, want %q (XDG/HOME override misconfigured)", resolved, skillsDir)
+		t.Fatalf("lateSkillsDir() = %q, want %q (user-config sandbox ineffective)", resolved, skillsDir)
 	}
 
 	writeSkillPlugin(t, sourceDir, "skills-plugin", "my-skill")
@@ -741,14 +772,7 @@ func TestHandlePluginRemove_PreservesSiblingSkillSymlink(t *testing.T) {
 	globalDir := t.TempDir()
 	srcA := t.TempDir()
 	srcB := t.TempDir()
-	xdgRoot := t.TempDir()
-
-	// Same sandboxing strategy as the single-plugin self-clean test.
-	t.Setenv("XDG_CONFIG_HOME", xdgRoot)
-	skillsDir := filepath.Join(xdgRoot, "late", "skills")
-	if err := os.MkdirAll(skillsDir, 0755); err != nil {
-		t.Fatalf("mkdir skills dir: %v", err)
-	}
+	_, skillsDir := sandboxUserConfig(t)
 
 	// Two distinct plugins, intentionally both declaring a skill with the
 	// same basename to maximize the chance a bogus "name only" keep key
