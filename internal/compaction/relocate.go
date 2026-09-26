@@ -436,12 +436,10 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 		for i := range elide {
 			elide[i] = false
 		}
-		elidedTokens = 0
 		out.Tripwire = TripwireMaxElideFraction
 		p.logTripwire(scores.TaskHash, totalTokens)
 	}
 
-	var kept []Segment
 	var b strings.Builder
 	var run []Segment
 
@@ -486,7 +484,6 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 	for i, seg := range scores.Segments {
 		if !elide[i] {
 			flushRun()
-			kept = append(kept, seg)
 			b.WriteString(seg.Text)
 			continue
 		}

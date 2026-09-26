@@ -751,7 +751,7 @@ func parseRetryAfter(v string) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	if date, err := http.ParseTime(v); err == nil {
-		if d := date.Sub(time.Now()); d > 0 {
+		if d := time.Until(date); d > 0 {
 			return d
 		}
 	}
