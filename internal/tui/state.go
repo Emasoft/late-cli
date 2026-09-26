@@ -166,10 +166,12 @@ type AppState struct {
 	RetryVerb string
 
 	// AutocompactDisarmed records that the JEV auto-compaction trigger
-	// already fired for this agent's current crossing of the threshold. It
-	// re-arms (clears) once usage falls below (percent-9)% of the context
-	// window — typically right after a compaction shrank the history — or
-	// when /new starts a fresh conversation.
+	// already fired for the root agent's current crossing of the threshold
+	// (the trigger watches the ROOT agent's state only — the compaction it
+	// fires always rewrites the root session's history). It re-arms (clears)
+	// once root usage falls below (percent-9)% of the context window —
+	// typically right after a compaction shrank the history — or when /new
+	// starts a fresh conversation.
 	AutocompactDisarmed bool
 
 	// PayloadRecoveryUsed records that the one-shot 413 payload-recovery

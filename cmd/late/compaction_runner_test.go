@@ -59,7 +59,7 @@ func TestHistoryCompactionRunnerPersistsMutatingRun(t *testing.T) {
 	sess := compactionTestSession(t, path)
 	store := compaction.NewStore()
 
-	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, nil)
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, nil, nil)
 	report, err := runner(context.Background())
 	if err != nil {
 		t.Fatalf("runner() error = %v", err)
@@ -99,7 +99,7 @@ func TestHistoryCompactionRunnerShadowRunSkipsPersistence(t *testing.T) {
 	store := compaction.NewStore()
 	original := sess.History[1].Content.Text
 
-	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, true, compaction.DefaultRelocationThreshold, nil)
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, true, compaction.DefaultRelocationThreshold, nil, nil)
 	report, err := runner(context.Background())
 	if err != nil {
 		t.Fatalf("runner() error = %v", err)
@@ -162,7 +162,7 @@ func TestHistoryCompactionRunnerAppendsRunSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, shadowLog)
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, shadowLog, nil)
 	report, err := runner(context.Background())
 	if err != nil {
 		t.Fatalf("runner() error = %v", err)
@@ -222,7 +222,7 @@ func TestHistoryCompactionRunnerLogsFailedRunSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner := historyCompactionRunner(sess, failingHistoryScorer{}, store, true, compaction.DefaultRelocationThreshold, shadowLog)
+	runner := historyCompactionRunner(sess, failingHistoryScorer{}, store, true, compaction.DefaultRelocationThreshold, shadowLog, nil)
 	report, err := runner(context.Background())
 	if err == nil {
 		t.Fatal("runner() error = nil, want the scorer failure")
@@ -244,5 +244,50 @@ func TestHistoryCompactionRunnerLogsFailedRunSummary(t *testing.T) {
 	}
 	if e.Run.Scored != report.MessagesScored {
 		t.Errorf("Run.Scored = %d, want the report's %d", e.Run.Scored, report.MessagesScored)
+	}
+}
+
+// TestHistoryCompactionRunnerThreadsGate: the runner hands the pipeline's
+// GateConfig down to the walk, so the gate's max-elide-fraction tripwire
+// fires per message (nothing elided, Tripwires counted, one tripwire shadow
+// entry next to the run summary) where a nil-gate runner would elide
+// everything.
+func TestHistoryCompactionRunnerThreadsGate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.json")
+	sess := compactionTestSession(t, path)
+	store := compaction.NewStore()
+	shadowLog, err := compaction.NewShadowLogAt(filepath.Join(t.TempDir(), "shadow.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := compaction.DefaultGateConfig()
+	gate.KeepThreshold = compaction.DefaultRelocationThreshold
+	gate.MaxElideFraction = 0.5
+
+	runner := historyCompactionRunner(sess, fakeHistoryScorer{score: 0}, store, false, compaction.DefaultRelocationThreshold, shadowLog, &gate)
+	report, err := runner(context.Background())
+	if err != nil {
+		t.Fatalf("runner() error = %v", err)
+	}
+	if report.Tripwires != 1 {
+		t.Fatalf("Tripwires = %d, want 1 (every segment scores 0 — the whole message trips the fraction)", report.Tripwires)
+	}
+	if report.SegmentsElided != 0 || report.TokensSaved != 0 {
+		t.Errorf("the tripwire must elide nothing, report = %+v", report)
+	}
+	if strings.Contains(sess.History[1].Content.Text, "[[elided") {
+		t.Fatal("the tripped message must stay byte-identical (no pointers)")
+	}
+
+	// The shadow log holds the walk's tripwire entry plus the run summary.
+	entries := readShadowLines(t, shadowLog.Path())
+	if len(entries) != 2 {
+		t.Fatalf("got %d shadow log lines, want 1 tripwire + 1 run summary", len(entries))
+	}
+	if entries[0].Type != compaction.EntryTypeTripwire || entries[0].Action != compaction.TripwireAction {
+		t.Errorf("entry[0] Type/Action = %q/%q, want the walk's tripwire", entries[0].Type, entries[0].Action)
+	}
+	if entries[1].Type != compaction.EntryTypeHistoryRun {
+		t.Errorf("entry[1] Type = %q, want the run summary", entries[1].Type)
 	}
 }

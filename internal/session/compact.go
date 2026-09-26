@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"late/internal/client"
 	"late/internal/common"
@@ -54,17 +55,27 @@ import (
 //     (whose Content annotates the calls). Assistant ToolCalls are
 //     structurally required and are never touched: only Content shrinks.
 //   - Tool results produced by protected tools (activate_skill — see
-//     compaction.ProtectedTool) are never compacted: the result IS the
-//     instructions the agent was told to follow, and eliding them would
-//     silently strip the guidance out of the conversation.
+//     compaction.ProtectedTool — and expand, tool.ExpandToolName) are never
+//     compacted: the former IS the instructions the agent was told to
+//     follow, and eliding it would silently strip the guidance out of the
+//     conversation; the latter holds bytes the agent explicitly asked back,
+//     so eliding them would undo a request the agent just made.
 //   - Segments are scored against the ongoing task (the last user message);
-//     a segment scoring strictly below the threshold is elided into the
+//     a segment scoring strictly below its elide floor is elided into the
 //     store, and each run of consecutive elided segments is replaced by one
 //     [[elided …]] pointer line standing exactly where the run stood —
 //     content-addressed (compaction.ContentID with salt "" and the "r"
 //     prefix), carrying the run's [first, last] line range and a 120-char
 //     escaped summary. compaction.Reconstruct over the rewritten message
 //     and the store is the byte-for-byte inverse of the rewrite.
+//   - With a gate (CompactionOptions.Gate, the pipeline's GateConfig the
+//     walk shares with the tool-output path) the elide floor is per kind —
+//     protected kinds (stacktrace, diff) only elide below their own, much
+//     lower, floor (compaction.GateFloorFor) — and the max-elide-fraction
+//     tripwire runs per message: a scorer that wants to elide more than the
+//     fraction of a message's tokens is distrusted and that message keeps
+//     everything (report.Tripwires; the shadow log when one is threaded).
+//     A nil gate keeps the legacy flat-threshold walk.
 //   - Fail-open: a scorer error that still answers every requested id (the
 //     pipeline's contract — unscoreable items come back as keep-scores)
 //     does not stop the walk: those scores are used, the scorer's errors
@@ -232,6 +243,23 @@ type CompactionOptions struct {
 	// ShadowOnly computes the would-save report without mutating history or
 	// storing originals (compaction-mode "shadow").
 	ShadowOnly bool
+	// Gate, when non-nil, applies the pipeline's GateConfig safety semantics
+	// to the walk — the same protections the tool-output path gets from
+	// ApplyGateConfig: a segment is elided only below its kind's protected
+	// floor (compaction.GateFloorFor) instead of the flat Threshold, and the
+	// max-elide-fraction tripwire runs per MESSAGE: a message whose elided
+	// tokens would exceed MaxElideFraction elides nothing and records the
+	// tripwire (report.Tripwires, plus the shadow log via ShadowLog). A nil
+	// Gate keeps the legacy flat-threshold behavior. A gate whose
+	// KeepThreshold is outside (0, 1] falls back to the normalized Threshold
+	// for unprotected kinds — the effective floor is never unset.
+	Gate *compaction.GateConfig
+	// ShadowLog receives the walk's tripwire shadow entries when Gate's
+	// max-elide-fraction tripwire fires (best-effort: an append failure
+	// never fails the run; nil skips shadow logging for the walk's
+	// tripwires — the run summary itself remains the caller's append, as
+	// main.go's runner does).
+	ShadowLog *compaction.ShadowLog
 }
 
 // CompactionReport summarizes one CompactContext run. In shadow mode the
@@ -268,6 +296,12 @@ type CompactionReport struct {
 	// shadow log's per-run summary lines group under it, the same way the
 	// per-segment decision lines do.
 	TaskHash string
+	// Tripwires is the number of messages where the gate's
+	// max-elide-fraction tripwire fired: the scorer wanted to elide more
+	// than Gate.MaxElideFraction of the message's tokens, so NOTHING was
+	// elided in that message (the tool-output path's CompactResult.Tripwire
+	// analog, per message). Zero without a gate or when no message tripped.
+	Tripwires int
 }
 
 // CompactContext compacts the session history in place (unless
@@ -279,7 +313,10 @@ type CompactionReport struct {
 // completed on fail-open scores joins those scorer errors at the end, and a
 // walk that had to stop (no usable scores for a message) reports how far it
 // got. A walk that would mutate a message below the persisted high-water
-// mark fails with ErrFrozenPrefix before changing anything. The report covers
+// mark fails with ErrFrozenPrefix before changing anything. With
+// opts.Gate the walk runs the pipeline's gate protections (per-kind floors
+// and the per-message max-elide-fraction tripwire; see CompactionOptions);
+// a nil Gate keeps the legacy flat-threshold walk. The report covers
 // everything completed either way, and already-rewritten messages stay
 // rewritten; history persistence is the caller's job (SaveHistory), while a
 // completing mutating run persists the advanced high-water mark itself
@@ -298,6 +335,17 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		opts.FrozenPercent = defaultFrozenPercent
 	}
 	report.ShadowOnly = opts.ShadowOnly
+
+	// Gate normalization: a gate whose KeepThreshold is unset or out of
+	// range falls back to the walk's normalized Threshold for unprotected
+	// kinds — the effective floor is never unset (mirrors resolvedGate,
+	// whose keep is always the pipeline's armed threshold). The copy keeps
+	// the caller's config untouched.
+	if opts.Gate != nil && (opts.Gate.KeepThreshold <= 0 || opts.Gate.KeepThreshold > 1) {
+		g := *opts.Gate
+		g.KeepThreshold = opts.Threshold
+		opts.Gate = &g
+	}
 
 	// The frozen prefix is append-only: it starts at the persisted high-water
 	// mark — every completed mutating walk covered the history below it, so
@@ -340,10 +388,11 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	// that issued the calls, so the history surface knows which tool
 	// produced each tool result — the same "tool:<name>" origin the
 	// tool-output path stamps on its records. Tool results from protected
-	// tools (compaction.ProtectedTool — activate_skill) are skipped before
-	// segmentation: the gate's protected score floor makes them unelidable
-	// on the tool-output path, and here the honest equivalent is to never
-	// even score them (a kept decision is guaranteed, not scored into).
+	// tools (protectedHistoryTool — activate_skill, expand) are skipped
+	// before segmentation: the gate's protected score floor makes
+	// activate_skill results unelidable on the tool-output path, and here
+	// the honest equivalent is to never even score them (a kept decision is
+	// guaranteed, not scored into).
 	originTool := make(map[string]string)
 	for i := range s.History {
 		for _, tc := range s.History[i].ToolCalls {
@@ -362,8 +411,9 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 		}
 		msg := &s.History[i]
 		if msg.Role == "tool" {
-			if name, ok := originTool[msg.ToolCallID]; ok && compaction.ProtectedTool(name) {
-				// A protected tool's result (the skill's instructions):
+			if name, ok := originTool[msg.ToolCallID]; ok && protectedHistoryTool(name) {
+				// A protected tool's result (the skill's instructions, or
+				// bytes the agent explicitly asked back through expand):
 				// never re-segmented, never scored, never rewritten.
 				continue
 			}
@@ -463,7 +513,10 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 			b.WriteString("\n")
 			run = run[:0]
 		}
-		// Per-segment scores and the (flat) elide floor, then the shared
+		// Per-segment scores and the elide floor — the gate's protected-kind
+		// floor when a gate is set (compaction.GateFloorFor: the protected
+		// floor for stacktrace/diff segments, else the keep threshold), the
+		// flat Threshold for the legacy nil-gate walk — then the shared
 		// paragraph-atomicity decision (same rule as the tool-output path):
 		// pieces cut from the same oversized paragraph share ONE decision,
 		// made on the minimum sibling score — one low piece elides the whole
@@ -478,9 +531,51 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 				score = keepScoreFallback
 			}
 			segScores[i] = score
-			segFloors[i] = opts.Threshold
+			if opts.Gate != nil {
+				segFloors[i] = compaction.GateFloorFor(*opts.Gate, seg.Kind)
+			} else {
+				segFloors[i] = opts.Threshold
+			}
 		}
 		elide := compaction.AtomicElideDecisions(segs, segScores, segFloors)
+
+		// The max-elide-fraction tripwire (the tool-output path's gate
+		// guard, mirrored per MESSAGE): a scorer that wants to drop more
+		// than MaxElideFraction of a message's tokens is wrong more often
+		// than not — and one broken score map could gut a message
+		// wholesale. Distrust it: elide nothing in the message, count the
+		// tripwire in the report, and shadow-log the override when a log is
+		// threaded. The gate owns the decision: the legacy nil-gate walk
+		// never trips.
+		if opts.Gate != nil && opts.Gate.MaxElideFraction > 0 {
+			var totalTokens, elidedTokens int
+			for i, seg := range segs {
+				totalTokens += seg.Tokens
+				if elide[i] {
+					elidedTokens += seg.Tokens
+				}
+			}
+			if totalTokens > 0 && float64(elidedTokens) > opts.Gate.MaxElideFraction*float64(totalTokens) {
+				for i := range elide {
+					elide[i] = false
+				}
+				report.Tripwires++
+				if opts.ShadowLog != nil {
+					// Best-effort, exactly like the pipeline's logTripwire:
+					// logging must not be able to break compaction, and the
+					// tripwire has already done its job by the time this
+					// runs.
+					_ = opts.ShadowLog.Append(compaction.ShadowEntry{
+						TS:       time.Now(),
+						TaskHash: report.TaskHash,
+						Tokens:   totalTokens,
+						Type:     compaction.EntryTypeTripwire,
+						Action:   compaction.TripwireAction,
+					})
+				}
+			}
+		}
+
 		for i, seg := range segs {
 			if !elide[i] {
 				flushRun()
@@ -524,6 +619,17 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	// Fail-open scorer errors accumulated along the walk surface here; a
 	// clean walk returns a nil error.
 	return report, errors.Join(walkErrs...)
+}
+
+// protectedHistoryTool reports whether a tool result produced by toolName
+// must never be compacted by the history walk: activate_skill
+// (compaction.ProtectedTool — the result IS the skill's instructions, what
+// the agent was told to follow) and expand (tool.ExpandToolName — the agent
+// explicitly asked those bytes back, so eliding them would undo a request
+// the agent just made). Such results are skipped before segmentation: a
+// kept decision is guaranteed, not scored into.
+func protectedHistoryTool(toolName string) bool {
+	return compaction.ProtectedTool(toolName) || toolName == tool.ExpandToolName
 }
 
 // scoresComplete reports whether scores answers every id in items — the

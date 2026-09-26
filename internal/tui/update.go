@@ -1802,10 +1802,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.updateViewport()
 			}
 			// JEV auto-compaction trigger — the same flow as
-			// /jev-compact-context, fired when the focused agent's just-updated
-			// usage crosses the configured share of the context window.
-			if event.ID == m.Focused.ID() {
-				autoCompactCmd = m.maybeJevAutoCompact(s)
+			// /jev-compact-context, fired when the ROOT agent's just-updated
+			// usage crosses the configured share of the context window,
+			// regardless of which agent is focused: the compaction pass
+			// always rewrites the root session's history, so only root
+			// usage can drive the trigger (a focused subagent's usage
+			// crossing is its own context, never compacted here).
+			if event.ID == m.Root.ID() {
+				autoCompactCmd = m.maybeJevAutoCompact(m.GetAgentState(m.Root.ID()))
 			}
 		case common.StatusEvent:
 			switch event.Status {
@@ -2032,34 +2036,39 @@ func (m *Model) startCompaction() tea.Cmd {
 const autocompactRearmPoints = 9
 
 // maybeJevAutoCompact returns the tea.Cmd that runs one full-history
-// compaction pass when the focused agent's usage has crossed the configured
+// compaction pass when the ROOT agent's usage has crossed the configured
 // percentage (config jev-autocompact + jev-autocompact-percent, default 99)
-// of the context window — the same m.Focused.MaxTokens() source the info
-// bar's context bar uses. The percent keys off the watched (focused) agent's
-// model, not the root's: that is whose context window fills, so a per-model
-// jev-autocompact-percent override inside its models[] entry (resolved by
-// Config.AutocompactPercentForAgent through agent_models) wins over the
-// global threshold. The run is guarded by Model.CompactionRunning and fires
-// once per crossing: the agent is disarmed until usage falls below the
-// re-arm level or a new session starts. Without a known context size
-// (MaxTokens() <= 0) there is no threshold to cross, so the trigger skips
-// silently.
+// of the context window — the same m.Root.MaxTokens() source the info bar's
+// context bar uses. The trigger always watches the root session, whichever
+// agent is focused: the compaction pass rewrites the root session's history
+// (the Compactor runs session.CompactContext on it), so a focused
+// subagent's usage crossing must not fire it. The percent keys off the
+// watched root agent's model: that is whose context window fills, so a
+// per-model jev-autocompact-percent override inside the root's models[]
+// entry (resolved by Config.AutocompactPercentForAgent through
+// agent_models) wins over the global threshold. The run is guarded by
+// Model.CompactionRunning and fires once per crossing: the root agent is
+// disarmed until usage falls below the re-arm level or a new session
+// starts. Without a known context size (MaxTokens() <= 0) there is no
+// threshold to cross, so the trigger skips silently. s must be the root
+// agent's state (the trigger's usage source, disarm flag, and status text
+// all live there).
 func (m *Model) maybeJevAutoCompact(s *AppState) tea.Cmd {
 	if !m.JevAutocompact || m.Compactor == nil || m.CompactionRunning {
 		return nil
 	}
-	maxTokens := m.Focused.MaxTokens()
+	maxTokens := m.Root.MaxTokens()
 	if maxTokens <= 0 {
 		// Unknown context size (client.ContextSize -1, or unlimited): the
 		// threshold is undefined — skip silently.
 		return nil
 	}
 	// The global percent (validated at startup by ResolveAutocompact) is the
-	// fallback; the focused agent's model entry can override it. A nil
+	// fallback; the root agent's model entry can override it. A nil
 	// AppConfig has no model registry, so only the global applies there.
 	percent := m.JevAutocompactPercent
 	if m.AppConfig != nil {
-		percent = m.AppConfig.AutocompactPercentForAgent(agentTypeForID(m.Focused.ID()), m.JevAutocompactPercent)
+		percent = m.AppConfig.AutocompactPercentForAgent(agentTypeForID(m.Root.ID()), m.JevAutocompactPercent)
 	}
 	if percent <= 0 || percent > 100 {
 		percent = config.DefaultJevAutocompactPercent
