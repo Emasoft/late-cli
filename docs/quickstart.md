@@ -211,6 +211,7 @@ The elide decision runs through the reference pipeline's gate (defaults mirror `
 * `compaction-max-elide-percent` (default `70`, range 1–100) — the tripwire: when the scorer wants to elide more than this share of a tool output's tokens, it is distrusted and NOTHING is elided for that output (recorded in the result and the shadow log).
 * `compaction-protected-floor` (default `5`, range 1–100) — stacktrace and diff segments are only elided below this score, whatever the normal threshold: a dropped hunk or trace silently corrupts everything built on top of it.
 * The token min-gate (fixed 400 tokens) skips scoring entirely for outputs below the floor — the round trip costs more than any possible elision saves.
+* History compaction (`/jev-compact-context`, the auto-trigger, and the 413 recovery pass) honors the same protections: the same keep threshold and protected-kind floors, with the max-elide-fraction tripwire applied per message (a tripped message keeps everything).
 
 ### Preflight and replay (`-check-compaction`, `-replay-shadow`)
 
