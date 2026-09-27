@@ -168,7 +168,10 @@ func (m *Model) inputView() string {
 
 	s := m.GetAgentState(m.Focused.ID())
 	if s.State == StateThinking || s.State == StateStreaming || showPluginAction {
-		outerStyle = outerStyle.BorderForeground(activeBorder)
+		ms := float64(time.Now().UnixNano()) / 1e6
+		pulse := (math.Sin(ms/250.0) + 1.0) / 2.0
+		borderGrad := lipgloss.Blend1D(100, lipgloss.Color("#232329"), lipgloss.Color("#62B3D5"))
+		outerStyle = outerStyle.BorderForeground(borderGrad[int(pulse*99)])
 	} else if s.State == StateConfirmTool {
 		outerStyle = outerStyle.BorderForeground(warnBorderColor)
 	}
