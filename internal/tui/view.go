@@ -506,7 +506,7 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 
 func formatAgentBreadcrumb(id string) string {
 	if id == "" || id == common.MainAgentID || id == "main" {
-		return "main"
+		return "orchestrator"
 	}
 	if strings.Contains(id, "-subagent-") {
 		parts := strings.SplitN(id, "-subagent-", 2)
@@ -602,11 +602,21 @@ func (m *Model) statusBarView() string {
 	}
 	leftItems = append(leftItems, statePart)
 
-	// Focused agent label: always name the focused agent. The root agent has no
-	// breadcrumb chain, so without this the status bar showed no agent name or
-	// type at all for the orchestrator. A focused subagent is covered by its
-	// breadcrumb chain instead (no duplicate label).
-	if m.Focused != nil && len(pathParts) <= 1 {
+	// Agent identity: full breadcrumb chain when focused on a subagent, or single
+	// focused-agent label for the root orchestrator. Always anchored in slot 2.
+	if len(pathParts) > 1 {
+		var styledParts []string
+		for i, id := range pathParts {
+			label := formatAgentBreadcrumb(id)
+			if i == len(pathParts)-1 {
+				styledParts = append(styledParts, breadcrumbActiveAgentStyle.Render(label))
+			} else {
+				styledParts = append(styledParts, breadcrumbAgentStyle.Render(label))
+			}
+		}
+		breadcrumbContent := strings.Join(styledParts, breadcrumbSeparatorStyle.Render(" › "))
+		leftItems = append(leftItems, breadcrumbContent)
+	} else if m.Focused != nil {
 		id := m.Focused.ID()
 		isRoot := m.Focused == m.Root || (m.Root != nil && id == m.Root.ID())
 		label := agentTypeForID(id)
@@ -632,22 +642,6 @@ func (m *Model) statusBarView() string {
 			repoPart := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor).Render(display)
 			leftItems = append(leftItems, repoPart)
 		}
-	}
-
-	// Breadcrumbs (on the left, shown when focused on a subagent); the path
-	// parts are computed above alongside the focused-agent label.
-	if len(pathParts) > 1 {
-		var styledParts []string
-		for i, id := range pathParts {
-			label := formatAgentBreadcrumb(id)
-			if i == len(pathParts)-1 {
-				styledParts = append(styledParts, breadcrumbActiveAgentStyle.Render(label))
-			} else {
-				styledParts = append(styledParts, breadcrumbAgentStyle.Render(label))
-			}
-		}
-		breadcrumbContent := strings.Join(styledParts, breadcrumbSeparatorStyle.Render(" › "))
-		leftItems = append(leftItems, breadcrumbContent)
 	}
 
 	leftSection := strings.Join(leftItems, "  ")

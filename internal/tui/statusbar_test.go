@@ -66,12 +66,12 @@ func TestStatusBarSubagentFocusUsesBreadcrumbsWithoutDuplicateLabel(t *testing.T
 	if n := strings.Count(plain, "coder"); n != 1 {
 		t.Fatalf("focused subagent type should appear exactly once via breadcrumbs, got %d occurrences in %q", n, plain)
 	}
-	if !strings.Contains(plain, "main › coder #0") {
+	if !strings.Contains(plain, "orchestrator › coder #0") {
 		t.Errorf("expected breadcrumb chain in %q", plain)
 	}
-	// The root label must not leak in next to the breadcrumbs.
-	if strings.Contains(plain, "orchestrator") {
-		t.Errorf("root label should not appear when a subagent is focused: %q", plain)
+	// The root label appears once as the breadcrumb root, without a duplicate standalone label.
+	if n := strings.Count(plain, "orchestrator"); n != 1 {
+		t.Errorf("orchestrator should appear exactly once in breadcrumbs, got %d occurrences in %q", n, plain)
 	}
 }
 
@@ -102,5 +102,42 @@ func TestStatusBarUnresolvableAgentFallsBackToRawID(t *testing.T) {
 
 	if !strings.Contains(plain, "subagent-9") {
 		t.Fatalf("expected raw focused ID fallback in %q", plain)
+	}
+}
+
+func TestStatusBarBranchAfterAgentIdentity(t *testing.T) {
+	root := &focusTestOrchestrator{id: common.MainAgentID}
+	child := &focusTestOrchestrator{id: "coder-subagent-0", parent: root}
+
+	mRoot := newStatusBarModel(t, root)
+	mRoot.ShowCWD = true
+	mRoot.GitBranch = "feat/ux-polish"
+
+	mChild := newStatusBarModel(t, root)
+	mChild.Focused = child
+	mChild.ShowCWD = true
+	mChild.GitBranch = "feat/ux-polish"
+
+	rootPlain := ansi.Strip(mRoot.statusBarView())
+	childPlain := ansi.Strip(mChild.statusBarView())
+
+	if !strings.Contains(rootPlain, "⎇ feat/ux-polish") {
+		t.Errorf("root status bar missing git branch: %q", rootPlain)
+	}
+	if !strings.Contains(childPlain, "⎇ feat/ux-polish") {
+		t.Errorf("subagent status bar missing git branch: %q", childPlain)
+	}
+
+	// In both cases, branch appears after the agent identity on the left
+	rootOrchIdx := strings.Index(rootPlain, "orchestrator")
+	rootBranchIdx := strings.Index(rootPlain, "⎇ feat/ux-polish")
+	if rootOrchIdx == -1 || rootBranchIdx == -1 || rootOrchIdx >= rootBranchIdx {
+		t.Errorf("expected orchestrator before branch in root view: %q", rootPlain)
+	}
+
+	childCrumbIdx := strings.Index(childPlain, "orchestrator › coder #0")
+	childBranchIdx := strings.Index(childPlain, "⎇ feat/ux-polish")
+	if childCrumbIdx == -1 || childBranchIdx == -1 || childCrumbIdx >= childBranchIdx {
+		t.Errorf("expected breadcrumbs before branch in child view: %q", childPlain)
 	}
 }

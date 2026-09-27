@@ -177,7 +177,7 @@ var (
 				Background(appBgColor)
 
 	breadcrumbActiveAgentStyle = lipgloss.NewStyle().
-					Foreground(textColor).
+					Foreground(primaryColor).
 					Bold(true).
 					Background(appBgColor)
 )
