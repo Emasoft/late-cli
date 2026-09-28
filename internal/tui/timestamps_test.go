@@ -89,10 +89,11 @@ func renderBlockForIndex(s *AppState, index int) *RenderBlock {
 // the persisted config.json value.
 func TestTimestampsTogglePersistsToConfig(t *testing.T) {
 	// The /timestamps toggle persists via config.SaveConfig, so isolate the
-	// config.json write into a temp dir. These two stanzas are inlined from
-	// infobar_test.go's setUserConfigEnv/pressEnter helpers to keep the
-	// package-level test-helper namespace collision-free across the two
-	// single-feature branches.
+	// config.json write into a temp dir, mirroring the config package's own
+	// test helpers, and drive the slash command with a synthetic Enter
+	// keypress. These stanzas are inlined rather than extracted into
+	// package-level helpers to keep the shared test-helper namespace free
+	// for the other single-feature PRs.
 	configRoot := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configRoot)
 	t.Setenv("APPDATA", configRoot)
