@@ -2,14 +2,14 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"late/internal/client"
 	"late/internal/common"
 	"late/internal/session"
+	"late/internal/tool"
 	"net/http"
 	"net/http/httptest"
-	"late/internal/tool"
 	"os"
 	"path/filepath"
 	"sync"
@@ -277,6 +277,15 @@ func TestNextChildIDPersistsSequenceForResume(t *testing.T) {
 }
 
 func TestBaseOrchestrator_Execute_EmptyTextDoesNotAddMessage(t *testing.T) {
+	// Execute's run loop commits via AddAssistantMessageWithTools →
+	// saveAndNotify → UpdateSessionMetadata, which writes the .meta.json
+	// sidecar into the global sessions dir. Redirect it so nothing leaves
+	// the temp dir.
+	tmpDir := t.TempDir()
+	originalSessionDir := session.SessionDir
+	session.SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -284,7 +293,6 @@ func TestBaseOrchestrator_Execute_EmptyTextDoesNotAddMessage(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	tmpDir := t.TempDir()
 	historyPath := filepath.Join(tmpDir, "session.json")
 	initial := []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("initial goal")},
@@ -370,6 +378,15 @@ func TestBaseOrchestrator_CancelClearsQueuedMessages(t *testing.T) {
 }
 
 func TestBaseOrchestrator_CancelDuringRunDoesNotCommitQueuedMessages(t *testing.T) {
+	// The "turn 1" submit runs a full turn: AddUserMessage + the run-loop's
+	// AddAssistantMessageWithTools both persist via saveAndNotify →
+	// UpdateSessionMetadata, writing the .meta.json sidecar into the global
+	// sessions dir. Redirect it so nothing leaves the temp dir.
+	tmpDir := t.TempDir()
+	originalSessionDir := session.SessionDir
+	session.SessionDir = func() (string, error) { return tmpDir, nil }
+	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+
 	// Setup a server that holds the connection until cancelled
 	holdCh := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -381,7 +398,6 @@ func TestBaseOrchestrator_CancelDuringRunDoesNotCommitQueuedMessages(t *testing.
 	defer ts.Close()
 	defer close(holdCh)
 
-	tmpDir := t.TempDir()
 	historyPath := filepath.Join(tmpDir, "session.json")
 	c := client.NewClient(client.Config{BaseURL: ts.URL})
 	sess := session.New(c, historyPath, nil, "", false)

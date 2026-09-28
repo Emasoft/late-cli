@@ -2,7 +2,7 @@
 
 # Project variables
 BINARY_NAME=late
-VERSION?=2.0.0-rc.1
+VERSION?=2.0.0
 
 # Go compiler flags. Commit/build-number/build-date stamping: when git is
 # unavailable (tarball checkout, no repo) the commit and build number
