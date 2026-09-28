@@ -148,15 +148,6 @@ func TestInfoBarToggleReservesLayoutRow(t *testing.T) {
 	}
 }
 
-// typedOrchestrator lets a test focus a subagent-style ID ("<type>-subagent-n")
-// so the config.AgentModels lookup path is exercised.
-type typedOrchestrator struct {
-	mockOrchestrator
-	id string
-}
-
-func (m *typedOrchestrator) ID() string { return m.id }
-
 func TestInfoBarRenderContents(t *testing.T) {
 	cfg := &config.Config{
 		Models:      []config.ModelSetting{{ID: "provider-a", URL: "https://a.example/v1", Key: "k", Model: "gpt-test"}},

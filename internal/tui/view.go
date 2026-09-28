@@ -173,7 +173,10 @@ func (m *Model) inputView() string {
 
 	s := m.GetAgentState(m.Focused.ID())
 	if s.State == StateThinking || s.State == StateStreaming || showPluginAction {
-		outerStyle = outerStyle.BorderForeground(activeBorder)
+		ms := float64(time.Now().UnixNano()) / 1e6
+		pulse := (math.Sin(ms/250.0) + 1.0) / 2.0
+		borderGrad := lipgloss.Blend1D(100, lipgloss.Color("#232329"), lipgloss.Color("#62B3D5"))
+		outerStyle = outerStyle.BorderForeground(borderGrad[int(pulse*99)])
 	} else if s.State == StateConfirmTool {
 		outerStyle = outerStyle.BorderForeground(warnBorderColor)
 	}
@@ -511,7 +514,7 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 
 func formatAgentBreadcrumb(id string) string {
 	if id == "" || id == common.MainAgentID || id == "main" {
-		return "main"
+		return "orchestrator"
 	}
 	if strings.Contains(id, "-subagent-") {
 		parts := strings.SplitN(id, "-subagent-", 2)
@@ -573,6 +576,20 @@ func (m *Model) statusBarView() string {
 
 	var leftItems []string
 
+	// Breadcrumb path from the root down to the focused agent. Computed before
+	// the left-section segments are assembled: the focused-agent label below is
+	// suppressed when the full chain renders (the breadcrumbs already name the
+	// focused agent) and the breadcrumb block reuses the same parts.
+	var pathParts []string
+	curr := m.Focused
+	for curr != nil {
+		pathParts = append([]string{curr.ID()}, pathParts...)
+		curr = curr.Parent()
+	}
+	if len(pathParts) <= 1 && m.Focused != nil && m.Root != nil && m.Focused.ID() != m.Root.ID() {
+		pathParts = []string{m.Root.ID(), m.Focused.ID()}
+	}
+
 	// State (far left)
 	var statePart string
 	statusText := s.StatusText
@@ -593,6 +610,33 @@ func (m *Model) statusBarView() string {
 	}
 	leftItems = append(leftItems, statePart)
 
+	// Agent identity: full breadcrumb chain when focused on a subagent, or single
+	// focused-agent label for the root orchestrator. Always anchored in slot 2.
+	if len(pathParts) > 1 {
+		var styledParts []string
+		for i, id := range pathParts {
+			label := formatAgentBreadcrumb(id)
+			if i == len(pathParts)-1 {
+				styledParts = append(styledParts, breadcrumbActiveAgentStyle.Render(label))
+			} else {
+				styledParts = append(styledParts, breadcrumbAgentStyle.Render(label))
+			}
+		}
+		breadcrumbContent := strings.Join(styledParts, breadcrumbSeparatorStyle.Render(" › "))
+		leftItems = append(leftItems, breadcrumbContent)
+	} else if m.Focused != nil {
+		id := m.Focused.ID()
+		isRoot := m.Focused == m.Root || (m.Root != nil && id == m.Root.ID())
+		label := agentTypeForID(id)
+		if isRoot || label == "orchestrator" || id == common.MainAgentID || id == "main" {
+			label = "orchestrator"
+		} else if label == "" {
+			label = id
+		}
+		focusedAgentPart := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Background(appBgColor).Render(label)
+		leftItems = append(leftItems, focusedAgentPart)
+	}
+
 	// Branch or CWD (whisper-muted, unobtrusive context)
 	if m.ShowCWD {
 		if m.GitBranch != "" {
@@ -606,30 +650,6 @@ func (m *Model) statusBarView() string {
 			repoPart := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor).Render(display)
 			leftItems = append(leftItems, repoPart)
 		}
-	}
-
-	// Breadcrumbs (on the left, shown when focused on a subagent)
-	var pathParts []string
-	curr := m.Focused
-	for curr != nil {
-		pathParts = append([]string{curr.ID()}, pathParts...)
-		curr = curr.Parent()
-	}
-	if len(pathParts) <= 1 && m.Focused != nil && m.Root != nil && m.Focused.ID() != m.Root.ID() {
-		pathParts = []string{m.Root.ID(), m.Focused.ID()}
-	}
-	if len(pathParts) > 1 {
-		var styledParts []string
-		for i, id := range pathParts {
-			label := formatAgentBreadcrumb(id)
-			if i == len(pathParts)-1 {
-				styledParts = append(styledParts, breadcrumbActiveAgentStyle.Render(label))
-			} else {
-				styledParts = append(styledParts, breadcrumbAgentStyle.Render(label))
-			}
-		}
-		breadcrumbContent := strings.Join(styledParts, breadcrumbSeparatorStyle.Render(" › "))
-		leftItems = append(leftItems, breadcrumbContent)
 	}
 
 	leftSection := strings.Join(leftItems, "  ")

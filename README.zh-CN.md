@@ -58,8 +58,6 @@ late
 
 **手动下载二进制文件：[Linux、macOS、原生 Windows](https://github.com/mlhher/late-cli/releases)**
 
-> **预发布版本说明：** 本 README 文档描述了 **[v2.0.0-rc.1](https://github.com/mlhher/late-cli/releases/tag/v2.0.0-rc.1)**（预发布版本）中的功能特性。最新稳定版本为 **[v1.5.1](https://github.com/mlhher/late-cli/releases/tag/v1.5.1)**。这两个版本的二进制文件均可在 [GitHub Releases](https://github.com/mlhher/late-cli/releases) 获取。
-
 一个二进制文件。零配置。如果 `llama-server` 已经运行，Late 会自动发现它。
 
 📖 [**阅读快速入门指南**](./docs/quickstart.zh-CN.md)，了解持久化设置、完全自主的容器化工作流、MCP 和 Skills 配置、Git worktrees、快捷键等设置详情。
