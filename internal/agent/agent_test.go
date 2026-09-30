@@ -425,8 +425,12 @@ func TestNewSubagentOrchestrator_RejectsUnsafeParentSessionID(t *testing.T) {
 }
 
 // TestNewSubagentOrchestrator_InMemoryByDefault verifies that with
-// saveSubagentHistory=false the subagent session is fully in-memory: nothing
-// (not even a directory artifact) is written to the session directory.
+// saveSubagentHistory=false the subagent conversation itself is in-memory:
+// no child history file and no .meta.json sidecar is written. The parent
+// session's manifest DOES gain a running record (the registry is the
+// resume-critical sidecar and exists independently of conversation
+// persistence) — its sibling test pins that; this one pins that nothing
+// else leaks.
 func TestNewSubagentOrchestrator_InMemoryByDefault(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
@@ -456,10 +460,12 @@ func TestNewSubagentOrchestrator_InMemoryByDefault(t *testing.T) {
 	}
 
 	rootMetaPath := filepath.Join(tmp, "mock-session.meta.json")
+	manifestPath := filepath.Join(tmp, "mock-session", "subagents", "manifest.json")
 	for _, f := range walkRegularFiles(t, tmp) {
-		if f != rootMetaPath {
-			t.Errorf("Expected only root metadata when saveSubagentHistory=false, found: %s", f)
+		if f == rootMetaPath || f == manifestPath {
+			continue
 		}
+		t.Errorf("Expected only root metadata and the manifest when saveSubagentHistory=false, found: %s", f)
 	}
 }
 

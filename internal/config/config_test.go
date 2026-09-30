@@ -543,7 +543,7 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 	}{
 		{
 			name:            "explicit flag on wins over config off",
-			cfg:             &Config{SaveSubagentHistories: false},
+			cfg:             &Config{SaveSubagentHistories: &disabled},
 			cliExplicit:     true,
 			cliValue:        true,
 			savedPreference: &disabled,
@@ -551,7 +551,7 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 		},
 		{
 			name:            "explicit flag off wins over config on",
-			cfg:             &Config{SaveSubagentHistories: true},
+			cfg:             &Config{SaveSubagentHistories: &enabled},
 			cliExplicit:     true,
 			cliValue:        false,
 			savedPreference: &enabled,
@@ -559,36 +559,50 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 		},
 		{
 			name:            "saved preference wins over config",
-			cfg:             &Config{SaveSubagentHistories: true},
+			cfg:             &Config{SaveSubagentHistories: &enabled},
 			savedPreference: &disabled,
 			want:            false,
 		},
 		{
 			name:            "saved enabled preference wins over config",
-			cfg:             &Config{SaveSubagentHistories: false},
+			cfg:             &Config{SaveSubagentHistories: &disabled},
 			savedPreference: &enabled,
 			want:            true,
 		},
 		{
 			name:        "no flag uses config on",
-			cfg:         &Config{SaveSubagentHistories: true},
+			cfg:         &Config{SaveSubagentHistories: &enabled},
 			cliExplicit: false,
 			cliValue:    false,
 			want:        true,
 		},
 		{
 			name:        "no flag uses config off",
-			cfg:         &Config{SaveSubagentHistories: false},
+			cfg:         &Config{SaveSubagentHistories: &disabled},
 			cliExplicit: false,
 			cliValue:    false,
 			want:        false,
 		},
 		{
-			name:        "no flag and nil config defaults to off",
+			name:        "no flag and nil config defaults to on",
 			cfg:         nil,
 			cliExplicit: false,
 			cliValue:    false,
-			want:        false,
+			want:        true,
+		},
+		{
+			name:        "absent config entry defaults to on",
+			cfg:         &Config{},
+			cliExplicit: false,
+			cliValue:    false,
+			want:        true,
+		},
+		{
+			name:        "explicit null config entry defaults to on",
+			cfg:         &Config{SaveSubagentHistories: nil},
+			cliExplicit: false,
+			cliValue:    false,
+			want:        true,
 		},
 	}
 
@@ -599,6 +613,57 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadConfig_SaveSubagentHistoriesTriState pins the tri-state handling
+// of the *bool entry: absent (and null) means nil = the new ON default,
+// an explicit false disables, an explicit true enables.
+func TestLoadConfig_SaveSubagentHistoriesTriState(t *testing.T) {
+	write := func(t *testing.T, content string) *Config {
+		t.Helper()
+		configRoot := t.TempDir()
+		setUserConfigEnv(t, configRoot)
+		configPath := lateConfigPath(t)
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("absent entry is nil", func(t *testing.T) {
+		cfg := write(t, `{}`)
+		if cfg.SaveSubagentHistories != nil {
+			t.Fatalf("absent entry = %#v, want nil", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("null entry is nil", func(t *testing.T) {
+		cfg := write(t, `{"save_subagent_histories":null}`)
+		if cfg.SaveSubagentHistories != nil {
+			t.Fatalf("null entry = %#v, want nil", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("explicit false disables", func(t *testing.T) {
+		cfg := write(t, `{"save_subagent_histories":false}`)
+		if cfg.SaveSubagentHistories == nil || *cfg.SaveSubagentHistories {
+			t.Fatalf("false entry = %#v, want explicit false", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("explicit true enables", func(t *testing.T) {
+		cfg := write(t, `{"save_subagent_histories":true}`)
+		if cfg.SaveSubagentHistories == nil || !*cfg.SaveSubagentHistories {
+			t.Fatalf("true entry = %#v, want true", cfg.SaveSubagentHistories)
+		}
+	})
 }
 
 func TestConfig_GetModelForAgent(t *testing.T) {

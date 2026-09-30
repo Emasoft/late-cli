@@ -20,6 +20,15 @@ const (
 	PermissionModeUnsupervised       = "i-promise-i-have-backups-and-will-not-file-issues"
 )
 
+// DefaultSaveSubagentHistories is the save-subagent-histories default,
+// applied when neither the --save-subagent-histories flag, the saved
+// session preference, nor the config.json "save_subagent_histories" entry
+// provides a value. It is ON since the subagent manifest landed: child
+// histories (and the manifest itself) are the resume-critical record of
+// interrupted subagent work, and they only exist when a session folder
+// persists them.
+const DefaultSaveSubagentHistories = true
+
 type EnvLookup func(string) (string, bool)
 
 type OpenAISettings struct {
@@ -66,9 +75,15 @@ type Config struct {
 	LateSubagentModel   string          `json:"late_subagent_model,omitempty"`
 
 	// SaveSubagentHistories opts in to persisting subagent conversation
-	// histories under <sessions>/<session-id>/subagents/. Default false.
-	// Enable via config file or the --save-subagent-histories CLI flag.
-	SaveSubagentHistories bool `json:"save_subagent_histories,omitempty"`
+	// histories under <sessions>/<session-id>/subagents/. Default ON: an
+	// ABSENT entry (nil) resolves to true whenever a session folder exists,
+	// because the manifest needs the folder to exist for subagent persistence
+	// to be useful at resume. Disable via config file ("save_subagent_histories":
+	// false) or the --save-subagent-histories=false CLI flag; the per-session
+	// saved preference (written when the flag is passed explicitly) sits
+	// between the flag and this entry. The value is a *bool: nil means
+	// absent (the default ON), and an explicit false disables persistence.
+	SaveSubagentHistories *bool `json:"save_subagent_histories,omitempty"`
 
 	// PermissionMode selects how potentially dangerous commands are
 	// supervised. One of the PermissionMode* constants; empty means the
@@ -242,7 +257,10 @@ func ResolveSubagentSettingsWithEnv(cfg *Config, openAI OpenAISettings, lookup E
 // ResolveSaveSubagentHistories determines whether subagent history
 // persistence is enabled. Precedence: explicit CLI flag > saved session
 // preference > config file. There is intentionally no environment-variable
-// override.
+// override. The config entry is tri-state (*bool): nil (absent) means
+// the new default ON — a session folder always gets child histories and the
+// subagent manifest — while an explicit false disables persistence. The
+// built-in default is exported as DefaultSaveSubagentHistories.
 func ResolveSaveSubagentHistories(cfg *Config, cliExplicit bool, cliValue bool, savedPreference *bool) bool {
 	if cliExplicit {
 		return cliValue
@@ -250,10 +268,10 @@ func ResolveSaveSubagentHistories(cfg *Config, cliExplicit bool, cliValue bool, 
 	if savedPreference != nil {
 		return *savedPreference
 	}
-	if cfg != nil {
-		return cfg.SaveSubagentHistories
+	if cfg != nil && cfg.SaveSubagentHistories != nil {
+		return *cfg.SaveSubagentHistories
 	}
-	return false
+	return DefaultSaveSubagentHistories
 }
 
 // ResolvePermissionMode returns the effective permission mode.

@@ -28,7 +28,7 @@ func SubagentHistoryDir(sessionID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(sessionsDir, sessionID, "subagents"), nil
+	return filepath.Join(sessionsDir, sessionID, subagentsDirName), nil
 }
 
 // SubagentHistoryPath returns the full path of a subagent history file:
@@ -45,6 +45,16 @@ func SubagentHistoryPath(parentSessionID, childID string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, childID+".json"), nil
+}
+
+// SubagentManifestPath returns the full path of a session's subagent
+// manifest: <sessionsDir>/<sessionID>/subagents/manifest.json.
+func SubagentManifestPath(sessionID string) (string, error) {
+	dir, err := SubagentHistoryDir(sessionID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, manifestFileName), nil
 }
 
 // RemoveSessionFolder deletes a session's folder (containing its subagent

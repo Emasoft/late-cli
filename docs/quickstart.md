@@ -351,7 +351,7 @@ Setting `0` (or a negative value) disables stream retrying entirely. Run `late -
 | `--subagent-max-turns <n>` | Set max turns per subagent (default: 500) |
 | `--append-system-prompt "..."` | Append text to the system prompt (e.g. further instructions) |
 | `--enable-images` | Treat models as supporting images (for non llama.cpp servers) |
-| `--save-subagent-histories` | Persist subagent conversation histories to disk |
+| `--save-subagent-histories` | Persist subagent conversation histories to disk (default: on when a session folder exists) |
 | `--max-stream-retries <n>` | Max retries per LLM stream call with jittered exponential backoff (default: 10); `0` disables stream retrying. Env: `LATE_MAX_STREAM_RETRIES` |
 | `--ask-for-user-approval` | Require user approval for dangerous commands (default; overrides `config.json` `permission-mode`) |
 | `--i-promise-i-have-backups-and-will-not-file-issues` | Run every tool without user confirmation (overrides `config.json` `permission-mode`) |

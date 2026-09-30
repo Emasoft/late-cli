@@ -12,6 +12,7 @@ import (
 	"late/internal/tui"
 	"os"
 	"strings"
+	"time"
 )
 
 // NewSubagentOrchestrator creates a new BaseOrchestrator for a subagent.
@@ -134,6 +135,38 @@ func NewSubagentOrchestrator(
 
 	if err := sess.AddUserMessage(initialMsg); err != nil {
 		return nil, fmt.Errorf("failed to add initial message: %w", err)
+	}
+
+	// Manifest registration (Phase 1): the running record is written through
+	// the PARENT session. It happens AFTER the child's initial goal message
+	// is persisted above, so the recorded HistoryPath already exists on disk
+	// — an interrupted child's preserved work is always actually there.
+	//
+	// The child session itself skips metadata by design (skipMetadata in
+	// session.NewSubagentSession), so the manifest — keyed by the parent
+	// session's folder — must be reached through the parent. Only root
+	// sessions carry a session folder (the record key is derived from the
+	// history path), so an in-memory parent session is a no-op. Session is
+	// not part of common.Orchestrator; the interface assertion mirrors the
+	// SetContext one in cmd/late: if the concrete parent type ever changes,
+	// the spawn simply skips the manifest instead of failing.
+	// A failed write is NOT fatal to the spawn: losing a spawn record only
+	// degrades resume (the child keeps running and its history still lands
+	// on disk), while failing the spawn would lose the whole run over a
+	// bookkeeping hiccup.
+	if parentSession, ok := parent.(interface{ Session() *session.Session }); ok && parentSession.Session() != nil {
+		rec := session.SubagentRecord{
+			ID:          id,
+			AgentType:   agentType,
+			Goal:        goal,
+			CtxFiles:    ctxFiles,
+			Status:      session.SubagentStatusRunning,
+			SpawnedAt:   time.Now(),
+			HistoryPath: subagentHistoryPath,
+		}
+		if err := parentSession.Session().SaveSubagentRecord(rec); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to record subagent %s in the session manifest: %v\n", id, err)
+		}
 	}
 
 	// 4. Create Orchestrator
