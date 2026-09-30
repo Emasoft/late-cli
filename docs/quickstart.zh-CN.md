@@ -352,7 +352,7 @@ Late 的原生搜索工具会自动遵守你项目的 `.gitignore`，通过排�
 | `--subagent-timeout <duration>` | 单次子智能体运行的时长上限（默认：30m；`0` 表示不限制） |
 | `--append-system-prompt "..."` | 在系统 prompt 附加文本（如：额外指令） |
 | `--enable-images` | 将模型视为支持图像（适用于非 llama.cpp 的服务器） |
-| `--save-subagent-histories` | 将子智能体的对话记录持久化到磁盘 |
+| `--save-subagent-histories` | 将子智能体的对话记录持久化到磁盘（默认：存在会话文件夹时开启） |
 | `--max-stream-retries <n>` | 每次 LLM 流式调用的最大重试次数，采用叠加抖动的指数退避（默认：10）；`0` 表示禁用流式重试。环境变量：`LATE_MAX_STREAM_RETRIES` |
 | `--ask-for-user-approval` | 要求对危险命令进行用户批准（默认值；覆盖 `config.json` 中的 `permission-mode`） |
 | `--i-promise-i-have-backups-and-will-not-file-issues` | 运行所有工具而不需要用户确认（覆盖 `config.json` 中的 `permission-mode`） |

@@ -133,7 +133,7 @@ func main() {
 	// account-level concurrency limit (429s).
 	maxConcurrentLLM := flag.Int("max-concurrent-llm-requests", appconfig.DefaultMaxConcurrentLLMRequests, "Process-wide cap on concurrent in-flight LLM requests across all agents and subagents (0 = unlimited); config.json \"max-concurrent-llm-requests\" applies unless the flag is passed")
 
-	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent histories to disk (overrides session and config).")
+	saveSubagentHistoriesReq := flag.Bool("save-subagent-histories", false, "Persist subagent histories to disk (overrides session and config). Default: on when a session folder exists.")
 	enableSqzReq := flag.Bool("enable-sqz", false, "Compress bash tool output with the external 'sqz' binary if available; config.json \"enable-sqz\" applies unless the flag is passed")
 	appendSystemPromptReq := flag.String("append-system-prompt", "", "Append this text to the final system prompt; config.json \"append-system-prompt\" applies unless the flag is passed")
 	versionReq := flag.Bool("version", false, "Print the version and exit.")
@@ -593,8 +593,11 @@ func main() {
 		}
 	}
 
-	// Resolve subagent history persistence opt-in
-	// (explicit CLI flag > saved session preference > config file).
+	// Resolve subagent history persistence
+	// (explicit CLI flag > saved session preference > config file >
+	// DefaultSaveSubagentHistories, which is ON since the subagent manifest
+	// landed: interrupted children's work only survives when the session
+	// folder persists their histories).
 	saveSubagentHistoriesCLI := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "save-subagent-histories" {
@@ -699,6 +702,17 @@ func main() {
 		sess.SetCompactionHighWater(loadedSessionMeta.CompactionHighWater)
 	} else {
 		sess.SetSubagentMetadata(0, &saveSubagentHistories)
+	}
+
+	// Manifest resume integration (Phase 1/2): close any spawn_subagent tool
+	// call left dangling by a previous late exit with a synthesized,
+	// persisted tool result built from the session manifest (running-at-exit
+	// records = "interrupted"). Persisting keeps resume idempotent: a second
+	// resume finds no dangling calls. A failure must not block resuming —
+	// the request-time sanitizer still closes the exchange — so it is logged
+	// and the session continues without the synthesized results.
+	if err := synthesizeDanglingSpawnResults(sess); err != nil {
+		common.LogErrorf("subagent-manifest", "subagent resume synthesis failed: %v", err)
 	}
 	executor.RegisterTools(sess.Registry, mainTools)
 
@@ -1461,13 +1475,32 @@ func main() {
 				if terr != nil {
 					result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
 				}
+				// Manifest terminal record (Phase 1): the parent can now see
+				// at resume time that this child ended abnormally, with the
+				// transcript preserved. Non-fatal: the transcript and the
+				// returned result above already carry the information.
+				childID := child.ID()
+				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
+					common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+				}
 				return result, nil
 			}
 
+			// Completed with the user's stop-request flag still set: the run
+			// produced a final output before the cancellation landed, but it
+			// is still a cancelled child for resume purposes.
+			childID := child.ID()
 			if child.IsStopRequested() {
-				return fmt.Sprintf("The subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res), nil
+				final := fmt.Sprintf("The subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res)
+				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {
+					common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+				}
+				return final, nil
 			}
 
+			if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCompleted, "", previewText(res, manifestResultPreviewLimit), ""); markErr != nil {
+				common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+			}
 			return fmt.Sprintf("The subagent successfully completed its task. Final result:\n\n%s", res), nil
 		}
 

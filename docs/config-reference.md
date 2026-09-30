@@ -51,7 +51,9 @@ Layered exceptions to that order:
 * `compaction-backend` — the one entry where config beats the environment: a
   set value wins over `JEV_API` / auto-detection; the environment is consulted
   only when the entry is absent.
-* `save_subagent_histories` — flag > per-session saved preference > config.
+* `save_subagent_histories` — flag > per-session saved preference > config >
+  on when a session folder exists (the default since the subagent manifest:
+  an absent entry means ON; set `false` to disable).
 * The three `permission-mode` flags are mutually exclusive: pass at most one.
 
 ## Boolean values (on/off synonyms)
@@ -233,7 +235,7 @@ equivalent; Go's flag package accepts one or two dashes (`-flag` / `--flag`).
 | `subagent_timeout` | duration-string | `"24h"` | `--subagent-timeout` | Wall-clock budget for one subagent run; `"0"` or negative = unlimited; note the underscore spelling; unparseable values warn and fall back. |
 | `subagent-idle-timeout` | duration-string | `"15m"` | `--subagent-idle-timeout` | Notify when a subagent has been truly idle (no stream progress, no in-flight tool, no nested spawn) this long; `"0"` = off. |
 | `subagent-idle-kill-after` | duration-string | `"0"` | `--subagent-idle-kill-after` | Kill a subagent that stays truly idle past this duration; `"0"` = notify only. |
-| `save_subagent_histories` | boolean-with-synonyms | `false` | `--save-subagent-histories` | Persist subagent conversation histories under `<sessions>/<session-id>/subagents/` (a per-session saved preference sits between the flag and this entry). |
+| `save_subagent_histories` | boolean-with-synonyms | `true` | `--save-subagent-histories` | Persist subagent conversation histories (plus the subagent manifest) under `<sessions>/<session-id>/subagents/`; effective whenever a session folder exists. An ABSENT entry means the default (on); an explicit `false` disables. A per-session saved preference sits between the flag and this entry. |
 
 ### System prompt
 

@@ -232,6 +232,22 @@ func lastActionPreview(msgs []client.ChatMessage, limit int) string {
 	return "no actions recorded"
 }
 
+// manifestResultPreviewLimit is how much of a completed child's final result
+// the manifest keeps (SubagentRecord.ResultPreview). The full result lives
+// in the parent history already; the preview is what resume can still show
+// when the same crash that lost the parent's tail also took it.
+const manifestResultPreviewLimit = 200
+
+// previewText clips s to limit RUNES (not bytes) so the manifest preview
+// stays readable instead of cutting a multi-byte character mid-sequence.
+func previewText(s string, limit int) string {
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + "…"
+}
+
 // clip limits s to max bytes without splitting a multi-byte rune, appending
 // a truncation marker whenever anything was cut.
 func clip(s string, max int) string {

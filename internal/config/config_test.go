@@ -652,6 +652,8 @@ func TestResolveSubagentSettings(t *testing.T) {
 func TestResolveSaveSubagentHistories(t *testing.T) {
 	enabled := true
 	disabled := false
+	flexOn := flexPtr(true)
+	flexOff := flexPtr(false)
 	tests := []struct {
 		name            string
 		cfg             *Config
@@ -662,7 +664,7 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 	}{
 		{
 			name:            "explicit flag on wins over config off",
-			cfg:             &Config{SaveSubagentHistories: false},
+			cfg:             &Config{SaveSubagentHistories: flexOff},
 			cliExplicit:     true,
 			cliValue:        true,
 			savedPreference: &disabled,
@@ -670,7 +672,7 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 		},
 		{
 			name:            "explicit flag off wins over config on",
-			cfg:             &Config{SaveSubagentHistories: true},
+			cfg:             &Config{SaveSubagentHistories: flexOn},
 			cliExplicit:     true,
 			cliValue:        false,
 			savedPreference: &enabled,
@@ -678,36 +680,50 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 		},
 		{
 			name:            "saved preference wins over config",
-			cfg:             &Config{SaveSubagentHistories: true},
+			cfg:             &Config{SaveSubagentHistories: flexOn},
 			savedPreference: &disabled,
 			want:            false,
 		},
 		{
 			name:            "saved enabled preference wins over config",
-			cfg:             &Config{SaveSubagentHistories: false},
+			cfg:             &Config{SaveSubagentHistories: flexOff},
 			savedPreference: &enabled,
 			want:            true,
 		},
 		{
 			name:        "no flag uses config on",
-			cfg:         &Config{SaveSubagentHistories: true},
+			cfg:         &Config{SaveSubagentHistories: flexOn},
 			cliExplicit: false,
 			cliValue:    false,
 			want:        true,
 		},
 		{
 			name:        "no flag uses config off",
-			cfg:         &Config{SaveSubagentHistories: false},
+			cfg:         &Config{SaveSubagentHistories: flexOff},
 			cliExplicit: false,
 			cliValue:    false,
 			want:        false,
 		},
 		{
-			name:        "no flag and nil config defaults to off",
+			name:        "no flag and nil config defaults to on",
 			cfg:         nil,
 			cliExplicit: false,
 			cliValue:    false,
-			want:        false,
+			want:        true,
+		},
+		{
+			name:        "absent config entry defaults to on",
+			cfg:         &Config{},
+			cliExplicit: false,
+			cliValue:    false,
+			want:        true,
+		},
+		{
+			name:        "explicit null config entry defaults to on",
+			cfg:         &Config{SaveSubagentHistories: nil},
+			cliExplicit: false,
+			cliValue:    false,
+			want:        true,
 		},
 	}
 
@@ -718,6 +734,77 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParseConfigContent_SaveSubagentHistoriesTriState pins the strict
+// parser's tri-state handling of the *FlexBool entry: absent (and null)
+// means nil = the new ON default, an explicit false disables, an explicit
+// true (or a synonym) enables.
+func TestParseConfigContent_SaveSubagentHistoriesTriState(t *testing.T) {
+	t.Run("absent entry is nil", func(t *testing.T) {
+		cfg, err := parseConfigContent("/x/config.json", []byte(`{}`))
+		if err != nil {
+			t.Fatalf("parseConfigContent() error = %v", err)
+		}
+		if cfg.SaveSubagentHistories != nil {
+			t.Fatalf("absent entry = %#v, want nil", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("null entry is nil", func(t *testing.T) {
+		cfg, err := parseConfigContent("/x/config.json", []byte(`{"save_subagent_histories":null}`))
+		if err != nil {
+			t.Fatalf("parseConfigContent() error = %v", err)
+		}
+		if cfg.SaveSubagentHistories != nil {
+			t.Fatalf("null entry = %#v, want nil", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("explicit false disables", func(t *testing.T) {
+		cfg, err := parseConfigContent("/x/config.json", []byte(`{"save_subagent_histories":false}`))
+		if err != nil {
+			t.Fatalf("parseConfigContent() error = %v", err)
+		}
+		if cfg.SaveSubagentHistories == nil || cfg.SaveSubagentHistories.Bool() {
+			t.Fatalf("false entry = %#v, want explicit false", cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("synonym true enables", func(t *testing.T) {
+		cfg, err := parseConfigContent("/x/config.json", []byte(`{"save_subagent_histories":"on"}`))
+		if err != nil {
+			t.Fatalf("parseConfigContent() error = %v", err)
+		}
+		if cfg.SaveSubagentHistories == nil || !cfg.SaveSubagentHistories.Bool() {
+			t.Fatalf(`"on" entry = %#v, want true`, cfg.SaveSubagentHistories)
+		}
+	})
+
+	t.Run("invalid value still rejected", func(t *testing.T) {
+		_, err := parseConfigContent("/x/config.json", []byte(`{"save_subagent_histories":"actve"}`))
+		if err == nil {
+			t.Fatal("expected an invalid boolean error")
+		}
+	})
+
+	t.Run("marshals back to plain literal", func(t *testing.T) {
+		cfg, err := parseConfigContent("/x/config.json", []byte(`{"save_subagent_histories":"yes"}`))
+		if err != nil {
+			t.Fatalf("parseConfigContent() error = %v", err)
+		}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("Marshal() error = %v", err)
+		}
+		var canonical map[string]any
+		if err := json.Unmarshal(data, &canonical); err != nil {
+			t.Fatalf("re-Unmarshal() error = %v", err)
+		}
+		if canonical["save_subagent_histories"] != true {
+			t.Fatalf("re-marshaled entry = %#v, want a plain true literal", canonical["save_subagent_histories"])
+		}
+	})
 }
 
 func TestResolveSubagentTimeout(t *testing.T) {
