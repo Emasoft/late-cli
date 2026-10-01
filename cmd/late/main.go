@@ -446,6 +446,19 @@ func main() {
 	}
 
 	c := client.NewClient(resolvedClientConfig)
+	// An explicit context-size-tokens declaration wins over discovery: it is
+	// applied BEFORE any request (and before DiscoverBackend can run) and
+	// the client never lets a probe result clobber it. Without it the
+	// context size stays -1 for providers that never advertise their window,
+	// and the predictive compaction heuristic stays dark. Declared on the
+	// root client; the subagent client below mirrors its own routed entry.
+	if appConfig != nil {
+		if setting, ok := appConfig.GetModelForAgent("orchestrator"); ok {
+			if ctxSize, ok := setting.ContextSizeOverride(); ok {
+				c.SetContextSize(ctxSize)
+			}
+		}
+	}
 
 	// Initialize Subagent Client
 	subagentClient := c
@@ -461,6 +474,13 @@ func main() {
 			LogitBias:    explicitSubagentLogitBias,
 			AppVersion:   common.Version,
 		})
+		if appConfig != nil {
+			if setting, ok := appConfig.GetModelForAgent("subagent"); ok {
+				if ctxSize, ok := setting.ContextSizeOverride(); ok {
+					subagentClient.SetContextSize(ctxSize)
+				}
+			}
+		}
 	}
 
 	// Flag overrides
@@ -571,6 +591,26 @@ func main() {
 
 	// Create root orchestrator
 	// We'll add middlewares later once the program is started
+	// Context-exhaustion safeguard (Phase B): install the executor's
+	// programmatic compaction hook so a stream request the provider rejects
+	// (or truncates) for context exhaustion is recovered in-process — the
+	// executor compacts the ROOT session's history and retries the request,
+	// instead of surfacing the deterministic failure to the user.
+	//
+	// Upstream main has no history-compaction pipeline yet (see the
+	// compaction PR): there is nothing here that can shrink history, so the
+	// hook is installed as a typed failure. The executor's detection, the
+	// no-retry-waste classification, the finish_reason=length discriminator,
+	// and the guidance surface are all live; only the automatic SHRINK is
+	// inert, and the surfaced error says exactly why ("auto-compaction
+	// unavailable") instead of a bare failure. The compaction PR replaces
+	// this closure with one wrapping the history runner (mutating mode
+	// only), and recovery starts working with no executor change.
+	// Process-wide like every executor hook (root + subagents share it).
+	executor.SetContextCompactor(func(ctx context.Context) (executor.CompactionReport, error) {
+		return executor.CompactionReport{}, executor.ErrCompactionUnavailable
+	})
+
 	rootAgent := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
 
 	model := tui.NewModel(rootAgent, renderer, appConfig)
@@ -797,6 +837,14 @@ func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableI
 		LogitBias:    logitBias,
 		AppVersion:   common.Version,
 	})
+	// An explicit context-size-tokens declaration must be applied BEFORE
+	// DiscoverBackend: the setter marks the value explicit, so discovery
+	// still identifies the backend but never overwrites the declared
+	// window. Applied after the (harmless) constructor either way — the
+	// guard inside DiscoverBackend makes the ordering race-free.
+	if ctxSize, ok := setting.ContextSizeOverride(); ok {
+		c.SetContextSize(ctxSize)
+	}
 	c.DiscoverBackend(ctx)
 	return c
 }
