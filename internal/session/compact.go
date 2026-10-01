@@ -351,6 +351,24 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	// mark — every completed mutating walk covered the history below it, so
 	// those bytes are the prompt-cache anchor — and only grows to the
 	// count-based floor, never shrinks.
+	//
+	// Concurrency: the whole history walk is serialized against concurrent
+	// appenders (appendMessage holds historyMu for the slice write) by
+	// holding historyMu for the walk's read AND write sections. msg is an
+	// in-place pointer into the shared slice (msg.Content is swapped inside
+	// the loop), so a concurrent append growing the slice could otherwise
+	// reallocate the backing array mid-walk and race the write. The walk
+	// runs once per compaction call (not per request), so the held lock
+	// blocks appends for scorer round trips — the correctness requirement
+	// wins; concurrent runs simply wait. The pre-walk metadata (mark, frozen
+	// floor, start length, token totals, task) is snapshotted under the same
+	// lock so report numbers and the walk bound come from one consistent
+	// history state. Persistence (history save, high-water sidecar) happens
+	// OUTSIDE the lock in the callers (SaveHistory on sess.HistoryPath is
+	// the caller's job; UpdateCompactionHighWater takes compactionMu only).
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+
 	mark := s.CompactionHighWater()
 	if mark > len(s.History) {
 		// The mark outlives the history it froze (a stale sidecar over a

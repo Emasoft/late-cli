@@ -57,13 +57,18 @@ const (
 )
 
 type Client struct {
-	mu             sync.RWMutex
-	cfg            Config
-	httpClient     *http.Client
-	backend        BackendType
-	ctxSize        int
-	supportsVision bool
-	userAgent      string
+	mu         sync.RWMutex
+	cfg        Config
+	httpClient *http.Client
+	backend    BackendType
+	ctxSize    int
+	// explicitlySetContextSize records that ctxSize came from SetContextSize
+	// (a user-declared models[].context-size-tokens) rather than discovery,
+	// so DiscoverBackend/RefreshContextSize never overwrite it with a probe
+	// result — the explicit declaration wins for the process lifetime.
+	explicitlySetContextSize bool
+	supportsVision           bool
+	userAgent                string
 }
 
 func NewClient(cfg Config) *Client {
@@ -549,7 +554,11 @@ func (c *Client) RefreshContextSize(ctx context.Context) {
 
 	if newCtxSize > 0 {
 		c.mu.Lock()
-		c.ctxSize = newCtxSize
+		// An explicit context-size-tokens declaration wins over re-probing:
+		// see SetContextSize.
+		if !c.explicitlySetContextSize {
+			c.ctxSize = newCtxSize
+		}
 		c.mu.Unlock()
 	}
 }
@@ -633,7 +642,9 @@ func (c *Client) DiscoverBackend(ctx context.Context) BackendType {
 
 	c.mu.Lock()
 	c.backend = discoveredBackend
-	if discoveredCtxSize > 0 {
+	if discoveredCtxSize > 0 && !c.explicitlySetContextSize {
+		// An explicit context-size-tokens declaration wins over discovery:
+		// see SetContextSize. The discovered value is discarded, not stored.
 		c.ctxSize = discoveredCtxSize
 	}
 	if discoveredSupportsVision {
@@ -770,6 +781,38 @@ func (c *Client) ContextSize() int {
 	return c.ctxSize
 }
 
+// SetContextSize sets the context window to an explicitly configured value
+// (config.json models[].context-size-tokens) BEFORE any discovery ran:
+// llama.cpp backends can auto-discover n_ctx, but other providers (or
+// truncating local gateways) never advertise it, and the -1 default would
+// keep the predictive compaction heuristic and the finish_reason=length
+// discriminator dark forever. The value is stored under the
+// explicitlySetContextSize flag, so DiscoverBackend and RefreshContextSize
+// never clobber it with a probe result (possibly stale, possibly about a
+// different loaded model): the user's declaration wins for the process
+// lifetime. Zero or negative values are ignored — they cannot describe a
+// real window, and ignoring them keeps SetContextSize(0) from silently
+// un-setting a discovered value.
+func (c *Client) SetContextSize(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ctxSize = n
+	c.explicitlySetContextSize = true
+}
+
+// IsContextSizeExplicit reports whether the context window came from
+// SetContextSize (an explicit models[].context-size-tokens declaration)
+// rather than from backend discovery. Tests use it to pin the
+// discovery-does-not-clobber invariant.
+func (c *Client) IsContextSizeExplicit() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.explicitlySetContextSize
+}
+
 func (c *Client) IsLlamaCPP() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -875,6 +918,105 @@ func (e *PayloadTooLargeError) Unwrap() []error {
 	return []error{ErrPayloadTooLarge, e.Status}
 }
 
+// ErrContextExceeded is the stable sentinel carried by every API error whose
+// status AND body identify deterministic context exhaustion: the conversation
+// (history + tools + system prompt) does not fit the model's context window,
+// so resending the identical request can never succeed — the same fail-fast
+// contract as ErrPayloadTooLarge, at the token level instead of the byte
+// level. Unlike a 413 (the BODY was too big), the conversation can shrink:
+// the executor's context guard runs the session compactor and retries once,
+// so the error is terminal for the retry tiers but recoverable for the run.
+// Callers classify with errors.Is anywhere in the wrap chain.
+var ErrContextExceeded = errors.New("context exceeded")
+
+// ContextExceededGuidance is the actionable message rendered for
+// context-exhaustion failures. When no compactor is installed (or a run
+// freed nothing) the executor surfaces this text verbatim; the TUI mirrors
+// it in the transcript's context-limit card.
+const ContextExceededGuidance = "the conversation exceeded this model's context window: late auto-compacted the history and retried, but the request still does not fit — free more context with /jev-compact-context (consider raising compaction-threshold in config.json) or start a new session with /new"
+
+// contextExceededPatterns are the provider error signatures for deterministic
+// context exhaustion, matched case-insensitively as substrings of the error
+// body: OpenAI's "context_length_exceeded" code, Anthropic's "prompt is too
+// long"/"maximum context length", llama.cpp/Ollama's "context window"/
+// "context size", Gemini's "input token count exceeds", DeepSeek's
+// "reduce the length of the messages", and the generic "too many tokens".
+var contextExceededPatterns = []string{
+	"context_length_exceeded",
+	"maximum context length",
+	"context window",
+	"too many tokens",
+	"input length exceeds",
+	"context size",
+	"reduce the length",
+}
+
+// isContextExceededBody reports whether a provider error body names context
+// exhaustion. Matching is a case-insensitive substring scan over the
+// (already bounded and sanitized) body text — the bodies are short, so the
+// linear scan costs nothing compared to the network round trip.
+func isContextExceededBody(body string) bool {
+	if body == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, pattern := range contextExceededPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// ContextExceededError marks an API response as deterministic context
+// exhaustion. It wraps the underlying StatusError so errors.As still recovers
+// the status/body/code details, and it carries ErrContextExceeded so
+// errors.Is classifies it anywhere in the executor's "stream error: %w" wrap
+// chain. Its Error text is the actionable guidance (what happened and the
+// recovery steps), with the provider's raw body appended for diagnostics.
+type ContextExceededError struct {
+	Status *StatusError
+	// Reason names the detection path for diagnostics ("http 400", "http
+	// 413", "finish_reason=length"). It is bookkeeping, not rendered text.
+	Reason string
+}
+
+func (e *ContextExceededError) Error() string {
+	if e.Status != nil && e.Status.Body != "" {
+		return ContextExceededGuidance + " (provider: " + e.Status.Body + ")"
+	}
+	return ContextExceededGuidance
+}
+
+// Unwrap exposes both the sentinel (for errors.Is classification) and the
+// underlying StatusError (for errors.As recovery of StatusCode/Body/Type).
+func (e *ContextExceededError) Unwrap() []error {
+	return []error{ErrContextExceeded, e.Status}
+}
+
+// statusReportsContextExhaustion decides whether a non-200 response is
+// deterministic context exhaustion. Status-only matching is deliberately
+// narrow: a bare 400/413 says nothing about WHY the request was rejected
+// (OpenAI returns 400 for malformed tool arguments too), so the provider's
+// body must name the limit. The one status-level special case is 429 whose
+// error CODE is OpenAI's "context_length_exceeded" string: rate-limit
+// status, body-level meaning — throttled requests carry a Retry-After and
+// pace on the throttle tier, this one is a hard failure and must not spin
+// the 200-retry throttle budget on a request that can never fit.
+func statusReportsContextExhaustion(status int, body string, code any) bool {
+	if isContextExceededBody(body) {
+		switch status {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests:
+			return true
+		}
+		return false
+	}
+	if status == http.StatusTooManyRequests && code != nil && strings.Contains(strings.ToLower(fmt.Sprint(code)), "context_length_exceeded") {
+		return true
+	}
+	return false
+}
+
 // StreamInterruptedError reports a transport failure while reading a
 // 200-OK response body mid-stream: connection reset, HTTP/2 RST_STREAM
 // or GOAWAY, truncated body. The server already accepted the request,
@@ -943,6 +1085,16 @@ func (c *Client) formatError(resp *http.Response) error {
 	// the provider's limit, so the error carries the ErrPayloadTooLarge
 	// sentinel and the actionable guidance instead of the generic status
 	// line. RetryAfter stays parsed (harmless: no retry tier consumes a 413).
+	// Body-level context-exhaustion detection runs FIRST: a 413 whose body
+	// names the token limit (e.g. a gateway mapping the token verdict onto
+	// HTTP 413) is context exhaustion, not a byte-size rejection, and the
+	// two sentinels drive different recovery (compaction+retry vs. manual).
+	if statusReportsContextExhaustion(resp.StatusCode, se.Body, se.Code) {
+		return &ContextExceededError{
+			Status: se,
+			Reason: "http " + strconv.Itoa(resp.StatusCode),
+		}
+	}
 	if resp.StatusCode == http.StatusRequestEntityTooLarge {
 		return &PayloadTooLargeError{Status: se}
 	}

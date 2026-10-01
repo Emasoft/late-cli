@@ -306,7 +306,7 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			// any printable rune in it is typing, so release on the first.
 			if press, ok := keyMsg.(tea.KeyPressMsg); ok &&
 				press.Mod&(tea.ModCtrl|tea.ModAlt|tea.ModMeta|tea.ModHyper|tea.ModSuper) == 0 {
-				for _, r := range []rune(press.Text) {
+				for _, r := range press.Text {
 					if !unicode.IsControl(r) {
 						m.TodoPaneFocused = false
 						break
@@ -1746,6 +1746,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		// payloadToastCmd surfaces the 413 payload-too-large guidance as a
 		// warning toast (the error box already carries the full text).
 		var payloadToastCmd tea.Cmd
+		// contextExceededToastCmd surfaces the context-exhaustion guidance —
+		// including the executor guard's compaction outcome ("auto-compacted
+		// (saved ~N tokens), retrying" or the unavailable/failed wording) —
+		// as a warning toast. No TUI-side compaction runs here: the
+		// executor's guard already did (or could not do) the work.
+		var contextExceededToastCmd tea.Cmd
 		// payloadRecoveryCmd runs the one-shot 413 recovery compaction (see
 		// maybePayloadRecoveryCompaction).
 		var payloadRecoveryCmd tea.Cmd
@@ -1875,6 +1881,24 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 							payloadRecoveryCmd = m.maybePayloadRecoveryCompaction(s)
 						}
 					}
+					// Context exhaustion (Phase B): the executor's guard
+					// already ran its compaction rounds before this event
+					// surfaced, so nothing is recovered here — but the
+					// error text carries the compaction outcome ("context
+					// limit hit — auto-compacted (saved ~N tokens), …" or
+					// the unavailable/failed wording) and the transcript
+					// error branch renders the dedicated context-limit
+					// card from it. Keep the warning toast for visibility.
+					if errors.Is(event.Error, client.ErrContextExceeded) {
+						eventError := event.Error
+						contextExceededToastCmd = func() tea.Msg {
+							return ToastMsg{
+								Text:     eventError.Error(),
+								Warning:  true,
+								Duration: 8 * time.Second,
+							}
+						}
+					}
 				}
 				// A turn that ended in error must not produce a recovery
 				// toast on the next turn.
@@ -1897,9 +1921,24 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.Transcript.busy = false
 			s.State = StateThinking
 			// The failure class decides the verb: an HTTP 400 is the API
-			// rejecting the request body, not a lost connection.
+			// rejecting the request body, not a lost connection. Context
+			// exhaustion is its own verb — the executor guard compacted
+			// history and the retry is immediate (event.Delay 0); the
+			// wrapped outcome ("… auto-compacted (saved ~N tokens) …")
+			// replaces the generic backoff tail.
 			retryVerb := retryVerbConnectionLost
 			var retryStatusErr *client.StatusError
+			if errors.Is(event.Err, client.ErrContextExceeded) {
+				retryVerb = strings.TrimSpace(strings.TrimPrefix(event.Err.Error(), client.ContextExceededGuidance))
+				s.StatusText = fmt.Sprintf("%s — retrying", retryVerb)
+				s.StreamingStyledCache = ""
+				s.StreamingChunkCount = 0
+				s.RetryVerb = retryVerbContextCompacted
+				if event.ID == m.Focused.ID() {
+					m.updateViewport()
+				}
+				break
+			}
 			if errors.As(event.Err, &retryStatusErr) && retryStatusErr.StatusCode == http.StatusBadRequest {
 				retryVerb = retryVerbRejectedByAPI
 			}
@@ -1924,11 +1963,16 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.State = StateThinking
 			if s.RetryVerb != "" {
 				s.StatusText = ""
-				if s.RetryVerb == retryVerbRejectedByAPI {
+				switch s.RetryVerb {
+				case retryVerbRejectedByAPI:
 					restoredToast = func() tea.Msg {
 						return ToastMsg{Text: "request accepted after retry", Duration: 2 * time.Second}
 					}
-				} else {
+				case retryVerbContextCompacted:
+					restoredToast = func() tea.Msg {
+						return ToastMsg{Text: "request accepted after context compaction", Duration: 2 * time.Second}
+					}
+				default:
 					restoredToast = func() tea.Msg {
 						return ToastMsg{Text: "connection regained", Duration: 2 * time.Second}
 					}
@@ -1995,6 +2039,9 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		if payloadToastCmd != nil {
 			eventCmds = append(eventCmds, payloadToastCmd)
+		}
+		if contextExceededToastCmd != nil {
+			eventCmds = append(eventCmds, contextExceededToastCmd)
 		}
 		if len(eventCmds) > 0 {
 			return m, tea.Batch(eventCmds...)

@@ -452,6 +452,7 @@ var knownModelEntryKeys = map[string]bool{
 	"key":                     true,
 	"model":                   true,
 	"jev-autocompact-percent": true,
+	"context-size-tokens":     true,
 }
 
 // lastEntryByKey returns the last recorded top-level entry with the given
