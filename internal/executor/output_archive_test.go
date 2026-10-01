@@ -181,8 +181,7 @@ func TestOutputArchiveRefusesUnsafeSessionID(t *testing.T) {
 }
 
 // TestMaybeArchiveToolResultGuards pins the archiver guards: nil archiver,
-// the size threshold (archive strictly above it), and the expand-tool
-// exemption.
+// and the size threshold (archive strictly above it).
 func TestMaybeArchiveToolResultGuards(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "tool-outputs")
 	a, err := session.NewOutputArchive(dir)
