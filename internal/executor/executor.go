@@ -98,6 +98,69 @@ func SetToolResultCompactor(c ToolResultCompactor) {
 	toolResultCompactor = c
 }
 
+// ArchiveThresholdChars is the tool-result size above which ExecuteToolCalls
+// archives the full output to disk and replaces it in history with the
+// compact reference form (session.FormatReference). Results at or under the
+// threshold enter history inline, unchanged. Deliberately lower than
+// MinCompactToolResultChars: archiving is local and free, so it casts a
+// wider net than the scoring-backed compaction stage.
+const ArchiveThresholdChars = 1024
+
+// ArchiveHeadChars is how many leading characters of the original output
+// the archived reference form keeps inline.
+const ArchiveHeadChars = 2000
+
+// toolResultArchiver is the process-wide output archive consulted by
+// ExecuteToolCalls before a tool result enters history. One archive per
+// session folder; the root agent and every subagent share the instance
+// installed for the run (mirroring SetToolResultCompactor), so a child's
+// oversized outputs land in the same session folder.
+var (
+	toolResultArchiverMu sync.RWMutex
+	toolResultArchiver   *session.OutputArchive
+)
+
+// SetToolResultArchiver installs a as the process-wide tool-output archive
+// for ExecuteToolCalls — the root agent and every subagent share it.
+// Install it once at startup (cmd/late) with the archive rooted at the
+// active session's folder. Pass nil to disable archiving.
+func SetToolResultArchiver(a *session.OutputArchive) {
+	toolResultArchiverMu.Lock()
+	defer toolResultArchiverMu.Unlock()
+	toolResultArchiver = a
+}
+
+// maybeArchiveToolResult returns the (possibly archived) form of result for
+// history: an oversized result is written to the archive and replaced by
+// the compact, deterministic reference form. Guards, in order:
+//
+//   - no archive installed → inline unchanged;
+//   - result at or under ArchiveThresholdChars → inline unchanged;
+//   - the expand tool → exempt, inline unchanged. expand exists to return
+//     originals; archiving its result would bury the very text the model
+//     asked for behind a pointer.
+//
+// Fail-open: an Archive error is logged and the full output stays inline —
+// a full-disk condition must never lose a tool result from the
+// conversation. On success the reference form (small) is what history
+// stores; the session.OutputArchive determinism contract guarantees it is
+// byte-identical for identical outputs, and it is generated once here at
+// admission and never regenerated or substituted afterward.
+func maybeArchiveToolResult(toolName, result string) string {
+	toolResultArchiverMu.RLock()
+	a := toolResultArchiver
+	toolResultArchiverMu.RUnlock()
+	if a == nil || len(result) <= ArchiveThresholdChars || toolName == tool.ExpandToolName {
+		return result
+	}
+	archived, err := a.Archive(result)
+	if err != nil {
+		common.LogErrorf("tool-archive", "failed to archive %s tool output (%d chars), keeping it inline: %v", toolName, len(result), err)
+		return result
+	}
+	return session.FormatReference(archived, result, ArchiveHeadChars)
+}
+
 // maybeCompactToolResult returns the (possibly compacted) form of result for
 // history. Fail-safe: an oversized result of the expand tool is never
 // re-compacted (expand exists to return originals — compacting them again
@@ -188,6 +251,17 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 				result = fmt.Sprintf("Error executing tool %s: %v", tc.Function.Name, err)
 			}
 		}
+		// Output archiving (stage 1 of admission): oversized results are
+		// stored on disk and replaced by the compact reference form BEFORE
+		// the compaction stage sees them. Determinism (prompt-cache
+		// stability): the reference form is generated once, here, and the
+		// bytes stored in history are final — the request renderer uses
+		// history verbatim and nothing ever substitutes the archived
+		// content back in. The small reference form then usually passes
+		// through compaction untouched (it is far below
+		// MinCompactToolResultChars), so archiving and compaction compose
+		// without double-handling the same output.
+		result = maybeArchiveToolResult(tc.Function.Name, result)
 		// Compaction (stage 2): oversized results may be relocated into the
 		// compaction store before they enter history. Shadow mode scores and
 		// logs without changing the result; off mode has no compactor
@@ -390,6 +464,10 @@ func RunLoop(
 		throttleBudget = 0
 	}
 
+	// Predictive compaction runs at most once per RunLoop invocation: see
+	// the pre-attempt heuristic inside the turn loop below.
+	predictiveCompactionDone := false
+
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -415,6 +493,13 @@ func RunLoop(
 		var acc *StreamAccumulator
 		var err error
 		infraAttempts, badBodyAttempts, throttleAttempts := 0, 0, 0
+		// contextRounds counts compaction+retry rounds taken for
+		// context-exhaustion failures in THIS turn's attempt loop — the
+		// deterministic-failure recovery path (see below), independent of
+		// the three retry tiers. Capped at maxContextCompactionRounds: two
+		// compactions that still leave the request over the limit mean the
+		// window is gone; a third compaction would not change that.
+		contextRounds := 0
 		var recoveryFired bool
 		for {
 			// Pre-attempt guard (retries only): if the context died while we
@@ -423,6 +508,33 @@ func RunLoop(
 			// dead ctx. Handle it as a cancel, not a new attempt.
 			if infraAttempts+badBodyAttempts+throttleAttempts > 0 && ctx.Err() != nil {
 				return "", err
+			}
+
+			// Predictive safeguard (Phase B5): when the model's context
+			// window is KNOWN (llama.cpp discovery, or an explicit
+			// models[].context-size-tokens) and the estimated request —
+			// history (which already includes the incoming user message;
+			// Submit appends it before the run starts) + system prompt +
+			// tool definitions — crosses 95% of the window, run the
+			// installed context compactor once BEFORE burning a doomed
+			// request on a provider that would truncate or reject. Capped
+			// at one predictive compaction per RunLoop invocation: after
+			// one pass the request proceeds even if still over (the
+			// provider may truncate as it always did; this is best-effort,
+			// not a hard gate). Gated on ctxSize > 0 AND a compactor being
+			// installed — with an unknown window there is nothing to
+			// predict against, and without a compactor the reactive
+			// failure path is the only behavior.
+			if !predictiveCompactionDone {
+				if ctxSize := sess.Client().ContextSize(); ctxSize > 0 {
+					estimated := common.CalculateHistoryTokens(sess.History, sess.SystemPrompt(), sess.GetToolDefinitions())
+					if estimated > ctxSize*95/100 && getContextCompactor() != nil {
+						predictiveCompactionDone = true
+						outcome := runContextCompaction(ctx)
+						common.LogErrorf("context-guard", "predictive compaction before stream (estimated %d of %d tokens): %s",
+							estimated, ctxSize, normalizeContextGuidance(outcome.summary()))
+					}
+				}
 			}
 
 			var onConnect func()
@@ -437,8 +549,61 @@ func RunLoop(
 
 			streamCh, errCh := sess.StartStream(ctx, extraBody, onConnect)
 			acc, err = ConsumeStream(ctx, streamCh, errCh, onStreamChunk)
+			if err == nil && acc.FinishReason == "length" {
+				// A stream can "succeed" while still being a context
+				// exhaustion verdict: providers that truncate instead of
+				// rejecting end the stream with finish_reason=length and a
+				// usage total at (or near) the window. Classify it exactly
+				// like an HTTP-level context rejection so the same
+				// compaction+retry safeguard applies; the output-truncation
+				// continuation below only handles the remaining case (a
+				// max_tokens cap on a non-full context).
+				ctxSize := sess.Client().ContextSize()
+				if ctxSize > 0 && acc.Usage.TotalTokens > 0 &&
+					float64(acc.Usage.TotalTokens) >= float64(ctxSize)*0.95 {
+					err = &client.ContextExceededError{Reason: "finish_reason=length"}
+				}
+			}
 			if err == nil {
 				break
+			}
+
+			// Context-exhaustion safeguard (Phase B4): the request is
+			// deterministic-failing — the conversation does not fit the
+			// model's window, so the retry tiers must not burn budgets on
+			// it (classifyStreamError maps the sentinel to retryClassNone).
+			// Recovery instead compacts history and retries the request
+			// through this same attempt machinery: the failed attempt
+			// committed nothing (ConsumeStream errors return before any
+			// history write, and a finish_reason=length exhaustion never
+			// reached the commit below), so history is intact and the
+			// retry is a clean re-request over the shrunken conversation.
+			// Only a run that ACTUALLY freed something earns the retry —
+			// a shadow report or a failed walk cannot shrink the request.
+			// No backoff: nothing about the failure is transient.
+			if isContextExceeded(err) && contextRounds < maxContextCompactionRounds {
+				contextRounds++
+				outcome := runContextCompaction(ctx)
+				if outcome.freedSomething() {
+					if onRetry != nil {
+						// Surface the round so the TUI can show the
+						// compaction outcome while the retry streams (the
+						// verb branch keys off the sentinel in the error).
+						onRetry(common.RetryEvent{
+							ID:          common.GetOrchestratorID(ctx),
+							Attempt:     contextRounds,
+							MaxAttempts: maxContextCompactionRounds,
+							Delay:       0,
+							Err:         fmt.Errorf("%w (%s)", err, normalizeContextGuidance(outcome.summary())),
+						})
+					}
+					continue
+				}
+				// Unrecoverable: no compactor, compaction unavailable, the
+				// run failed, or it freed nothing. Surface the typed error
+				// with the guidance and the observed outcome — retry tiers
+				// intentionally untouched.
+				return "", contextExceededGuidance(err, outcome)
 			}
 
 			// Terminal per tier: budget exhausted for this failure's class or
@@ -548,16 +713,16 @@ func RunLoop(
 		}
 
 		if acc.FinishReason == "length" {
-			// Determine if this is real context exhaustion or just output truncation
-			// (e.g. max_tokens cap set on the server side).
-			ctxSize := sess.Client().ContextSize()
-			isContextExhausted := ctxSize > 0 && acc.Usage.TotalTokens > 0 &&
-				float64(acc.Usage.TotalTokens) >= float64(ctxSize)*0.95
-
-			if isContextExhausted {
-				return "", fmt.Errorf("exceeds the available context size")
-			}
-
+			// Deterministic context exhaustion was already classified inside
+			// the attempt loop (the safeguard ran the compactor and retried,
+			// or the run ended with its guidance). Reaching the commit path
+			// with a length finish means the context is NOT full: the
+			// provider cut the OUTPUT at a max_tokens cap. The pre-existing
+			// continuation behavior applies — save the partial response and
+			// ask the model to continue more concisely. (The exhaustion
+			// discriminator above converts the full-context case into a
+			// *client.ContextExceededError before this branch is reached;
+			// if the guard already spent its rounds the run has returned.)
 			// Output was truncated but context is not full — save partial
 			// response and ask the model to continue more concisely.
 			if err := sess.AddAssistantMessageWithTools(acc.Content, acc.Reasoning, nil); err != nil {

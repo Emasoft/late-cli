@@ -231,10 +231,8 @@ func TestExecuteToolCalls_WatchdogToolKillDoesNotAttachNote(t *testing.T) {
 	// Wait until the shell call is in flight, then kill it exactly the way
 	// the orchestrator's idle watchdog does (stage-1 tool kill).
 	deadline := time.Now().Add(5 * time.Second)
-	killed := false
-	for !killed {
+	for {
 		if sess.CancelInFlightTool() {
-			killed = true
 			break
 		}
 		if time.Now().After(deadline) {

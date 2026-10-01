@@ -652,6 +652,19 @@ func main() {
 	}
 
 	c := client.NewClient(resolvedClientConfig)
+	// An explicit context-size-tokens declaration wins over discovery: it is
+	// applied BEFORE any request (and before DiscoverBackend can run) and
+	// the client never lets a probe result clobber it. Without it the
+	// context size stays -1 for providers that never advertise their window,
+	// and the predictive compaction heuristic stays dark. Declared on the
+	// root client; the subagent client below mirrors its own routed entry.
+	if appConfig != nil {
+		if setting, ok := appConfig.GetModelForAgent("orchestrator"); ok {
+			if ctxSize, ok := setting.ContextSizeOverride(); ok {
+				c.SetContextSize(ctxSize)
+			}
+		}
+	}
 
 	// Initialize Subagent Client
 	subagentClient := c
@@ -667,6 +680,13 @@ func main() {
 			LogitBias:    explicitSubagentLogitBias,
 			AppVersion:   common.Version,
 		})
+		if appConfig != nil {
+			if setting, ok := appConfig.GetModelForAgent("subagent"); ok {
+				if ctxSize, ok := setting.ContextSizeOverride(); ok {
+					subagentClient.SetContextSize(ctxSize)
+				}
+			}
+		}
 	}
 
 	// Flag overrides
@@ -980,6 +1000,33 @@ func main() {
 		}
 	}
 
+	// Tool-output archiving (default behavior, no config key): oversized
+	// tool outputs are written under the session's folder and the
+	// conversation carries only the compact reference form. One archive for
+	// the run — the root agent and every subagent share it, mirroring the
+	// compactor install above. Rooted at the active session's folder so the
+	// archive dies with the session folder (RemoveSessionFolder); an
+	// in-memory session (no derived session ID) fails the validity check
+	// and simply gets no archive — everything stays inline.
+	toolArchive, archiveDirErr := session.OutputArchiveDir(effectiveSessionID)
+	if archiveDirErr == nil {
+		arch, archErr := session.NewOutputArchive(toolArchive)
+		if archErr != nil {
+			// Archiving is fail-open end to end: ExecuteToolCalls keeps
+			// results inline on any archive error, so a failed setup only
+			// disables the feature.
+			fmt.Fprintf(os.Stderr, "Warning: tool-output archiving disabled (%v)\n", archErr)
+			toolArchive = ""
+		} else {
+			// Root install; the subagent runner below re-installs the same
+			// archive for every spawn so children archive their outputs
+			// even if the root install is ever made conditional.
+			executor.SetToolResultArchiver(arch)
+		}
+	} else {
+		toolArchive = ""
+	}
+
 	// Resolve theme: --theme flag > $LATE_THEME > config.json > bundled base.
 	themeID := *themeReq
 	if themeID == "" {
@@ -1111,6 +1158,42 @@ func main() {
 		// no event can trigger the recovery before the flag is set: the
 		// startup race is closed by construction, not by synchronization.
 		model.CompactionApplies = compactionMode == appconfig.CompactionModeEnabled
+	}
+
+	// Context-exhaustion safeguard (Phase B): install the executor's
+	// programmatic compaction hook so a stream request the provider rejects
+	// (or truncates) for context exhaustion is recovered in-process — the
+	// executor compacts the ROOT session's history and retries the request,
+	// instead of surfacing the deterministic failure to the user.
+	//
+	// The closure reuses historyCompactionRunner (the same adapter the TUI's
+	// /jev-compact-context flow uses), which handles persisting the mutated
+	// history, the error-log record, and the shadow-log run summary.
+	//
+	// Mutating (non-shadow) mode only: compaction-mode "shadow" computes the
+	// honest would-save report without rewriting history — it cannot shrink
+	// the request, so running it as "recovery" would burn a scoring round
+	// and change nothing. With compaction off (no pipeline, compactionMode
+	// off) or no scorer (backend unresolved), the hook is still installed
+	// but fails with the typed executor.ErrCompactionUnavailable so the
+	// executor's error text can say exactly why recovery was impossible
+	// (guidance naming /jev-compact-context) instead of a bare failure.
+	// Process-wide like every executor hook (root + subagents share it); a
+	// subagent's context-exhaustion failure recovers through the root
+	// session's history, which is the conversation the guard can shrink.
+	if compactionPipeline != nil && compactionMode != appconfig.CompactionModeOff {
+		runner := historyCompactionRunner(sess, compactionPipeline.HistoryScorer(), compactionStore,
+			compactionMode != appconfig.CompactionModeEnabled, compactionThreshold, compactionShadowLog, historyGate)
+		executor.SetContextCompactor(func(ctx context.Context) (session.CompactionReport, error) {
+			return runner(ctx)
+		})
+	} else {
+		// Recovery is impossible in this configuration: install a typed
+		// failure so RunLoop's guard reports "auto-compaction unavailable"
+		// rather than a generic error, and still records the event.
+		executor.SetContextCompactor(func(ctx context.Context) (session.CompactionReport, error) {
+			return session.CompactionReport{}, executor.ErrCompactionUnavailable
+		})
 	}
 
 	// Retrieval hooks (Step 17): BaseOrchestrator runs the hook at every
@@ -1343,7 +1426,123 @@ func main() {
 	}
 
 	if resolvedEnableSubagents {
-		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string, timeoutOverride *time.Duration) (string, error) {
+
+		// runEnv bundles the startup-scope collaborators every spawned or
+		// resumed child shares (see subagentRunEnv).
+		runEnv := &subagentRunEnv{
+			pluginManager:    pluginManager,
+			messenger:        p,
+			root:             rootAgent,
+			sess:             sess,
+			toolArchive:      toolArchive,
+			retrievalHookFor: retrievalHookFor,
+			diag:             diag,
+			idleTimeout:      resolvedSubagentIdleTimeout,
+			idleKillAfter:    resolvedSubagentIdleKillAfter,
+		}
+
+		// resumeSubagent implements spawn_subagent's "resume" argument
+		// (Phase C): the parent asks for a dead/crashed subagent by ID and
+		// gets the SAME child back — same ID, full persisted history,
+		// complete fresh-spawn tool surface — running again from where its
+		// history stopped. A closure inside main so it can read the
+		// resolved startup settings; the pure record validation it relies
+		// on (validateResumeRecord) is package-level and unit-tested.
+		resumeSubagent := func(ctx context.Context, request tool.SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+			manifest, err := session.LoadSubagentManifest(effectiveSessionID)
+			if err != nil {
+				return "", fmt.Errorf("resume %s: failed to load the session manifest: %w", request.ResumeID, err)
+			}
+			record, ok := manifest.Get(request.ResumeID)
+			if !ok {
+				return "", fmt.Errorf("no subagent %q in this session's manifest — resume needs the ID the original spawn reported", request.ResumeID)
+			}
+			if err := validateResumeRecord(record); err != nil {
+				return "", err
+			}
+
+			// Re-validate a recorded worktree against the CURRENT
+			// repository before trusting it (the worktree may have been
+			// pruned between runs); a worktree that no longer resolves
+			// still resumes, just with the recorded directory dropped from
+			// the prompt and the tool context.
+			worktreeDir := ""
+			if record.WorktreePath != "" {
+				if wt, wtErr := tool.ValidateWorktree(record.WorktreePath); wtErr == nil {
+					worktreeDir = wt
+				} else {
+					common.LogErrorf("subagent-resume", "subagent %s worktree no longer valid: %v", record.ID, wtErr)
+				}
+			}
+
+			agentType := record.AgentType
+			if agentType == "" {
+				agentType = request.AgentType
+			}
+
+			runBudget := effectiveSubagentBudget(timeoutOverride, resolvedSubagentTimeout)
+			runCtx := ctx
+			var runCancel context.CancelFunc = func() {}
+			if runBudget > 0 {
+				runCtx, runCancel = context.WithTimeout(ctx, runBudget)
+			}
+			defer runCancel()
+
+			var currentSubagentClient *client.Client
+			if appConfig != nil {
+				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
+					var biasForSubagent map[string]int
+					if setting.Model == resolvedSubagentConfig.Model {
+						biasForSubagent = subagentClient.LogitBias()
+					}
+					currentSubagentClient = client.NewClient(client.Config{
+						BaseURL:      setting.URL,
+						APIKey:       setting.Key,
+						Model:        setting.Model,
+						EnableImages: resolvedEnableImages,
+						LogitBias:    biasForSubagent,
+						AppVersion:   common.Version,
+					})
+					currentSubagentClient.DiscoverBackend(ctx)
+				}
+			}
+			if currentSubagentClient == nil {
+				currentSubagentClient = subagentClient
+			}
+
+			child, _, err := agent.NewResumedSubagentOrchestrator(currentSubagentClient, *record, agentType, enabledTools, resolvedInjectCWD, resolvedGemmaThinking, resolvedSubagentMaxTurns, rootAgent, p)
+			if err != nil {
+				return "", fmt.Errorf("resume %s failed: %w", record.ID, err)
+			}
+
+			res, err := buildAndWireChild(runEnv, child, wireChildConfig{
+				runCtx:        runCtx,
+				worktree:      worktreeDir,
+				runBudget:     runBudget,
+				requestCancel: runCancel,
+			})
+			return classifyAndReportSubagentOutcome(sess, child, agentType, record.Goal, res, err, subagentOutcomeContext{
+				runCtx:     runCtx,
+				runBudget:  runBudget,
+				resumed:    true,
+				finalWords: fmt.Sprintf("The %s subagent was resumed with its full prior context and completed its task. Final result:\n\n%s", agentType, res),
+			})
+		}
+
+		runner := func(ctx context.Context, request tool.SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+			// Resume mode: restore a previously interrupted child instead
+			// of spawning fresh. The manifest record must exist and be
+			// non-terminal — a completed/failed/cancelled child is done
+			// for good, and the parent is told to spawn fresh instead.
+			if request.IsResume() {
+				return resumeSubagent(ctx, request, timeoutOverride)
+			}
+
+			goal := request.Goal
+			ctxFiles := request.CtxFiles
+			agentType := request.AgentType
+			worktree := request.Worktree
+
 			// Effective wall-clock budget for this run. Context layering:
 			// parent ctx (cancellation) ⊇ run budget (deadline) — runCtx is
 			// derived from ctx, so cancelling the parent still cancels the
@@ -1383,159 +1582,28 @@ func main() {
 				currentSubagentClient = subagentClient
 			}
 
-			child, err := agent.NewSubagentOrchestrator(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, resolvedInjectCWD, resolvedGemmaThinking, resolvedSubagentMaxTurns, effectiveSessionID, saveSubagentHistories, rootAgent, p)
+			child, err := agent.NewSubagentOrchestratorWithWorktree(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, resolvedInjectCWD, resolvedGemmaThinking, resolvedSubagentMaxTurns, effectiveSessionID, saveSubagentHistories, worktree, rootAgent, p)
 			if err != nil {
 				return "", err
 			}
-			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
 
-			// Retrieval read side (Step 17): children get the same per-turn
-			// hook as the root agent — the work-area injection is per-agent
-			// session, while the record store and pipeline are shared.
-			if retrievalHookFor != nil {
-				if bo, ok := child.(*orchestrator.BaseOrchestrator); ok {
-					bo.SetRetrievalHook(retrievalHookFor(bo.Session()))
-				}
-			}
-
-			// Diagnostics sink (same propagation shape as the retrieval hook
-			// above): the child is its own BaseOrchestrator instance, so
-			// without this its dropped-events reporting would fall back to
-			// raw os.Stderr mid-session and paint over the alt-screen.
-			if bo, ok := child.(*orchestrator.BaseOrchestrator); ok {
-				bo.SetDiagnostics(diag)
-			}
-
-			// NewSubagentOrchestrator already set the child's context from
-			// the parent (agent.go: child.SetContext(parent.Context())) —
-			// keep that inheritance and layer the run budget on top: runCtx
-			// is derived from the runner ctx, so the parent ctx (cancellation)
-			// subsumes the budget (deadline). BaseOrchestrator.Execute then
-			// derives its run context from this one, so the deadline reaches
-			// the executor run loop. SetContext is not part of
-			// common.Orchestrator; the interface assertion keeps the spawn
-			// working if the concrete child type ever changes (it then simply
-			// keeps the parent context and runs without a budget rather than
-			// failing the spawn).
-			if sa, ok := child.(interface{ SetContext(context.Context) }); ok {
-				sa.SetContext(runCtx)
-			}
-
-			// The child runs its own idle watchdog with the same policy as
-			// the parent (it is a BaseOrchestrator too), so a stuck nested
-			// agent reports idle — or kills itself — independently.
-			if sa, ok := child.(interface {
-				SetIdlePolicy(idle, killAfter time.Duration)
-			}); ok {
-				sa.SetIdlePolicy(resolvedSubagentIdleTimeout, resolvedSubagentIdleKillAfter)
-			}
-
-			// The child streams on its own session, so the parent shows no
-			// progress while the nested run executes. Keep the parent's
-			// activity alive with a 1/minute heartbeat and mark the nested
-			// spawn busy, so the parent's idle watchdog neither fires nor
-			// idle-kills while its child is legitimately working.
-			done := make(chan struct{})
-			defer close(done)
-			go func() {
-				t := time.NewTicker(time.Minute)
-				defer t.Stop()
-				for {
-					select {
-					case <-done:
-						return
-					case <-t.C:
-						// rootAgent is a *orchestrator.BaseOrchestrator,
-						// which satisfies common.ActivityMarker; the parent
-						// stays visibly active while the child works.
-						rootAgent.MarkActivity()
-					}
-				}
-			}()
-			// Mark the nested spawn busy on the parent for the idle watchdog.
-			rootAgent.BeginNestedSpawn()
-			defer rootAgent.EndNestedSpawn()
-
-			// Mid-turn snapshot ticker (Phase 3a): the child persists history
-			// only at message-commit boundaries, so the in-flight turn's
-			// stream bytes live only in the executor's accumulator until that
-			// commit. While the child runs, the ticker re-snapshots its
-			// session history every subagentSnapshotInterval, shrinking the
-			// crash-loss window to the interval plus the final flush. The
-			// child session's SnapshotHistory copies the history under its
-			// historyMu and writes outside the lock, so a tick never blocks
-			// the streaming goroutine and never races a concurrent append.
-			// The ticker starts just before Execute and stops in a defer; the
-			// deferred stop performs the final flush so the window closes at
-			// outcome time (the commit path already persisted every committed
-			// message, so the flush is the belt to the commit's braces).
-			// Snapshot failures are logged inside the helper, never fatal.
-			if childSession := childSessionFor(child); childSession != nil {
-				if stopSnapshot := startSubagentSnapshotTicker(child, childSession, subagentSnapshotInterval); stopSnapshot != nil {
-					defer stopSnapshot()
-				}
-			}
-
-			res, err := child.Execute("")
-			// Classify the termination BEFORE looking at err: the budget, the
-			// idle watchdog, the user's kill and crashes all surface
-			// differently here. The idle-kill case must precede the
-			// user-cancel case: a watchdog kill surfaces as a plain
-			// context.Canceled from the child, and only IdleKillReason
-			// distinguishes it from a user stop. IdleKillReason is not part
-			// of common.Orchestrator; the interface assertion mirrors the
-			// SetContext/SetIdlePolicy ones above.
-			childIdleKillReason := ""
-			if sa, ok := child.(interface{ IdleKillReason() string }); ok {
-				childIdleKillReason = sa.IdleKillReason()
-			}
-			var cause string
-			switch {
-			case childIdleKillReason != "":
-				cause = fmt.Sprintf("idle: killed by the harness idle watchdog (%s)", childIdleKillReason)
-			case runBudget > 0 && runCtx.Err() == context.DeadlineExceeded:
-				cause = fmt.Sprintf("time budget exhausted (%s)", runBudget)
-			case errors.Is(err, context.Canceled) || child.IsStopRequested():
-				cause = "cancelled or killed by the user"
-			case err != nil:
-				cause = fmt.Sprintf("crashed: %v", err)
-			}
-			if cause != "" {
-				// Abnormal termination: hand the parent a pruned transcript so it
-				// can understand the cause and resume without redoing the work.
-				transcriptPath, terr := writeSubagentTranscript(child, agentType, goal, cause)
-				summary := lastActionPreview(child.History(), 500)
-				result := fmt.Sprintf("The %s subagent terminated abnormally (%s).\nFull pruned transcript: %s\nLast actions:\n%s", agentType, cause, transcriptPath, summary)
-				if terr != nil {
-					result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
-				}
-				// Manifest terminal record (Phase 1): the parent can now see
-				// at resume time that this child ended abnormally, with the
-				// transcript preserved. Non-fatal: the transcript and the
-				// returned result above already carry the information.
-				childID := child.ID()
-				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
-					common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
-				}
-				return result, nil
-			}
-
-			// Completed with the user's stop-request flag still set: the run
-			// produced a final output before the cancellation landed, but it
-			// is still a cancelled child for resume purposes.
-			childID := child.ID()
-			if child.IsStopRequested() {
-				final := fmt.Sprintf("The subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res)
-				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {
-					common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
-				}
-				return final, nil
-			}
-
-			if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCompleted, "", previewText(res, manifestResultPreviewLimit), ""); markErr != nil {
-				common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
-			}
-			return fmt.Sprintf("The subagent successfully completed its task. Final result:\n\n%s", res), nil
+			// Everything the fresh-spawn and resume paths share — archive
+			// reinstall, retrieval hook, diagnostics, run context (parent
+			// ctx + budget + worktree), idle policy, parent heartbeat and
+			// busy marking, and the mid-turn snapshot ticker — lives in
+			// buildAndWireChild, and the outcome classification + manifest
+			// terminal write in classifyAndReportSubagentOutcome; the
+			// runner body only keeps the per-path differences (constructor,
+			// final wording).
+			res, err := buildAndWireChild(runEnv, child, wireChildConfig{
+				runCtx:    runCtx,
+				worktree:  worktree,
+				runBudget: runBudget,
+			})
+			return classifyAndReportSubagentOutcome(sess, child, agentType, goal, res, err, subagentOutcomeContext{
+				runCtx:    runCtx,
+				runBudget: runBudget,
+			})
 		}
 
 		sess.Registry.Register(tool.SpawnSubagentTool{
@@ -1562,6 +1630,291 @@ func effectiveSubagentBudget(timeoutOverride *time.Duration, globalBudget time.D
 		return 0 // explicit per-spawn unlimited suppresses the global budget
 	}
 	return globalBudget
+}
+
+// validateResumeRecord decides whether a manifest record can be live-resumed
+// (spawn_subagent's "resume" argument): only an interrupted child — a record
+// still "running" when this process reads it, i.e. killed by a previous late
+// exit — is resumable. Terminal records are done for good: completed work
+// needs no resume, and failed/cancelled work was already terminated with a
+// recorded cause, so the parent must spawn fresh instead. A record without
+// a persisted history cannot be restored either: the conversation was
+// in-memory only and is gone.
+func validateResumeRecord(record *session.SubagentRecord) error {
+	switch record.Status {
+	case session.SubagentStatusRunning:
+		// The resumable case: running-at-read = interrupted by exit.
+	case session.SubagentStatusCompleted, session.SubagentStatusFailed, session.SubagentStatusCancelled:
+		return terminalResumeError(record)
+	default:
+		return fmt.Errorf("subagent %s has unknown manifest status %q; spawn a fresh agent instead", record.ID, record.Status)
+	}
+	if record.HistoryPath == "" {
+		return fmt.Errorf("subagent %s has no persisted history (subagent history persistence was disabled for that run) — its conversation cannot be restored; spawn a fresh agent instead", record.ID)
+	}
+	return nil
+}
+
+// terminalResumeError is the model-facing error for resuming a child whose
+// manifest record is already terminal: the work is done (or done failing),
+// so the parent must spawn fresh instead.
+func terminalResumeError(record *session.SubagentRecord) error {
+	switch record.Status {
+	case session.SubagentStatusCompleted:
+		return fmt.Errorf("agent %s already terminated (completed); spawn a fresh agent instead", record.ID)
+	default:
+		cause := record.Cause
+		if cause == "" {
+			cause = record.Status
+		}
+		return fmt.Errorf("agent %s already terminated (%s); spawn a fresh agent instead", record.ID, cause)
+	}
+}
+
+// subagentOutcomeContext carries the per-run values the outcome classifier
+// needs: the run context (for deadline detection) and whether the run was a
+// resume (which only changes the wording).
+type subagentOutcomeContext struct {
+	runCtx    context.Context
+	runBudget time.Duration
+	// resumed marks the wording as post-resume ("terminated abnormally
+	// again after resuming").
+	resumed bool
+	// finalWords is the completed-run wording; empty falls back to the
+	// fresh-spawn default.
+	finalWords string
+}
+
+// classifyAndReportSubagentOutcome is the shared tail of the fresh-spawn
+// runner and the resume path: classify the termination BEFORE looking at
+// err (budget, idle watchdog, user kill, and crashes all surface
+// differently here — the idle-kill case must precede the user-cancel case,
+// because a watchdog kill surfaces as a plain context.Canceled and only
+// IdleKillReason distinguishes it from a user stop), write the terminal
+// manifest record through sess, and build the model-facing result text.
+// IdleKillReason is not part of common.Orchestrator; the interface
+// assertion mirrors the SetContext/SetIdlePolicy ones in the runner.
+func classifyAndReportSubagentOutcome(sess *session.Session, child common.Orchestrator, agentType, goal, res string, err error, octx subagentOutcomeContext) (string, error) {
+	childIdleKillReason := ""
+	if sa, ok := child.(interface{ IdleKillReason() string }); ok {
+		childIdleKillReason = sa.IdleKillReason()
+	}
+	var cause string
+	switch {
+	case childIdleKillReason != "":
+		cause = fmt.Sprintf("idle: killed by the harness idle watchdog (%s)", childIdleKillReason)
+	case octx.runBudget > 0 && octx.runCtx.Err() == context.DeadlineExceeded:
+		cause = fmt.Sprintf("time budget exhausted (%s)", octx.runBudget)
+	case errors.Is(err, context.Canceled) || child.IsStopRequested():
+		cause = "cancelled or killed by the user"
+	case err != nil:
+		cause = fmt.Sprintf("crashed: %v", err)
+	}
+	if cause != "" {
+		abnormal := "terminated abnormally"
+		if octx.resumed {
+			abnormal = "terminated abnormally again after resuming"
+		}
+		// Abnormal termination: hand the parent a pruned transcript so it
+		// can understand the cause and resume without redoing the work.
+		transcriptPath, terr := writeSubagentTranscript(child, agentType, goal, cause)
+		summary := lastActionPreview(child.History(), 500)
+		result := fmt.Sprintf("The %s subagent %s (%s).\nFull pruned transcript: %s\nLast actions:\n%s", agentType, abnormal, cause, transcriptPath, summary)
+		if terr != nil {
+			result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
+		}
+		// Manifest terminal record (Phase 1): the parent can now see
+		// at resume time that this child ended abnormally, with the
+		// transcript preserved. Non-fatal: the transcript and the
+		// returned result above already carry the information.
+		childID := child.ID()
+		if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
+			common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+		}
+		return result, nil
+	}
+
+	// Completed with the user's stop-request flag still set: the run
+	// produced a final output before the cancellation landed, but it
+	// is still a cancelled child for resume purposes.
+	childID := child.ID()
+	if child.IsStopRequested() {
+		cancelled := "The subagent task was explicitly cancelled by the user"
+		if octx.resumed {
+			cancelled = "The resumed subagent task was explicitly cancelled by the user"
+		}
+		final := fmt.Sprintf("%s. Final output before cancellation:\n\n%s", cancelled, res)
+		if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {
+			common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+		}
+		return final, nil
+	}
+
+	if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCompleted, "", previewText(res, manifestResultPreviewLimit), ""); markErr != nil {
+		common.LogErrorf("subagent-manifest", "failed to record terminal status for %s: %v", childID, markErr)
+	}
+	if octx.finalWords != "" {
+		return octx.finalWords, nil
+	}
+	return fmt.Sprintf("The subagent successfully completed its task. Final result:\n\n%s", res), nil
+}
+
+// wireChildConfig carries the per-run values buildAndWireChild needs beyond
+// the child itself. It is constructed inside main(), where the wiring
+// inputs live.
+type wireChildConfig struct {
+	// runCtx is the child's execution context: parent ctx ⊇ run budget.
+	runCtx context.Context
+	// worktree, when non-empty, is layered into the child's tool context
+	// as the execution base directory (WorktreeDirKey).
+	worktree string
+	// runBudget is the effective budget in force (0 = unlimited).
+	runBudget time.Duration
+	// requestCancel releases the budget context's resources after the
+	// child finishes; nil when the caller releases it itself.
+	requestCancel context.CancelFunc
+}
+
+// subagentRunEnv bundles the startup-scope collaborators the shared child
+// executor needs: everything main() resolved once that every spawned or
+// resumed child consumes. Keeping it a plain struct lets the runner and the
+// resume closure share one value and keeps buildAndWireChild at package
+// level (unit-testable with stub wiring).
+type subagentRunEnv struct {
+	pluginManager    *plugin.PluginManager
+	messenger        tui.Messenger
+	root             *orchestrator.BaseOrchestrator
+	sess             *session.Session
+	toolArchive      string
+	retrievalHookFor func(*session.Session) func(context.Context)
+	diag             func(string)
+	idleTimeout      time.Duration
+	idleKillAfter    time.Duration
+}
+
+// buildAndWireChild is the shared executor of a spawned-or-resumed child:
+// it wires everything both spawn paths need — middlewares, the shared
+// tool-output archive, the retrieval hook, the diagnostics sink, the run
+// context (parent ctx + budget + worktree), the idle policy, the parent
+// heartbeat and nested-busy marking, and the mid-turn snapshot ticker —
+// then runs child.Execute("") and returns its result. The fresh-spawn
+// runner and the resume closure both call it, so a resumed child behaves
+// exactly like a freshly spawned one.
+func buildAndWireChild(env *subagentRunEnv, child common.Orchestrator, cfg wireChildConfig) (string, error) {
+	runCtx := cfg.runCtx
+	if cfg.worktree != "" {
+		runCtx = context.WithValue(runCtx, common.WorktreeDirKey, cfg.worktree)
+	}
+	if cfg.requestCancel != nil {
+		defer cfg.requestCancel()
+	}
+
+	child.SetMiddlewares(buildMiddlewares(env.pluginManager, env.messenger, child.Registry()))
+
+	// Tool-output archiving for the child: ExecuteToolCalls reads a
+	// process-wide hook, so the runner re-installs the SAME shared
+	// archive before every spawn. The hook is already in place from
+	// startup (the root install), but the child runs on the same
+	// session folder and must never depend on install ordering —
+	// re-installing the same instance is a no-op semantically.
+	if env.toolArchive != "" {
+		if arch, archErr := session.NewOutputArchive(env.toolArchive); archErr == nil {
+			executor.SetToolResultArchiver(arch)
+		}
+	}
+
+	// Retrieval read side (Step 17): children get the same per-turn
+	// hook as the root agent — the work-area injection is per-agent
+	// session, while the record store and pipeline are shared.
+	if env.retrievalHookFor != nil {
+		if bo, ok := child.(*orchestrator.BaseOrchestrator); ok {
+			bo.SetRetrievalHook(env.retrievalHookFor(bo.Session()))
+		}
+	}
+
+	// Diagnostics sink (same propagation shape as the retrieval hook
+	// above): the child is its own BaseOrchestrator instance, so
+	// without this its dropped-events reporting would fall back to
+	// raw os.Stderr mid-session and paint over the alt-screen.
+	if bo, ok := child.(*orchestrator.BaseOrchestrator); ok {
+		bo.SetDiagnostics(env.diag)
+	}
+
+	// NewSubagentOrchestrator/NewResumedSubagentOrchestrator already
+	// set the child's context from the parent (agent.go:
+	// child.SetContext(parent.Context())) — keep that inheritance
+	// and layer the run budget on top: runCtx is derived from the
+	// runner ctx, so the parent ctx (cancellation) subsumes the
+	// budget (deadline). BaseOrchestrator.Execute then derives its
+	// run context from this one, so the deadline reaches the
+	// executor run loop. SetContext is not part of
+	// common.Orchestrator; the interface assertion keeps the spawn
+	// working if the concrete child type ever changes (it then
+	// simply keeps the parent context and runs without a budget
+	// rather than failing the spawn).
+	if sa, ok := child.(interface{ SetContext(context.Context) }); ok {
+		sa.SetContext(runCtx)
+	}
+
+	// The child runs its own idle watchdog with the same policy as
+	// the parent (it is a BaseOrchestrator too), so a stuck nested
+	// agent reports idle — or kills itself — independently.
+	if sa, ok := child.(interface {
+		SetIdlePolicy(idle, killAfter time.Duration)
+	}); ok {
+		sa.SetIdlePolicy(env.idleTimeout, env.idleKillAfter)
+	}
+
+	// The child streams on its own session, so the parent shows no
+	// progress while the nested run executes. Keep the parent's
+	// activity alive with a 1/minute heartbeat and mark the nested
+	// spawn busy, so the parent's idle watchdog neither fires nor
+	// idle-kills while its child is legitimately working.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				// env.root is a *orchestrator.BaseOrchestrator, which
+				// satisfies common.ActivityMarker; the parent stays
+				// visibly active while the child works.
+				env.root.MarkActivity()
+			}
+		}
+	}()
+	// Mark the nested spawn busy on the parent for the idle watchdog.
+	env.root.BeginNestedSpawn()
+	defer env.root.EndNestedSpawn()
+
+	// Mid-turn snapshot ticker (Phase 3a): the child persists history
+	// only at message-commit boundaries, so the in-flight turn's
+	// stream bytes live only in the executor's accumulator until that
+	// commit. While the child runs, the ticker re-snapshots its
+	// session history every subagentSnapshotInterval, shrinking the
+	// crash-loss window to the interval plus the final flush. The
+	// child session's SnapshotHistory copies the history under its
+	// historyMu and writes outside the lock, so a tick never blocks
+	// the streaming goroutine and never races a concurrent append.
+	// The ticker starts just before Execute and stops in a defer; the
+	// deferred stop performs the final flush so the window closes at
+	// outcome time (the commit path already persisted every committed
+	// message, so the flush is the belt to the commit's braces).
+	// Snapshot failures are logged inside the helper, never fatal.
+	if childSession := childSessionFor(child); childSession != nil {
+		if stopSnapshot := startSubagentSnapshotTicker(child, childSession, subagentSnapshotInterval); stopSnapshot != nil {
+			defer stopSnapshot()
+		}
+	}
+
+	// The child continues from its loaded history: the LLM sees the
+	// full prior context and carries the goal forward (empty input =
+	// no new user turn).
+	return child.Execute("")
 }
 
 // compactionCheckTimeout bounds the whole -check-compaction preflight (three
@@ -1837,6 +2190,14 @@ func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableI
 		LogitBias:    logitBias,
 		AppVersion:   common.Version,
 	})
+	// An explicit context-size-tokens declaration must be applied BEFORE
+	// DiscoverBackend: the setter marks the value explicit, so discovery
+	// still identifies the backend but never overwrites the declared
+	// window. Applied after the (harmless) constructor either way — the
+	// guard inside DiscoverBackend makes the ordering race-free.
+	if ctxSize, ok := setting.ContextSizeOverride(); ok {
+		c.SetContextSize(ctxSize)
+	}
 	c.DiscoverBackend(ctx)
 	return c
 }
