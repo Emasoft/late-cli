@@ -54,7 +54,8 @@ type SpawnSubagentTool struct {
 
 func (t SpawnSubagentTool) Name() string { return "spawn_subagent" }
 func (t SpawnSubagentTool) Description() string {
-	return "Spawn a specialist subagent to perform a complex task. Use this when you need to isolate a task, such as researching a topic or writing a specific module. Pass \"resume\" instead of a goal to continue a previously interrupted subagent exactly where it stopped."
+	return "Spawn a specialist subagent to perform a complex task. Use this when you need to isolate a task, such as researching a topic or writing a specific module. Pass \"resume\" instead of a goal to continue a previously interrupted subagent exactly where it stopped. " +
+		"After any interruption notification, prefer {" + `"resume": "<id>"` + "} over re-spawning: the interrupted agent is restored exactly — same id, complete persisted history, full tool surface — and continues its task from where it stopped instead of redoing finished work."
 }
 func (t SpawnSubagentTool) Parameters() json.RawMessage {
 	configs := assets.GetSubagents()
