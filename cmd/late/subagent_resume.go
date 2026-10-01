@@ -220,10 +220,13 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 
 // manifestInterruptedText builds the tool-result string for one dangling
 // spawn call from the record's status: running means interrupted by the
-// previous exit (work preserved at the recorded paths); completed means the
+// previous exit — the directive live-resume wording, pointing the parent at
+// the exact spawn_subagent {"resume": "<id>"} call; completed means the
 // result preview survived but the parent's copy was lost in the same exit
-// (rare race); failed/cancelled reuse the runner's cause classification;
-// no record at all falls back to the generic interrupted wording.
+// (rare race); failed/cancelled reuse the runner's cause classification
+// with a review-the-transcript pointer (failed work may optionally be
+// resumed too, now that live resume exists); no record at all falls back to
+// the generic interrupted wording.
 func manifestInterruptedText(manifest *session.SubagentManifest, tc client.ToolCall, record *session.SubagentRecord) string {
 	if record == nil {
 		return danglingSubagentInterruptedText(tc.ID, "", "", "")
@@ -238,28 +241,51 @@ func manifestInterruptedText(manifest *session.SubagentManifest, tc client.ToolC
 		}
 		return text
 	case session.SubagentStatusFailed:
-		return fmt.Sprintf("The %s subagent failed in a previous session (%s) and cannot be resumed.", record.AgentType, record.Cause)
+		text := fmt.Sprintf("The %s subagent failed in a previous session (%s).", record.AgentType, record.Cause)
+		if record.TranscriptPath != "" {
+			text += fmt.Sprintf(" Review the transcript at %s before deciding.", record.TranscriptPath)
+		}
+		text += " If the failure was transient or the work is close to done, you may call the spawn_subagent tool with {\"resume\": \"" + record.ID + "\"} to continue it; otherwise spawn a fresh agent."
+		return text
 	case session.SubagentStatusCancelled:
-		return fmt.Sprintf("The %s subagent was cancelled in a previous session (%s).", record.AgentType, record.Cause)
+		return fmt.Sprintf("The %s subagent was cancelled in a previous session (%s). Its work state is preserved at %s; call the spawn_subagent tool with {\"resume\": \"%s\"} if it should continue, or spawn a fresh agent for a clean restart.", record.AgentType, record.Cause, record.HistoryPath, record.ID)
 	default:
 		return danglingSubagentInterruptedText(record.ID, record.AgentType, record.HistoryPath, record.TranscriptPath)
 	}
 }
 
 // danglingSubagentInterruptedText is the model-facing wording for a spawn
-// call interrupted by a previous late exit. It points at the preserved work
-// (history file, and transcript when the child ended abnormally) so the
-// parent can review it and continue or re-spawn as needed.
+// call interrupted by a previous late exit. It is DIRECTIVE (Phase C live
+// resume): the parent is told exactly how to restore the child — the
+// spawn_subagent {"resume": "<id>"} call — and warned not to re-state the
+// goal or spawn a replacement, because the preserved history is the child's
+// full state and resuming it continues the task where it stopped.
 func danglingSubagentInterruptedText(id, agentType, historyPath, transcriptPath string) string {
-	text := fmt.Sprintf("Subagent %s was interrupted by a previous late exit before completing.", id)
+	if id == "" {
+		// No manifest record matched the dangling call: the generic
+		// fallback keeps the historical review-the-transcript shape (the
+		// tool-call ID is not a resume ID).
+		text := "This subagent was interrupted by a previous late exit before completing."
+		if historyPath != "" {
+			text += fmt.Sprintf(" Its work up to the interruption is preserved at %s", historyPath)
+		} else {
+			text += " Its work up to the interruption could not be preserved"
+		}
+		if transcriptPath != "" {
+			text += fmt.Sprintf(" (and transcript %s)", transcriptPath)
+		}
+		text += ". Review it and continue or re-spawn as needed."
+		return text
+	}
+	text := fmt.Sprintf("Subagent %s (%s) was interrupted by a previous late exit. Its full work state is preserved", id, agentType)
 	if historyPath != "" {
-		text += fmt.Sprintf(" Its work up to the interruption is preserved at %s", historyPath)
+		text += fmt.Sprintf(" at %s", historyPath)
 	} else {
-		text += " Its work up to the interruption could not be preserved"
+		text += " in the session manifest"
 	}
 	if transcriptPath != "" {
-		text += fmt.Sprintf(" (and transcript %s)", transcriptPath)
+		text += fmt.Sprintf(" (transcript: %s)", transcriptPath)
 	}
-	text += ". Review it and continue or re-spawn as needed."
+	text += fmt.Sprintf(". To resume it exactly where it stopped, call the spawn_subagent tool with {\"resume\": \"%s\"} (all other parameters are ignored; the agent restores with its complete history and continues its task). Do NOT re-state the goal or spawn a new agent for this work unless resume fails.", id)
 	return text
 }

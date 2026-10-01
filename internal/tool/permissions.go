@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"late/internal/common"
 	"late/internal/pathutil"
@@ -108,16 +109,31 @@ func isNewPath(path string, cwd string) bool {
 
 // IsSafePath checks if a path is within the current working directory.
 func IsSafePath(path string) bool {
+	return IsSafePathIn(path, "")
+}
+
+// IsSafePathIn checks if a path is within the allowed directory: baseDir
+// when non-empty (the agent run's worktree), else the process working
+// directory. The two-function split keeps every existing IsSafePath caller
+// (write tools, target_edit, middleware confirmation) unchanged — they have
+// no execution context — while the shell tool, which does, resolves the
+// worktree base from its ctx.
+func IsSafePathIn(path, baseDir string) bool {
 	// Shortcut: If the path is relative and does not contain ".." components,
-	// it is guaranteed to be within the CWD (unless it follows a malicious symlink,
-	// but we assume the agent stays within the provided tree).
+	// it is guaranteed to be within the base directory (unless it follows a
+	// malicious symlink, but we assume the agent stays within the provided
+	// tree).
 	if !filepath.IsAbs(path) && !strings.Contains(path, "..") {
 		return true
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return false
+	cwd := strings.TrimSpace(baseDir)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return false
+		}
 	}
 
 	absPath, err := filepath.Abs(path)
@@ -173,6 +189,38 @@ func IsSafePath(path string) bool {
 	}
 
 	return strings.HasPrefix(absPath, absCwd)
+}
+
+// isInsideWorktree reports whether path lies within the worktree wired into
+// ctx (WorktreeDirKey). It is the shell tool's escape hatch for the `cwd`
+// parameter: a worktree child may legitimately cd around inside its
+// worktree even though the process CWD (which IsSafePath measures) is the
+// parent project. An absolute path (the only kind the shell tool accepts
+// here) resolves like IsSafePath's symlink-climbing check, just against the
+// worktree base.
+func isInsideWorktree(ctx context.Context, path string) bool {
+	worktree := common.GetWorktreeDir(ctx)
+	if worktree == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	return IsSafePathIn(path, worktree)
+}
+
+// resolveWorktreePath anchors a relative path at the agent run's worktree
+// when one is wired into ctx (WorktreeDirKey) — read_file's only path
+// handling — so a worktree child's unqualified reads resolve inside its
+// worktree instead of the process CWD. Absolute paths and worktree-less
+// runs are returned unchanged (the historical behavior: os.ReadFile is
+// CWD-relative).
+func resolveWorktreePath(ctx context.Context, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	worktree := common.GetWorktreeDir(ctx)
+	if worktree == "" {
+		return path
+	}
+	return filepath.Join(worktree, path)
 }
 
 const (

@@ -158,7 +158,24 @@ const (
 	MaxBadBodyRetriesKey  contextKey = "max_bad_body_retries"
 	ForceRevaluateKey     contextKey = "force_revaluate"
 	MaxThrottleRetriesKey contextKey = "max_throttle_retries"
+	// WorktreeDirKey carries the git worktree directory a subagent was
+	// spawned into (spawn_subagent's "worktree" argument). Tools that
+	// default to the process working directory consume it: the shell tool
+	// executes there (cmd.Dir) and the search/read tools base relative
+	// paths on it. The value is the validated worktree path recorded in
+	// the child's manifest record (SubagentRecord.WorktreePath).
+	WorktreeDirKey contextKey = "worktree_dir"
 )
+
+// GetWorktreeDir returns the worktree directory wired into the current agent
+// run's context, or "" when the run has no worktree (tools then keep their
+// process-CWD behavior).
+func GetWorktreeDir(ctx context.Context) string {
+	if dir, ok := ctx.Value(WorktreeDirKey).(string); ok {
+		return dir
+	}
+	return ""
+}
 
 // MainAgentID is the orchestrator ID of the root/main agent.
 // Subagents use IDs of the form "<type>-subagent-<n>".

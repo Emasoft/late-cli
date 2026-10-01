@@ -993,6 +993,15 @@ func (o *BaseOrchestrator) run() {
 				// Terminal status: kept BLOCKING — the TUI must observe the
 				// run's final status or it stays wedged in its running state.
 				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("image_unsupported")}
+			} else if isContextExceededError(err) {
+				// Context exhaustion is NOT a bad request to roll back: the
+				// message is fine, the conversation is simply too large.
+				// Popping the last user message would silently delete the
+				// user's text. The executor's guard already ran the
+				// auto-compaction rounds; surface the typed guidance
+				// verbatim (it names the compaction outcome and /new).
+				// Terminal status: kept BLOCKING (see above).
+				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
 			} else if isBadRequestStatusError(err) {
 				// The API rejected the request body even after the executor's bad-body
 				// retries. Roll the turn back so the session returns to its pre-submit
@@ -1049,6 +1058,17 @@ func (o *BaseOrchestrator) run() {
 func isBadRequestStatusError(err error) bool {
 	var se *client.StatusError
 	return errors.As(err, &se) && se.StatusCode == http.StatusBadRequest
+}
+
+// isContextExceededError reports whether err is (or wraps) the typed
+// context-exhaustion sentinel — the client's body-based classification of a
+// provider rejection as deterministic context exhaustion. The orchestrator's
+// 400-turn-rollback branch must NOT fire for these: the last user message is
+// not the problem (popping it would delete the user's text while the rest of
+// the oversized conversation stays), and the executor's context guard has
+// already run the compaction+retry recovery.
+func isContextExceededError(err error) bool {
+	return errors.Is(err, client.ErrContextExceeded)
 }
 
 func (o *BaseOrchestrator) Events() <-chan common.Event {
