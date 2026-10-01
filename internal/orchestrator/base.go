@@ -985,7 +985,10 @@ func (o *BaseOrchestrator) run() {
 				strings.Contains(errStr, "does not support image") {
 				// Remove the last user message from history
 				if len(o.sess.History) > 0 && o.sess.History[len(o.sess.History)-1].Role == "user" {
-					o.sess.History = o.sess.History[:len(o.sess.History)-1]
+					// TruncateHistory takes historyMu, the same lock the
+					// mid-turn snapshot reader (SnapshotHistory) holds while
+					// copying, so the rollback cannot race a snapshot.
+					o.sess.TruncateHistory(len(o.sess.History) - 1)
 				}
 				// Terminal status: kept BLOCKING — the TUI must observe the
 				// run's final status or it stays wedged in its running state.
@@ -1143,7 +1146,10 @@ func (o *BaseOrchestrator) Rewind(index int) error {
 	if index < 0 || index >= len(o.sess.History) {
 		return fmt.Errorf("invalid history index")
 	}
-	o.sess.History = o.sess.History[:index]
+	// TruncateHistory takes historyMu, the same lock the mid-turn snapshot
+	// reader (SnapshotHistory) holds while copying, so the rewind cannot
+	// race a snapshot.
+	o.sess.TruncateHistory(index)
 	// The frozen prefix never outlives the history it froze: the compaction
 	// high-water mark clamps to the truncated length, and the metadata write
 	// below persists the clamp.
