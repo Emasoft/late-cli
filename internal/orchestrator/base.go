@@ -489,7 +489,10 @@ func (o *BaseOrchestrator) run() {
 				strings.Contains(errStr, "does not support image") {
 				// Remove the last user message from history
 				if len(o.sess.History) > 0 && o.sess.History[len(o.sess.History)-1].Role == "user" {
-					o.sess.History = o.sess.History[:len(o.sess.History)-1]
+					// TruncateHistory takes historyMu, the same lock the
+					// mid-turn snapshot reader (SnapshotHistory) holds while
+					// copying, so the rollback cannot race a snapshot.
+					o.sess.TruncateHistory(len(o.sess.History) - 1)
 				}
 				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("image_unsupported")}
 			} else if isBadRequestStatusError(err) {
@@ -632,7 +635,10 @@ func (o *BaseOrchestrator) Rewind(index int) error {
 	if index < 0 || index >= len(o.sess.History) {
 		return fmt.Errorf("invalid history index")
 	}
-	o.sess.History = o.sess.History[:index]
+	// TruncateHistory takes historyMu, the same lock the mid-turn snapshot
+	// reader (SnapshotHistory) holds while copying, so the rewind cannot
+	// race a snapshot.
+	o.sess.TruncateHistory(index)
 	if o.sess.HistoryPath != "" {
 		if err := session.SaveHistory(o.sess.HistoryPath, o.sess.History); err != nil {
 			return err

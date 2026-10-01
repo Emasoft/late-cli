@@ -176,7 +176,7 @@ func TestSynthesizeDanglingSpawnResults_PersistedAndIdempotent(t *testing.T) {
 		t.Fatalf("LoadHistory: %v", err)
 	}
 	resumed := session.New(nil, historyPath, reloaded, "prompt", false)
-	if err := synthesizeDanglingSpawnResults(resumed); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(resumed); err != nil {
 		t.Fatalf("synthesizeDanglingSpawnResults: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestSynthesizeDanglingSpawnResults_PersistedAndIdempotent(t *testing.T) {
 	// no-op (no new messages, count unchanged).
 	before := len(saved)
 	resumed2 := session.New(nil, historyPath, saved, "prompt", false)
-	if err := synthesizeDanglingSpawnResults(resumed2); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(resumed2); err != nil {
 		t.Fatalf("second synthesizeDanglingSpawnResults: %v", err)
 	}
 	if len(resumed2.History) != before {
@@ -263,7 +263,7 @@ func TestSynthesizeDanglingSpawnResults_StatusWordings(t *testing.T) {
 		t.Fatalf("LoadHistory: %v", err)
 	}
 	resumed := session.New(nil, sess.HistoryPath, saved, "prompt", false)
-	if err := synthesizeDanglingSpawnResults(resumed); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(resumed); err != nil {
 		t.Fatalf("synthesizeDanglingSpawnResults: %v", err)
 	}
 
@@ -310,7 +310,7 @@ func TestSynthesizeDanglingSpawnResults_NonInterruptedHistoryUntouched(t *testin
 	before := len(sess.History)
 
 	// No manifest file exists at all.
-	if err := synthesizeDanglingSpawnResults(sess); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(sess); err != nil {
 		t.Fatalf("synthesizeDanglingSpawnResults: %v", err)
 	}
 	if len(sess.History) != before {
@@ -322,7 +322,7 @@ func TestSynthesizeDanglingSpawnResults_NonInterruptedHistoryUntouched(t *testin
 // a history path (no folder) is a silent no-op.
 func TestSynthesizeDanglingSpawnResults_InMemorySessionNoop(t *testing.T) {
 	sess := session.New(nil, "", []client.ChatMessage{}, "prompt", false)
-	if err := synthesizeDanglingSpawnResults(sess); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(sess); err != nil {
 		t.Fatalf("synthesizeDanglingSpawnResults on in-memory session = %v, want nil", err)
 	}
 }
@@ -350,7 +350,7 @@ func TestSynthesizedResultsAreValidToolExchange(t *testing.T) {
 		t.Fatalf("LoadHistory: %v", err)
 	}
 	resumed := session.New(nil, sess.HistoryPath, saved, "prompt", false)
-	if err := synthesizeDanglingSpawnResults(resumed); err != nil {
+	if _, err := synthesizeDanglingSpawnResults(resumed); err != nil {
 		t.Fatalf("synthesizeDanglingSpawnResults: %v", err)
 	}
 

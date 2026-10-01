@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 
+	"late/internal/agent"
 	"late/internal/client"
+	"late/internal/orchestrator"
 	"late/internal/session"
 )
 
@@ -37,25 +39,29 @@ const spawnSubagentToolName = "spawn_subagent"
 // of either record. Unmatched calls fall back to the generic interrupted
 // wording. The synthesis runs only when the manifest exists; one summary
 // line is logged to stderr per invocation.
-func synthesizeDanglingSpawnResults(sess *session.Session) error {
+//
+// The loaded manifest is returned (nil when none exists or it could not be
+// read) so the resume caller can feed the TUI-side restore
+// (restoreInterruptedSubagents) without loading the file twice.
+func synthesizeDanglingSpawnResults(sess *session.Session) (*session.SubagentManifest, error) {
 	effectiveSessionID := deriveEffectiveSessionID(sess.HistoryPath)
 	if effectiveSessionID == "" {
-		return nil // no session folder: nothing was ever persisted
+		return nil, nil // no session folder: nothing was ever persisted
 	}
 	manifestPath, err := session.SubagentManifestPath(effectiveSessionID)
 	if err != nil {
 		// Unsafe IDs can never have produced a folder; nothing to do.
-		return nil
+		return nil, nil
 	}
 	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
-		return nil // no manifest: no subagent ever spawned in this session
+		return nil, nil // no manifest: no subagent ever spawned in this session
 	}
 	manifest, err := session.LoadSubagentManifest(effectiveSessionID)
 	if err != nil {
 		// A corrupt manifest must not make the session unresumable: the
 		// request-time sanitizer still closes the dangling calls.
 		logSubagentErrorf("subagent-manifest: failed to load manifest for %s: %v", effectiveSessionID, err)
-		return nil
+		return nil, nil
 	}
 
 	// answeredIDs collects every tool-call ID that already has a tool result
@@ -84,7 +90,7 @@ func synthesizeDanglingSpawnResults(sess *session.Session) error {
 			consumed[rec] = true // also fine for nil (generic wording)
 			content := manifestInterruptedText(manifest, tc, rec)
 			if err := sess.AddToolResultMessage(tc.ID, content); err != nil {
-				return fmt.Errorf("persist synthesized result for %s: %w", tc.ID, err)
+				return nil, fmt.Errorf("persist synthesized result for %s: %w", tc.ID, err)
 			}
 			answeredIDs[tc.ID] = true
 			synthesized++
@@ -94,7 +100,63 @@ func synthesizeDanglingSpawnResults(sess *session.Session) error {
 	if synthesized > 0 {
 		logSubagentErrorf("subagent-manifest: resume synthesized %d tool result(s) for dangling spawn_subagent call(s) in session %s", synthesized, effectiveSessionID)
 	}
-	return nil
+	return manifest, nil
+}
+
+// restoreInterruptedSubagents re-lists every manifest child that was
+// interrupted by the previous exit (Phase 3b of subagent persistence) as a
+// read-only orchestrator on the root, so the TUI can browse it — tab
+// switching, transcript view — like any other historical child. The
+// synthesized tool result above already made the parent MODEL aware; this is
+// the TUI-facing half of the same resume story.
+//
+// The rule mirrors the manifest's crash model: a record still "running" when
+// this process reads it means the previous exit interrupted that child, so
+// EVERY such record is restored — whether or not its spawn call was dangling
+// in this history (the persisted synthesis makes later resumes find no
+// dangling calls, while the manifest keeps saying "running" until a
+// terminal write). Terminal records — completed, failed, cancelled — are
+// skipped: their outcome already lives in the parent transcript via the
+// persisted tool result or the runner's own summary, and the manifest's
+// terminal preview is that same outcome, not a hidden conversation. The
+// restored map deduplicates within one resume pass.
+//
+// Read-only by construction (agent.NewRestoredSubagentOrchestrator): no
+// session, empty registry, Execute refuses. Failures are logged and skipped,
+// never fatal — a broken history file degrades the TUI listing only, and
+// resume must always proceed.
+func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *session.SubagentManifest, restored map[string]bool) {
+	if root == nil || manifest == nil {
+		return
+	}
+	for i := range manifest.Records {
+		rec := &manifest.Records[i]
+		if rec.Status != session.SubagentStatusRunning || restored[rec.ID] {
+			continue
+		}
+		restored[rec.ID] = true
+		if rec.HistoryPath == "" {
+			logSubagentErrorf("subagent-restore: subagent %s was interrupted without a persisted history; not listed in the TUI", rec.ID)
+			continue
+		}
+		child, err := agent.NewRestoredSubagentOrchestrator(rec.ID, rec.AgentType, rec.Goal, rec.HistoryPath, RestoredSubagentStatusText(rec.Cause))
+		if err != nil {
+			logSubagentErrorf("subagent-restore: failed to restore subagent %s: %v", rec.ID, err)
+			continue
+		}
+		root.AddChild(child)
+		logSubagentErrorf("subagent-restore: restored subagent %s (%s) into the TUI with %d preserved message(s)", rec.ID, rec.AgentType, len(child.History()))
+	}
+}
+
+// RestoredSubagentStatusText renders the status line for a restored record:
+// the generic interrupted wording, with the cause appended when the manifest
+// recorded one.
+func RestoredSubagentStatusText(cause string) string {
+	if cause == "" {
+		return agent.RestoredSubagentStatus
+	}
+	return agent.RestoredSubagentStatus + " (" + cause + ")"
 }
 
 // spawnArgs is the slice of the spawn_subagent arguments the correlation

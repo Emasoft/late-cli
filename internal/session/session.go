@@ -27,6 +27,14 @@ type Session struct {
 	subagentSeq           int
 	saveSubagentHistories *bool
 	Registry              *tool.Registry
+
+	// historyMu guards the History slice header for mid-turn snapshot
+	// readers (SnapshotHistory, Phase 3a of subagent persistence): appends
+	// hold it for the duration of the slice write only — persistence in
+	// saveAndNotify stays outside the lock — so a periodic snapshot copies
+	// the history without racing a live stream's appends and without
+	// blocking the streaming goroutine on marshal or disk I/O.
+	historyMu sync.Mutex
 }
 
 func New(c *client.Client, historyPath string, history []client.ChatMessage, systemPrompt string, useTools bool) *Session {
@@ -104,25 +112,77 @@ func (s *Session) ExecuteTool(ctx context.Context, tc client.ToolCall) (string, 
 	return t.Execute(ctx, json.RawMessage(tc.Function.Arguments))
 }
 
+// appendMessage is the single path the Add* helpers use to record a message:
+// it appends to history under historyMu and persists with the lock released.
+func (s *Session) appendMessage(msg client.ChatMessage) error {
+	s.historyMu.Lock()
+	s.History = append(s.History, msg)
+	s.historyMu.Unlock()
+	return s.saveAndNotify()
+}
+
+// SnapshotHistory writes a point-in-time copy of the session's history to
+// its history path — the mid-turn persistence primitive (Phase 3a of
+// subagent persistence). A child's history otherwise lands on disk only at
+// message-commit boundaries (appendMessage → saveAndNotify), so the
+// in-flight turn's bytes live only in the executor's stream accumulator
+// until that commit; a crash mid-turn loses them. The periodic snapshot
+// shrinks that residual loss window.
+//
+// Concurrency: the history slice is copied under historyMu — the same lock
+// appendMessage holds while appending — so the copy never races a live
+// stream's appends. Marshaling and the disk write run OUTSIDE the lock, so
+// the streaming goroutine is never blocked by snapshot cost. Idempotent
+// with the commit-path write (same writeAtomic primitive), and a no-op for
+// in-memory sessions (no history path) and empty histories (a snapshot
+// must not materialize a file for a child that never produced anything).
+func (s *Session) SnapshotHistory() error {
+	if s.HistoryPath == "" {
+		return nil
+	}
+	s.historyMu.Lock()
+	snapshot := make([]client.ChatMessage, len(s.History))
+	copy(snapshot, s.History)
+	s.historyMu.Unlock()
+
+	if len(snapshot) == 0 {
+		return nil
+	}
+	return SaveHistory(s.HistoryPath, snapshot)
+}
+
+// TruncateHistory drops the history tail below index — the rollback primitive
+// for the rewind path (BaseOrchestrator.Rewind) and the unsupported-image
+// rollback (BaseOrchestrator.run's error branch), which live outside this
+// package and so cannot take historyMu themselves. Out-of-range indexes are
+// a no-op so callers keep their existing validity checks authoritative.
+func (s *Session) TruncateHistory(index int) {
+	s.historyMu.Lock()
+	if index < 0 || index >= len(s.History) {
+		s.historyMu.Unlock()
+		return
+	}
+	s.History = s.History[:index]
+	s.historyMu.Unlock()
+}
+
 // AddToolResultMessage adds a tool response message to history.
 func (s *Session) AddToolResultMessage(toolCallID, content string) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:       "tool",
 		ToolCallID: toolCallID,
 		Content:    client.TextContent(content),
 	})
-	return s.saveAndNotify()
 }
 
 // AddAssistantMessageWithTools adds an assistant message with tool calls.
 func (s *Session) AddAssistantMessageWithTools(content string, reasoning string, toolCalls []client.ToolCall) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:             "assistant",
 		Content:          client.TextContent(content),
 		ReasoningContent: reasoning,
 		ToolCalls:        toolCalls,
 	})
-	return s.saveAndNotify()
 }
 
 func (s *Session) GetToolDefinitions() []client.ToolDefinition {
@@ -143,24 +203,21 @@ func (s *Session) GetToolDefinitions() []client.ToolDefinition {
 
 // AddUserMessage adds a user message to history and persists it.
 func (s *Session) AddUserMessage(content string) error {
-	s.History = append(s.History, client.ChatMessage{Role: "user", Content: client.TextContent(content)})
-	return s.saveAndNotify()
+	return s.appendMessage(client.ChatMessage{Role: "user", Content: client.TextContent(content)})
 }
 
 // AddMessage adds an arbitrary message to history and persists it.
 func (s *Session) AddMessage(msg client.ChatMessage) error {
-	s.History = append(s.History, msg)
-	return s.saveAndNotify()
+	return s.appendMessage(msg)
 }
 
 // AddAssistantMessage adds an assistant message to history and persists it.
 func (s *Session) AddAssistantMessage(content, reasoning string) error {
-	s.History = append(s.History, client.ChatMessage{
+	return s.appendMessage(client.ChatMessage{
 		Role:             "assistant",
 		Content:          client.TextContent(content),
 		ReasoningContent: reasoning,
 	})
-	return s.saveAndNotify()
 }
 
 // PopLastUserMessage removes the trailing user message from history and
@@ -168,10 +225,13 @@ func (s *Session) AddAssistantMessage(content, reasoning string) error {
 // removed (false = no-op: empty history or non-user tail). The error is a
 // persistence error, returned only when a change was made.
 func (s *Session) PopLastUserMessage() (bool, error) {
+	s.historyMu.Lock()
 	if len(s.History) == 0 || s.History[len(s.History)-1].Role != "user" {
+		s.historyMu.Unlock()
 		return false, nil
 	}
 	s.History = s.History[:len(s.History)-1]
+	s.historyMu.Unlock()
 
 	// Popping the first-and-only message empties the history. saveAndNotify()
 	// treats empty history as "nothing to persist" (its empty-guard exists so
@@ -201,7 +261,9 @@ func (s *Session) PopLastUserMessage() (bool, error) {
 
 // AppendToLastMessage appends content to the last message (continuation).
 func (s *Session) AppendToLastMessage(content, reasoning string) error {
+	s.historyMu.Lock()
 	if len(s.History) == 0 {
+		s.historyMu.Unlock()
 		return fmt.Errorf("no history to append to")
 	}
 	lastIdx := len(s.History) - 1
@@ -233,6 +295,8 @@ func (s *Session) AppendToLastMessage(content, reasoning string) error {
 			s.History[lastIdx].ReasoningContent = reasoning
 		}
 	}
+	// Persistence runs with the lock released, mirroring appendMessage.
+	s.historyMu.Unlock()
 	return s.saveAndNotify()
 }
 
@@ -436,7 +500,11 @@ func (s *Session) StartNewConversation() error {
 	now := time.Now()
 	sessionID := fmt.Sprintf("session-%s-%09d", now.Format("20060102-150405"), now.Nanosecond())
 	s.HistoryPath = filepath.Join(dir, sessionID+".json")
+	// historyMu guards the slice header against the mid-turn snapshot
+	// reader (SnapshotHistory).
+	s.historyMu.Lock()
 	s.History = []client.ChatMessage{}
+	s.historyMu.Unlock()
 	return nil
 }
 

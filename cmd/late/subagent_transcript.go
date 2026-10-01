@@ -38,6 +38,78 @@ type sessionPathSource interface {
 	Session() *session.Session
 }
 
+// childSessionFor extracts the child's session for the mid-turn snapshot
+// ticker (Phase 3a). Session is deliberately not part of common.Orchestrator
+// (only the concrete *orchestrator.BaseOrchestrator and the test stubs expose
+// it), so the runner reaches it through an interface assertion — the same
+// shape as the SetContext assertion in the runner. The parameter is the
+// minimal surface the helper needs (the ID, for error lines); the runner
+// passes the full common.Orchestrator child.
+// nil keeps the snapshot wiring silent when the concrete child type ever
+// changes.
+func childSessionFor(child interface{ ID() string }) *session.Session {
+	if sa, ok := child.(interface{ Session() *session.Session }); ok {
+		return sa.Session()
+	}
+	return nil
+}
+
+// startSubagentSnapshotTicker runs the mid-turn snapshot loop (Phase 3a) for
+// one child run: every interval it snapshots the child session's history to
+// its history path (Session.SnapshotHistory), shrinking the crash-loss window
+// to the interval plus the final flush. Snapshot errors are logged to stderr,
+// never fatal — a failed snapshot degrades crash
+// granularity only, and must never fail the child run.
+//
+// The returned stop func ends the ticker AND performs the final flush —
+// runners defer it right before child.Execute so the window closes at
+// outcome time, after the last tick and before the manifest's terminal
+// record is written. Stop first joins the ticker goroutine (an in-flight
+// tick finishes before stop returns: no snapshot write ever outlives the
+// child run) and then flushes, so the flush never interleaves with a tick.
+// The child session exposes no persistable history (in-memory child, or a
+// child without a history path) → no ticker, nil.
+//
+// The interval is a parameter so tests can drive ticks quickly; production
+// always passes subagentSnapshotInterval. This split keeps the production
+// constant (5s, not configurable this phase) while the loop itself stays
+// testable in milliseconds. The child parameter is the minimal surface the
+// error lines need (the ID); the runner passes the full orchestrator.
+func startSubagentSnapshotTicker(child interface{ ID() string }, childSession *session.Session, interval time.Duration) (stop func()) {
+	if childSession == nil || childSession.HistoryPath == "" {
+		return nil
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := childSession.SnapshotHistory(); err != nil {
+					logSubagentErrorf("subagent-snapshot: periodic history snapshot failed for %s: %v", child.ID(), err)
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		// Join the ticker goroutine: the last tick's write completes before
+		// the final flush, and nothing snapshot-related outlives stop().
+		<-finished
+		// Final flush after the ticker stops: the last snapshot lands
+		// before the outcome is recorded, so the window closes at outcome
+		// time even when no tick fired after the child's last commit.
+		if err := childSession.SnapshotHistory(); err != nil {
+			logSubagentErrorf("subagent-snapshot: final history snapshot failed for %s: %v", child.ID(), err)
+		}
+	}
+}
+
 const (
 	// transcriptFileMode and transcriptDirMode keep subagent transcripts as
 	// private as the rest of the session artifacts.
@@ -246,6 +318,16 @@ func lastActionPreview(msgs []client.ChatMessage, limit int) string {
 // in the parent history already; the preview is what resume can still show
 // when the same crash that lost the parent's tail also took it.
 const manifestResultPreviewLimit = 200
+
+// subagentSnapshotInterval is how often a running child's session history is
+// snapshotted to disk while it streams (Phase 3a of subagent persistence).
+// Message commits alone leave the in-flight turn's bytes only in the
+// executor's stream accumulator, so a crash mid-turn loses them; the ticker
+// shrinks that residual loss window to the interval plus the tick. A
+// constant, not a flag: the value trades disk-write frequency against crash
+// granularity and has no tuning audience — revise it in code if that ever
+// changes.
+const subagentSnapshotInterval = 5 * time.Second
 
 // previewText clips s to limit RUNES (not bytes) so the manifest preview
 // stays readable instead of cutting a multi-byte character mid-sequence.

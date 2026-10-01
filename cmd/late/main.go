@@ -499,9 +499,12 @@ func main() {
 	// records = "interrupted"). Persisting keeps resume idempotent: a second
 	// resume finds no dangling calls. A failure must not block resuming —
 	// the request-time sanitizer still closes the exchange — so it is logged
-	// and the session continues without the synthesized results.
-	if err := synthesizeDanglingSpawnResults(sess); err != nil {
-		logSubagentManifestErrorf("subagent resume synthesis failed: %v", err)
+	// and the session continues without the synthesized results. The loaded
+	// manifest feeds the TUI-side restore (below, once rootAgent exists).
+	restoredSubagents := make(map[string]bool)
+	resumedManifest, synthesizeErr := synthesizeDanglingSpawnResults(sess)
+	if synthesizeErr != nil {
+		logSubagentErrorf("subagent-manifest: subagent resume synthesis failed: %v", synthesizeErr)
 	}
 	executor.RegisterTools(sess.Registry, mainTools)
 
@@ -586,6 +589,17 @@ func main() {
 	// Create root orchestrator
 	// We'll add middlewares later once the program is started
 	rootAgent := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+
+	// TUI rehydration (Phase 3b): the interrupted children the resume
+	// synthesis reported re-enter the TUI as read-only orchestrators on the
+	// root, so the preserved transcripts are browsable like any other
+	// historical child (tab switching, transcript view). This runs before
+	// the TUI program exists and before any live spawn can register a
+	// child — AddChild is synchronous on the root's mutex, so there is no
+	// ordering race with the runner below.
+	if resumedManifest != nil {
+		restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents)
+	}
 
 	model := tui.NewModel(rootAgent, renderer, appConfig)
 	model.SetActiveThemeStyles(themeBytes)
@@ -767,6 +781,26 @@ func main() {
 			}
 			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
 
+			// Mid-turn snapshot ticker (Phase 3a): the child persists history
+			// only at message-commit boundaries, so the in-flight turn's
+			// stream bytes live only in the executor's accumulator until that
+			// commit. While the child runs, the ticker re-snapshots its
+			// session history every subagentSnapshotInterval, shrinking the
+			// crash-loss window to the interval plus the final flush. The
+			// child session's SnapshotHistory copies the history under its
+			// historyMu and writes outside the lock, so a tick never blocks
+			// the streaming goroutine and never races a concurrent append.
+			// The ticker starts just before Execute and stops in a defer; the
+			// deferred stop performs the final flush so the window closes at
+			// outcome time (the commit path already persisted every committed
+			// message, so the flush is the belt to the commit's braces).
+			// Snapshot failures are logged inside the helper, never fatal.
+			if childSession := childSessionFor(child); childSession != nil {
+				if stopSnapshot := startSubagentSnapshotTicker(child, childSession, subagentSnapshotInterval); stopSnapshot != nil {
+					defer stopSnapshot()
+				}
+			}
+
 			res, err := child.Execute("")
 			// Classify the termination BEFORE looking at err: the user's
 			// cancel and a plain run error surface differently here. A
@@ -797,7 +831,7 @@ func main() {
 				// returned result above already carry the information.
 				childID := child.ID()
 				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
-					logSubagentManifestErrorf("failed to record terminal status for %s: %v", childID, markErr)
+					logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
 				}
 				return result, nil
 			}
@@ -809,13 +843,13 @@ func main() {
 			if child.IsStopRequested() {
 				final := fmt.Sprintf("The subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res)
 				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {
-					logSubagentManifestErrorf("failed to record terminal status for %s: %v", childID, markErr)
+					logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
 				}
 				return final, nil
 			}
 
 			if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCompleted, "", previewText(res, manifestResultPreviewLimit), ""); markErr != nil {
-				logSubagentManifestErrorf("failed to record terminal status for %s: %v", childID, markErr)
+				logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
 			}
 			return fmt.Sprintf("The subagent successfully completed its task. Final result:\n\n%s", res), nil
 		}
