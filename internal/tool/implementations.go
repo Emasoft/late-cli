@@ -54,7 +54,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", err
 	}
 
-	data, err := os.ReadFile(params.Path)
+	data, err := os.ReadFile(resolveWorktreePath(ctx, params.Path))
 	if err != nil {
 		return "", err
 	}
@@ -351,11 +351,18 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		}
 	}
 
-	// Validate and set working directory
+	// Validate and set working directory. Priority: the call's explicit
+	// `cwd` parameter > the agent run's worktree (WorktreeDirKey, set for
+	// children spawned with spawn_subagent's "worktree" argument) > the
+	// process working directory. The worktree default keeps a worktree
+	// child's unqualified commands running inside its worktree without
+	// every call needing a `cwd` parameter.
 	if params.Cwd != "" {
-		if !IsSafePath(params.Cwd) {
+		if !IsSafePath(params.Cwd) && !isInsideWorktree(ctx, params.Cwd) {
 			return "", fmt.Errorf("cwd '%s' is outside the allowed directory", params.Cwd)
 		}
+	} else if worktree := common.GetWorktreeDir(ctx); worktree != "" {
+		params.Cwd = worktree
 	} else {
 		// Default to current directory
 		cwd, err := os.Getwd()

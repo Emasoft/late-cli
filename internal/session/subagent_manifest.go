@@ -58,6 +58,23 @@ type SubagentRecord struct {
 	// history persistence was disabled for the run. Resume surfaces it as
 	// the preserved-work pointer for interrupted children.
 	HistoryPath string `json:"history_path,omitempty"`
+	// WorkingDir is the process working directory captured at spawn time —
+	// the best available truth about where the child worked, since late
+	// runs children in the process CWD. Resume rebuilds the child's
+	// system-prompt ${{CWD}} from it, so a resumed agent keeps working in
+	// the original project even when late was re-launched elsewhere.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// WorktreePath is the registered git worktree the child was spawned
+	// into (the spawn_subagent "worktree" argument), empty when the child
+	// ran in the process CWD. When set it takes precedence over WorkingDir
+	// for the resumed prompt and is wired into the child's tool context as
+	// the execution base directory.
+	WorktreePath string `json:"worktree_path,omitempty"`
+	// ResumeCount is the number of live resumes this child has gone
+	// through (0 = never resumed). It is bumped when a resume spawn
+	// re-starts the child, so a record survives as "interrupted, resumed
+	// N times" across repeated exits.
+	ResumeCount int `json:"resume_count,omitempty"`
 	// TranscriptPath is the pruned Markdown transcript written by the
 	// runner for abnormal terminations (idle kill, budget exhaustion,
 	// user cancel, error). Completed children leave it empty — their full
@@ -174,6 +191,27 @@ func (m *SubagentManifest) markStatusAt(id, status, cause, resultPreview, transc
 	rec.EndedAt = endedAt
 }
 
+// MarkResumed counts one live resume against the record: it bumps
+// ResumeCount, flips the record back to "running" (the resumed run is live
+// again), and clears the previous terminal stamps (EndedAt/Cause stay
+// cleared until the resumed run writes its own outcome). Unknown IDs are a
+// no-op. It operates on the in-memory copy; call Save to persist.
+func (m *SubagentManifest) MarkResumed(id string) {
+	m.markResumedAt(id, time.Now())
+}
+
+// markResumedAt is MarkResumed with an injectable timestamp for tests.
+func (m *SubagentManifest) markResumedAt(id string, at time.Time) {
+	rec, ok := m.Get(id)
+	if !ok {
+		return
+	}
+	rec.Status = SubagentStatusRunning
+	rec.ResumeCount++
+	rec.EndedAt = time.Time{}
+	rec.Cause = ""
+}
+
 // manifestMu serializes the load-modify-save cycles of SaveSubagentRecord.
 // Concurrent subagent runners may both spawn and terminate children; the
 // manifest is shared per-session state, so without the lock a reader-modify
@@ -261,5 +299,29 @@ func (s *Session) MarkSubagentStatus(id, status, cause, resultPreview, transcrip
 	}
 	manifest.SessionID = sessionID
 	manifest.MarkStatus(id, status, cause, resultPreview, transcriptPath)
+	return manifest.Save()
+}
+
+// MarkSubagentResumed counts one live resume of a subagent in the session's
+// manifest: the record flips back to "running" (the resumed run is live, so
+// a crash mid-resume again reads as "interrupted"), ResumeCount is bumped,
+// and the previous termination stamps are cleared. Unknown IDs are a no-op —
+// a resume may only refine an existing spawn record, never invent one.
+// It is a no-op for an in-memory session or when the manifest cannot be
+// loaded, mirroring MarkSubagentStatus.
+func (s *Session) MarkSubagentResumed(id string) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" {
+		return nil // in-memory session: no session folder, no manifest
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	manifest.MarkResumed(id)
 	return manifest.Save()
 }

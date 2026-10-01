@@ -752,7 +752,47 @@ func main() {
 	}()
 
 	if *enableSubagentsReq {
-		runner := func(ctx context.Context, goal string, ctxFiles []string, agentType string) (string, error) {
+		// resumeSubagent implements spawn_subagent's "resume" argument: the
+		// parent asks for a dead/crashed subagent by ID and gets the SAME
+		// child back — same ID, full persisted history (snapshot ticker +
+		// final flush guarantee it), complete fresh-spawn tool surface —
+		// running again from where its history stopped. A closure inside
+		// main so it can read the resolved startup settings; the pure record
+		// validation it relies on (validateResumeRecord) is package-level
+		// and unit-tested.
+		resumeSubagent := func(ctx context.Context, request tool.SubagentSpawnRequest) (string, error) {
+			manifest, err := session.LoadSubagentManifest(effectiveSessionID)
+			if err != nil {
+				return "", fmt.Errorf("resume %s: failed to load the session manifest: %w", request.ResumeID, err)
+			}
+			record, ok := manifest.Get(request.ResumeID)
+			if !ok {
+				return "", fmt.Errorf("no subagent %q in this session's manifest — resume needs the ID the original spawn reported", request.ResumeID)
+			}
+			if err := validateResumeRecord(record); err != nil {
+				return "", err
+			}
+
+			// Re-validate a recorded worktree against the CURRENT repository
+			// before trusting it (the worktree may have been pruned between
+			// runs); a worktree that no longer resolves still resumes, just
+			// with the recorded directory dropped from the prompt and the
+			// tool context. NewResumedSubagentOrchestrator applies the
+			// resolved directory through the record's CWD precedence.
+			if record.WorktreePath != "" {
+				if wt, wtErr := tool.ValidateWorktree(record.WorktreePath); wtErr == nil {
+					record.WorktreePath = wt
+				} else {
+					logSubagentErrorf("subagent-resume: subagent %s worktree no longer valid: %v", record.ID, wtErr)
+					record.WorktreePath = ""
+				}
+			}
+
+			agentType := record.AgentType
+			if agentType == "" {
+				agentType = request.AgentType
+			}
+
 			var currentSubagentClient *client.Client
 			if appConfig != nil {
 				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
@@ -775,7 +815,105 @@ func main() {
 				currentSubagentClient = subagentClient
 			}
 
-			child, err := agent.NewSubagentOrchestrator(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, *injectCWDReq, *gemmaThinkingReq, *subagentMaxTurns, effectiveSessionID, saveSubagentHistories, rootAgent, p)
+			child, _, err := agent.NewResumedSubagentOrchestrator(currentSubagentClient, *record, agentType, enabledTools, *injectCWDReq, *gemmaThinkingReq, *subagentMaxTurns, rootAgent, p)
+			if err != nil {
+				return "", fmt.Errorf("resume %s failed: %w", record.ID, err)
+			}
+			child.SetMiddlewares(buildMiddlewares(pluginManager, p, child.Registry()))
+
+			// The resumed child runs with the same mid-turn snapshot ticker
+			// protection as a fresh spawn (see the fresh-spawn runner below)
+			// so a crash during the resumed life still preserves the work.
+			if childSession := childSessionFor(child); childSession != nil {
+				if stopSnapshot := startSubagentSnapshotTicker(child, childSession, subagentSnapshotInterval); stopSnapshot != nil {
+					defer stopSnapshot()
+				}
+			}
+
+			if err := sess.MarkSubagentResumed(record.ID); err != nil {
+				logSubagentErrorf("subagent-resume: failed to mark subagent %s as resumed: %v", record.ID, err)
+			}
+
+			res, err := child.Execute("")
+			// Classify the termination BEFORE looking at err (same contract
+			// as the fresh-spawn runner below), then write the terminal
+			// manifest record. The resumed wording tells the parent this is
+			// a second life.
+			var cause string
+			switch {
+			case err != nil && child.IsStopRequested():
+				cause = "cancelled or killed by the user"
+			case err != nil:
+				cause = fmt.Sprintf("crashed: %v", err)
+			case child.IsStopRequested():
+				cause = "cancelled or killed by the user"
+			}
+			if cause != "" {
+				transcriptPath, terr := writeSubagentTranscript(child, agentType, record.Goal, cause)
+				summary := lastActionPreview(child.History(), 500)
+				result := fmt.Sprintf("The %s subagent terminated abnormally again after resuming (%s).\nFull pruned transcript: %s\nLast actions:\n%s", agentType, cause, transcriptPath, summary)
+				if terr != nil {
+					result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
+				}
+				childID := child.ID()
+				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
+					logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
+				}
+				return result, nil
+			}
+
+			childID := child.ID()
+			if child.IsStopRequested() {
+				final := fmt.Sprintf("The resumed subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res)
+				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {
+					logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
+				}
+				return final, nil
+			}
+
+			if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCompleted, "", previewText(res, manifestResultPreviewLimit), ""); markErr != nil {
+				logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
+			}
+			return fmt.Sprintf("The %s subagent was resumed with its full prior context and completed its task. Final result:\n\n%s", agentType, res), nil
+		}
+
+		runner := func(ctx context.Context, request tool.SubagentSpawnRequest) (string, error) {
+			// Resume mode: restore a previously interrupted child instead of
+			// spawning fresh. The manifest record must exist and be
+			// non-terminal — a completed/failed/cancelled child is done for
+			// good, and the parent is told to spawn fresh instead.
+			if request.IsResume() {
+				return resumeSubagent(ctx, request)
+			}
+
+			goal := request.Goal
+			ctxFiles := request.CtxFiles
+			agentType := request.AgentType
+			worktree := request.Worktree
+
+			var currentSubagentClient *client.Client
+			if appConfig != nil {
+				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
+					var biasForSubagent map[string]int
+					if setting.Model == resolvedSubagentConfig.Model {
+						biasForSubagent = subagentClient.LogitBias()
+					}
+					currentSubagentClient = client.NewClient(client.Config{
+						BaseURL:      setting.URL,
+						APIKey:       setting.Key,
+						Model:        setting.Model,
+						EnableImages: *enableImagesReq,
+						LogitBias:    biasForSubagent,
+						AppVersion:   common.Version,
+					})
+					currentSubagentClient.DiscoverBackend(ctx)
+				}
+			}
+			if currentSubagentClient == nil {
+				currentSubagentClient = subagentClient
+			}
+
+			child, err := agent.NewSubagentOrchestratorWithWorktree(currentSubagentClient, goal, ctxFiles, agentType, enabledTools, *injectCWDReq, *gemmaThinkingReq, *subagentMaxTurns, effectiveSessionID, saveSubagentHistories, worktree, rootAgent, p)
 			if err != nil {
 				return "", err
 			}
@@ -876,6 +1014,45 @@ func deriveEffectiveSessionID(historyPath string) string {
 		return ""
 	}
 	return id
+}
+
+// validateResumeRecord decides whether a manifest record can be live-resumed
+// (spawn_subagent's "resume" argument): only an interrupted child — a record
+// still "running" when this process reads it, i.e. killed by a previous late
+// exit — is resumable. Terminal records are done for good: completed work
+// needs no resume, and failed/cancelled work was already terminated with a
+// recorded cause, so the parent must spawn fresh instead. A record without
+// a persisted history cannot be restored either: the conversation was
+// in-memory only and is gone.
+func validateResumeRecord(record *session.SubagentRecord) error {
+	switch record.Status {
+	case session.SubagentStatusRunning:
+		// The resumable case: running-at-read = interrupted by exit.
+	case session.SubagentStatusCompleted, session.SubagentStatusFailed, session.SubagentStatusCancelled:
+		return terminalResumeError(record)
+	default:
+		return fmt.Errorf("subagent %s has unknown manifest status %q; spawn a fresh agent instead", record.ID, record.Status)
+	}
+	if record.HistoryPath == "" {
+		return fmt.Errorf("subagent %s has no persisted history (subagent history persistence was disabled for that run) — its conversation cannot be restored; spawn a fresh agent instead", record.ID)
+	}
+	return nil
+}
+
+// terminalResumeError is the model-facing error for resuming a child whose
+// manifest record is already terminal: the work is done (or done failing),
+// so the parent must spawn fresh instead.
+func terminalResumeError(record *session.SubagentRecord) error {
+	switch record.Status {
+	case session.SubagentStatusCompleted:
+		return fmt.Errorf("agent %s already terminated (completed); spawn a fresh agent instead", record.ID)
+	default:
+		cause := record.Cause
+		if cause == "" {
+			cause = record.Status
+		}
+		return fmt.Errorf("agent %s already terminated (%s); spawn a fresh agent instead", record.ID, cause)
+	}
 }
 func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableImages bool, logitBias map[string]int) *client.Client {
 	c := client.NewClient(client.Config{

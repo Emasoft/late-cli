@@ -274,21 +274,26 @@ func TestSynthesizeDanglingSpawnResults_StatusWordings(t *testing.T) {
 		}
 	}
 
-	// Running → interrupted wording with preserved-work pointers.
-	if got := results["call_run"]; !strings.Contains(got, "coder-subagent-7 was interrupted") ||
-		!strings.Contains(got, childHistory) || !strings.Contains(got, transcript) {
+	// Running → the directive live-resume wording with the preserved-work
+	// pointers and the exact spawn_subagent resume call.
+	if got := results["call_run"]; !strings.Contains(got, "coder-subagent-7 (coder) was interrupted") ||
+		!strings.Contains(got, childHistory) || !strings.Contains(got, transcript) ||
+		!strings.Contains(got, `{"resume": "coder-subagent-7"}`) ||
+		!strings.Contains(got, "Do NOT re-state the goal") {
 		t.Errorf("running record wording mismatch: %q", got)
 	}
 	// Completed → rare race wording + preview.
 	if got := results["call_done"]; !strings.Contains(got, "completed its task") || !strings.Contains(got, "the finished thing") {
 		t.Errorf("completed record wording mismatch: %q", got)
 	}
-	// Failed → cause preserved.
-	if got := results["call_fail"]; !strings.Contains(got, "failed in a previous session") || !strings.Contains(got, "crashed: boom") {
+	// Failed → cause preserved + the optional-resume pointer.
+	if got := results["call_fail"]; !strings.Contains(got, "failed in a previous session") || !strings.Contains(got, "crashed: boom") ||
+		!strings.Contains(got, `{"resume": "coder-subagent-9"}`) {
 		t.Errorf("failed record wording mismatch: %q", got)
 	}
-	// Cancelled → cancelled wording.
-	if got := results["call_cancel"]; !strings.Contains(got, "cancelled in a previous session") {
+	// Cancelled → cancelled wording + preserved work pointer.
+	if got := results["call_cancel"]; !strings.Contains(got, "cancelled in a previous session") ||
+		!strings.Contains(got, `{"resume": "coder-subagent-10"}`) {
 		t.Errorf("cancelled record wording mismatch: %q", got)
 	}
 	// Unknown call ID → generic interrupted fallback.

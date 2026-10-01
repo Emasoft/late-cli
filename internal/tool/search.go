@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"late/internal/common"
 )
 
 // Maximum number of characters for search output to prevent context window poisoning.
@@ -121,10 +123,7 @@ func (t *SearchContentTool) Execute(ctx context.Context, args json.RawMessage) (
 		params.ContextLines = 0
 	}
 
-	searchPath := "."
-	if params.Path != "" {
-		searchPath = params.Path
-	}
+	searchPath := resolveSearchPath(ctx, params.Path)
 
 	gi, repoRoot := getIgnoreForPath(searchPath, params.IncludeGitignored)
 
@@ -254,6 +253,22 @@ func (t *SearchContentTool) Execute(ctx context.Context, args json.RawMessage) (
 	return result, nil
 }
 
+// resolveSearchPath derives the directory a search walks: the call's
+// explicit `path` parameter when set, otherwise the agent run's worktree
+// (WorktreeDirKey) when one is wired into the context, otherwise the
+// process working directory (".").
+func resolveSearchPath(ctx context.Context, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if worktree := common.GetWorktreeDir(ctx); worktree != "" {
+		// No explicit path and the agent run carries a worktree: search
+		// there instead of the process CWD.
+		return worktree
+	}
+	return "."
+}
+
 // =============================================================================
 // Tool 2: find_files (Find / Path Search)
 // =============================================================================
@@ -338,10 +353,7 @@ func (t *FindFilesTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		params.Type = "any"
 	}
 
-	searchPath := "."
-	if params.Path != "" {
-		searchPath = params.Path
-	}
+	searchPath := resolveSearchPath(ctx, params.Path)
 
 	gi, repoRoot := getIgnoreForPath(searchPath, params.IncludeGitignored)
 
