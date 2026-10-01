@@ -45,10 +45,12 @@ func TestStatusReportsContextExhaustion(t *testing.T) {
 		// Body matches on the qualifying statuses.
 		{"400 openai code", 400, `{"error":{"code":"context_length_exceeded"}}`, nil, true},
 		{"400 openai message", 400, "This model's maximum context length is 8192 tokens", nil, true},
+		{"400 anthropic prompt too long", 400, `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}`, nil, true},
+		{"400 gemini token count", 400, "input token count (571785) exceeds the maximum number of tokens allowed (1048576)", nil, true},
 		{"400 claude style", 400, "Your input length exceeds the model's window", nil, true},
 		{"413 token verdict", 413, "the request exceeds the available context size", nil, true},
-		{"429 body verdict", 429, "request failed: too many tokens in the prompt", nil, true},
 		{"429 code verdict", 429, "rate limit exceeded", "context_length_exceeded", true},
+		{"429 token-phrase body is a throttle, not exhaustion", 429, "request failed: too many tokens in the prompt", nil, false},
 		// Case-insensitivity: the match must survive uppercase providers.
 		{"400 uppercase", 400, "CONTEXT WINDOW exceeded", nil, true},
 		// Body match on a non-qualifying status: the body alone is not enough
@@ -61,6 +63,18 @@ func TestStatusReportsContextExhaustion(t *testing.T) {
 		{"429 throttle", 429, "rate limit exceeded", nil, false},
 		{"429 unrelated code", 429, "rate limit exceeded", "insufficient_quota", false},
 		{"401 body match", 401, "context window", nil, false},
+		// False-positive resistance on the throttle status: a 429 naming
+		// token phrases is a rate/quota bucket (retryable, Retry-After),
+		// not deterministic exhaustion — misclassifying it would skip
+		// retries that would have succeeded. The 429 stays recognizable
+		// via OpenAI's context_length_exceeded code only.
+		{"429 throttle quoting a token statistic", 429, "rate limit exceeded: you sent too many tokens per minute (TPM cap 30000)", nil, false},
+		// Accepted narrow 400 surface: a 400 body naming the window is
+		// treated as the exhaustion verdict even in principle-unrelated
+		// phrasings. Body matching on 400/413 is deliberately substring-
+		// level (provider wordings vary too much for anything smarter);
+		// the real bad-body transient class (z.ai-style read failures)
+		// never mentions the window, so its retries stay intact.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

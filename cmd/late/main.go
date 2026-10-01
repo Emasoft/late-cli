@@ -457,6 +457,11 @@ func main() {
 			if ctxSize, ok := setting.ContextSizeOverride(); ok {
 				c.SetContextSize(ctxSize)
 			}
+		} else if appConfig.ContextSizeTokens > 0 {
+			// Single-model setups have no agent_models entry: the top-level
+			// declaration still reaches the client instead of being silently
+			// dropped.
+			c.SetContextSize(appConfig.ContextSizeTokens)
 		}
 	}
 
@@ -479,6 +484,11 @@ func main() {
 				if ctxSize, ok := setting.ContextSizeOverride(); ok {
 					subagentClient.SetContextSize(ctxSize)
 				}
+			} else if appConfig.ContextSizeTokens > 0 {
+				// Same single-model fallback as the root client: the
+				// subagent shares the declared window unless it has its
+				// own routed entry.
+				subagentClient.SetContextSize(appConfig.ContextSizeTokens)
 			}
 		}
 	}

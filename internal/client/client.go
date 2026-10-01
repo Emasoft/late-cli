@@ -715,14 +715,16 @@ const ContextExceededGuidance = "the conversation exceeded this model's context 
 // contextExceededPatterns are the provider error signatures for deterministic
 // context exhaustion, matched case-insensitively as substrings of the error
 // body: OpenAI's "context_length_exceeded" code, Anthropic's "prompt is too
-// long"/"maximum context length", llama.cpp/Ollama's "context window"/
-// "context size", Gemini's "input token count exceeds", DeepSeek's
-// "reduce the length of the messages", and the generic "too many tokens".
+// long", llama.cpp/Ollama's "context window"/"context size", Gemini's "input
+// token count", DeepSeek's "reduce the length of the messages", and the
+// generic "too many tokens"/"input length exceeds".
 var contextExceededPatterns = []string{
 	"context_length_exceeded",
 	"maximum context length",
+	"prompt is too long",
 	"context window",
 	"too many tokens",
+	"input token count",
 	"input length exceeds",
 	"context size",
 	"reduce the length",
@@ -775,15 +777,19 @@ func (e *ContextExceededError) Unwrap() []error {
 // deterministic context exhaustion. Status-only matching is deliberately
 // narrow: a bare 400/413 says nothing about WHY the request was rejected
 // (OpenAI returns 400 for malformed tool arguments too), so the provider's
-// body must name the limit. The one status-level special case is 429 whose
-// error CODE is OpenAI's "context_length_exceeded" string: rate-limit
-// status, body-level meaning — throttled requests carry a Retry-After, but
-// this one is a hard failure and must not spin the infra retry budget on a
-// request that can never fit.
+// body must name the limit — and only on 400/413, where a body naming the
+// limit IS the verdict. A 429 is throttle semantics by definition: its body
+// naming generic token phrases ("too many tokens") overwhelmingly means a
+// tokens-per-minute/quota bucket, which is retryable and carries a
+// Retry-After, so classifying it as deterministic exhaustion would skip
+// retries that would have succeeded. A 429 that is genuinely context
+// exhaustion signals it through OpenAI's "context_length_exceeded" error
+// CODE, which stays recognized below (rate-limit status, body-level
+// meaning — hard failure, never spins the infra budget).
 func statusReportsContextExhaustion(status int, body string, code any) bool {
 	if isContextExceededBody(body) {
 		switch status {
-		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests:
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 			return true
 		}
 		return false

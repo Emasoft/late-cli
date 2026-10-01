@@ -271,6 +271,13 @@ func RunLoop(
 	// Predictive compaction runs at most once per RunLoop invocation: see
 	// the pre-attempt heuristic inside the turn loop below.
 	predictiveCompactionDone := false
+	// predictedHistoryTokens caches the turn's token estimate across the
+	// attempt loop (retries see frozen history): 0 means "not computed yet
+	// for this turn". Recomputed at the start of each turn — history grows
+	// between turns (assistant reply + tool results), so a stale estimate
+	// would only ever under-trigger, and one blocking BPE pass per turn is
+	// the intended cost.
+	predictedHistoryTokens := 0
 
 	for i := 0; maxTurns <= 0 || i < maxTurns; i++ {
 		if ctx.Err() != nil {
@@ -279,6 +286,7 @@ func RunLoop(
 		if onStartTurn != nil {
 			onStartTurn()
 		}
+		predictedHistoryTokens = 0
 
 		// Inner attempt loop around the stream call only: retries never
 		// consume a turn (the turn counter above is untouched). Each attempt
@@ -327,9 +335,18 @@ func RunLoop(
 			// predict against, and without a compactor the reactive
 			// failure path is the only behavior.
 			if !predictiveCompactionDone {
-				if ctxSize := sess.Client().ContextSize(); ctxSize > 0 {
-					estimated := common.CalculateHistoryTokens(sess.History, sess.SystemPrompt(), sess.GetToolDefinitions())
-					if estimated > ctxSize*95/100 && getContextCompactor() != nil {
+				if ctxSize := sess.Client().ContextSize(); ctxSize > 0 && getContextCompactor() != nil {
+					// The estimate is cached across the attempt loop: a failed
+					// attempt commits nothing, so history is byte-identical on
+					// every retry of this turn — re-tokenizing the whole
+					// conversation (blocking BPE) per attempt would be pure
+					// waste on a 550k-token history. The cache is invalidated
+					// by history growth (tool results land between turns), so
+					// each turn re-estimates against current history once.
+					if predictedHistoryTokens == 0 {
+						predictedHistoryTokens = common.CalculateHistoryTokens(sess.History, sess.SystemPrompt(), sess.GetToolDefinitions())
+					}
+					if predictedHistoryTokens > ctxSize*95/100 {
 						predictiveCompactionDone = true
 						runContextCompaction(ctx)
 					}
@@ -383,6 +400,11 @@ func RunLoop(
 			if isContextExceeded(err) && contextRounds < maxContextCompactionRounds {
 				contextRounds++
 				outcome := runContextCompaction(ctx)
+				// A run that freed something rewrote history: the cached
+				// per-turn estimate is stale (too high), so drop it — the
+				// next predictive check re-estimates against the shrunken
+				// conversation instead of re-triggering a redundant pass.
+				predictedHistoryTokens = 0
 				if outcome.freedSomething() {
 					if onRetry != nil {
 						// Surface the round so the TUI can show the

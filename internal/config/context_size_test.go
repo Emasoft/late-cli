@@ -44,3 +44,18 @@ func TestUnmarshalConfig_ContextSizeTokensAccepted(t *testing.T) {
 		t.Errorf("ContextSizeTokens = %d, want 32768", got)
 	}
 }
+
+// TestUnmarshalConfig_TopLevelContextSizeTokensAccepted pins the
+// single-model fallback: a config without models[]/agent_models can
+// declare the window at the top level and it survives into the struct
+// (main.go applies it when no agent_models entry exists).
+func TestUnmarshalConfig_TopLevelContextSizeTokensAccepted(t *testing.T) {
+	content := []byte(`{"openai_base_url": "http://a:8080", "openai_model": "m", "context-size-tokens": 16384}`)
+	var cfg Config
+	if err := json.Unmarshal(content, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if got := cfg.ContextSizeTokens; got != 16384 {
+		t.Errorf("top-level ContextSizeTokens = %d, want 16384", got)
+	}
+}

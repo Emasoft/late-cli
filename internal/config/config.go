@@ -106,6 +106,13 @@ type Config struct {
 	SubagentAPIKey  string `json:"subagent_api_key,omitempty"`
 	SubagentModel   string `json:"subagent_model,omitempty"`
 
+	// ContextSizeTokens is the single-model fallback for the per-model
+	// models[].context-size-tokens declaration (see ModelSetting): setups
+	// without an agent_models entry (plain openai_* / env-var configs)
+	// declare the window here and it applies to both the orchestrator and
+	// the subagent client. 0/unset = unknown (auto-discovery only).
+	ContextSizeTokens int `json:"context-size-tokens,omitempty"`
+
 	SkillsDir string `json:"skills_dir,omitempty"`
 
 	Theme       string            `json:"theme,omitempty"`

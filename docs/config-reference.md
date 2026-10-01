@@ -114,6 +114,7 @@ Late prefers a located error over silently accepting a typo'd config:
 | `openai_base_url` | string | `http://localhost:8080` | — | Base URL of the main OpenAI-compatible API; `OPENAI_BASE_URL` env overrides when set. |
 | `openai_api_key` | string | `""` | — | API key for the main provider; `OPENAI_API_KEY` env overrides when set. |
 | `openai_model` | string | `""` | — | Main model id used when no `models`/`agent_models` routing applies; `OPENAI_MODEL` env overrides when set. |
+| `context-size-tokens` | number | `0` | — | Single-model fallback for the per-entry `models[].context-size-tokens`: declares the model's context window for setups without `agent_models` routing (the orchestrator and the subagent share it). `0`/unset = unknown (auto-discovery only). |
 | `late_subagent_base_url` | string | `""` (inherits main) | — | Dedicated subagent base URL; wins over the legacy `subagent_base_url`; `LATE_SUBAGENT_BASE_URL` env overrides when set. |
 | `late_subagent_api_key` | string | `""` (inherits main) | — | Dedicated subagent API key; wins over the legacy `subagent_api_key`; `LATE_SUBAGENT_API_KEY` env overrides when set. |
 | `late_subagent_model` | string | `""` (inherits main) | — | Dedicated subagent model; wins over the legacy `subagent_model`; `LATE_SUBAGENT_MODEL` env overrides when set. |
