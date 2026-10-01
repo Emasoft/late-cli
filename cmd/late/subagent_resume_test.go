@@ -159,3 +159,53 @@ func TestResumeWorktreeWordingThroughSynthesis(t *testing.T) {
 		}
 	}
 }
+
+// TestMatchSpawnRecordNeverCrossesAgentType pins the correlation guard: a
+// spawn call that names an agent_type must never be matched to a record of
+// a DIFFERENT type — the directive wording names the record's resume ID,
+// and a wrong-type correlation would advertise resuming the wrong child.
+// An untyped call may still bind any record (the args are a wildcard).
+func TestMatchSpawnRecordNeverCrossesAgentType(t *testing.T) {
+	records := []session.SubagentRecord{
+		{ID: "coder-subagent-20", AgentType: "coder", Goal: "port the parser", Status: session.SubagentStatusRunning, SpawnedAt: nowMinus(t, time.Hour)},
+		{ID: "researcher-subagent-21", AgentType: "researcher", Goal: "survey options", Status: session.SubagentStatusRunning, SpawnedAt: nowMinus(t, time.Hour)},
+	}
+	manifest := &session.SubagentManifest{Records: records}
+
+	// A call naming a type that has NO record (e.g. the spawn used a type
+	// that was never persisted, or all its records are consumed) must NOT
+	// grab a record of a DIFFERENT type — the old catch-all tier bound
+	// exactly that wrong record and advertised resuming the wrong child.
+	tc := client.ToolCall{ID: "call_r", Function: client.FunctionCall{
+		Name: spawnSubagentToolName, Arguments: `{"goal":"entirely unrelated","agent_type":"tester"}`,
+	}}
+	if rec := matchSpawnRecord(manifest, tc, map[*session.SubagentRecord]bool{}); rec != nil {
+		t.Errorf("typed call with no matching record bound %s (%s), want nil (generic wording)", rec.ID, rec.AgentType)
+	}
+
+	// A call whose goal matches nothing still binds its OWN type's record
+	// (the type-only tier: spawn args may paraphrase the goal, but the
+	// type is a strong signal).
+	tcDrift := client.ToolCall{ID: "call_d", Function: client.FunctionCall{
+		Name: spawnSubagentToolName, Arguments: `{"goal":"entirely unrelated","agent_type":"researcher"}`,
+	}}
+	if rec := matchSpawnRecord(manifest, tcDrift, map[*session.SubagentRecord]bool{}); rec == nil || rec.AgentType != "researcher" {
+		t.Errorf("goal-drifted call bound %+v, want its own researcher record", rec)
+	}
+
+	// An untyped call still falls back to any record (backward compat).
+	tcUntyped := client.ToolCall{ID: "call_u", Function: client.FunctionCall{
+		Name: spawnSubagentToolName, Arguments: `{}`,
+	}}
+	if rec := matchSpawnRecord(manifest, tcUntyped, map[*session.SubagentRecord]bool{}); rec == nil {
+		t.Error("untyped call with no matching record must still bind a record (wildcard args)")
+	}
+
+	// The typed call whose type matches binds its own record.
+	tcCoder := client.ToolCall{ID: "call_c", Function: client.FunctionCall{
+		Name: spawnSubagentToolName, Arguments: `{"goal":"port the parser","agent_type":"coder"}`,
+	}}
+	if rec := matchSpawnRecord(manifest, tcCoder, map[*session.SubagentRecord]bool{}); rec == nil || rec.ID != "coder-subagent-20" {
+		t.Errorf("typed call bound %+v, want coder-subagent-20", rec)
+	}
+}

@@ -171,8 +171,14 @@ type spawnArgs struct {
 // Within each precision tier a still-running record is preferred (the
 // interrupted-spawn case); a terminal record matches only when no running
 // one fits (the result-lost race: the crash landed between the runner's
-// return and the parent's result persistence). Unmatched calls fall back to
-// the generic wording — nil return.
+// return and the parent's result persistence). When no tier matches on
+// concrete arguments (all tiers empty or contradictory), the final tier
+// falls back to ANY unconsumed record so the parent still gets the
+// manifest's real state for its dangling call: the wording is equally true
+// of whichever interrupted child it names, and the correlation is
+// best-effort by design — spawn arguments and manifest records share no
+// stored link. Unmatched calls (empty manifest, everything consumed) fall
+// back to the generic interrupted wording — nil return.
 func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, consumed map[*session.SubagentRecord]bool) *session.SubagentRecord {
 	var args spawnArgs
 	_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
@@ -192,6 +198,11 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 	}
 	running := func(rec *session.SubagentRecord) bool { return rec.Status == session.SubagentStatusRunning }
 	matchesType := func(rec *session.SubagentRecord) bool {
+		// An empty arg is a wildcard (the model omitted agent_type); a
+		// non-empty one must AGREE with the record — a "researcher" spawn
+		// call must not be correlated with a "coder" record, whose
+		// directive resume wording would point the parent at the wrong
+		// child.
 		return args.AgentType == "" || rec.AgentType == args.AgentType
 	}
 	matchesGoal := func(rec *session.SubagentRecord) bool {
@@ -211,10 +222,22 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 	if rec := tier(matchesType); rec != nil {
 		return rec
 	}
-	if rec := tier(matchesGoal); rec != nil {
+	// Goal-only tier still requires the agent type to agree (a typed call
+	// must never bind a different type's record — a wrong-type directive
+	// resume wording would point the parent at the wrong child); an
+	// untyped call matches by goal alone.
+	if rec := tier(func(rec *session.SubagentRecord) bool { return matchesType(rec) && args.Goal != "" && matchesGoal(rec) }); rec != nil {
 		return rec
 	}
-	return tier(func(*session.SubagentRecord) bool { return true })
+	// Last resort: any unconsumed record. The agent-type tiers above stay
+	// strict (never cross-type), so the catch-all still cannot bind a spawn
+	// call to a record of a DIFFERENT type — it only fills in when the call
+	// named no type at all, and the wording remains true of the child it
+	// names.
+	if rec := tier(func(*session.SubagentRecord) bool { return args.AgentType == "" }); rec != nil {
+		return rec
+	}
+	return nil
 }
 
 // manifestInterruptedText builds the tool-result string for one dangling

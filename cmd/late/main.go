@@ -830,9 +830,11 @@ func main() {
 				}
 			}
 
-			if err := sess.MarkSubagentResumed(record.ID); err != nil {
-				logSubagentErrorf("subagent-resume: failed to mark subagent %s as resumed: %v", record.ID, err)
-			}
+			// MarkSubagentResumed is NOT called here: the resume constructor
+			// (agent.NewResumedSubagentOrchestrator) already flipped the
+			// record to running and bumped ResumeCount, and a second mark
+			// would double-count every resume. This site historically
+			// duplicated the bookkeeping — removed in the review pass.
 
 			res, err := child.Execute("")
 			// Classify the termination BEFORE looking at err (same contract
