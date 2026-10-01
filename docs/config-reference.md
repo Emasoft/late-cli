@@ -326,6 +326,15 @@ Each element of the `models` array is an object:
   entry's value (when valid) > the global `jev-autocompact-percent` > `99`.
   Out-of-range values warn at startup and fall back to the global (the strict
   parser covers key names, not value ranges).
+* `context-size-tokens` (number, optional, default `0` = unknown) — declares
+  the model's context window in tokens for backends that never advertise it.
+  llama.cpp is auto-discovered (the `/props` and `/v1/models` probes read
+  `n_ctx`); generic OpenAI-compatible providers and truncating local gateways
+  return nothing, which leaves the context size unknown and the predictive
+  compaction heuristic dark. Set this to the model's real window (e.g.
+  `32768`) and late behaves as if the backend had advertised it: the
+  declared value OVERRIDES discovery (a probe result never clobbers it) and
+  also back-fills when discovery finds nothing. Values `<= 0` are ignored.
 
 ### `agent_models` values
 
