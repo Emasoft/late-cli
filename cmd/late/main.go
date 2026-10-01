@@ -553,6 +553,27 @@ func main() {
 		}
 	}
 
+	// Tool-output archiving (default behavior, no config key): oversized
+	// tool outputs are written under the session's folder and the
+	// conversation carries only the compact reference form. One archive for
+	// the run — the root agent and every subagent share it. Rooted at the
+	// active session's folder so the archive dies with the session folder
+	// (RemoveSessionFolder); an in-memory session (no derived session ID)
+	// fails the validity check and simply gets no archive — everything
+	// stays inline.
+	toolArchiveDir, archiveDirErr := session.OutputArchiveDir(effectiveSessionID)
+	if archiveDirErr == nil {
+		arch, archErr := session.NewOutputArchive(toolArchiveDir)
+		if archErr != nil {
+			// Archiving is fail-open end to end: ExecuteToolCalls keeps
+			// results inline on any archive error, so a failed setup only
+			// disables the feature.
+			fmt.Fprintf(os.Stderr, "Warning: tool-output archiving disabled (%v)\n", archErr)
+		} else {
+			executor.SetToolResultArchiver(arch)
+		}
+	}
+
 	// Resolve theme: --theme flag > $LATE_THEME > config.json > bundled base.
 	themeID := *themeReq
 	if themeID == "" {

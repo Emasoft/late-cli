@@ -161,6 +161,12 @@ When Late creates subagents, each appears in its own tab while it works and disa
 
 ---
 
+## Tool-Output Archiving
+
+Independent of any other context management (default behavior, no config): tool outputs over 1024 characters are archived verbatim under the session's folder (`<sessions>/<sessionID>/tool-outputs/<sha256[:16]>.txt`) and the conversation carries a compact reference form — the first 2000 characters plus a `[full output archived: <path>]` pointer. The reference is content-addressed and deterministic (identical output → identical bytes), it is written once and never rewritten, and on any archive error the full output stays inline.
+
+---
+
 ## Tool Approval
 
 Potentially destructive commands and file changes require approval unless you have already granted permission for that scope.
