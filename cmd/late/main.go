@@ -857,14 +857,24 @@ func main() {
 				if terr != nil {
 					result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
 				}
-				childID := child.ID()
+				// Terminal status lands on the RESUME RECORD's ID, not the
+				// child's: a collision-renamed live twin (the root already
+				// listed a restored child with the record's id, so the
+				// twin got "-r1") is an unknown manifest ID —
+				// MarkSubagentStatus is a no-op for unknown IDs, so writing
+				// the twin ID would leave the record "running" forever and
+				// the next resume cycle would re-advertise an agent that
+				// already finished.
+				childID := record.ID
 				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusFailed, cause, "", transcriptPath); markErr != nil {
 					logSubagentErrorf("subagent-manifest: failed to record terminal status for %s: %v", childID, markErr)
 				}
 				return result, nil
 			}
 
-			childID := child.ID()
+			// Same record-ID keying for the normal termination paths: the
+			// resumed child IS this manifest record, twin-renamed or not.
+			childID := record.ID
 			if child.IsStopRequested() {
 				final := fmt.Sprintf("The resumed subagent task was explicitly cancelled by the user. Final output before cancellation:\n\n%s", res)
 				if markErr := sess.MarkSubagentStatus(childID, session.SubagentStatusCancelled, "cancelled or killed by the user", "", ""); markErr != nil {

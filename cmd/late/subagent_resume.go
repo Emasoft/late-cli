@@ -251,7 +251,11 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 // the generic interrupted wording.
 func manifestInterruptedText(manifest *session.SubagentManifest, tc client.ToolCall, record *session.SubagentRecord) string {
 	if record == nil {
-		return danglingSubagentInterruptedText(tc.ID, "", "", "")
+		// The tool-call ID must NEVER be advertised as a resume ID: it
+		// lives in a different namespace than the manifest's child IDs, so
+		// spawn_subagent {"resume": "<tc.ID>"} could never resolve. The
+		// id-less generic wording is the fail-safe.
+		return danglingSubagentInterruptedText("", "", "", "")
 	}
 	switch record.Status {
 	case session.SubagentStatusRunning:

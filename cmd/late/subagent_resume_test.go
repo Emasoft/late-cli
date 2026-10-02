@@ -160,6 +160,65 @@ func TestResumeWorktreeWordingThroughSynthesis(t *testing.T) {
 	}
 }
 
+// TestSynthesisUnmatchedCallNeverAdvertisesToolCallID runs two dangling
+// spawn calls through the full synthesis path with only ONE manifest record:
+// the first call consumes it; the second is unmatched (a typed call with no
+// same-type record falls through every tier). The unmatched wording must be
+// the id-less generic one — the record-less branch used to pass the
+// TOOL-CALL ID into the directive, advertising
+// spawn_subagent {"resume": "<tc.ID>"} with an id that lives in a different
+// namespace than the manifest's child IDs and could never resolve.
+func TestSynthesisUnmatchedCallNeverAdvertisesToolCallID(t *testing.T) {
+	const sessionID = "session-phasec-unmatched-wording"
+	sess := runnerTestSession(t, sessionID)
+
+	if err := sess.AddAssistantMessageWithTools("", "", []client.ToolCall{
+		{Index: 0, ID: "call_first", Type: "function",
+			Function: client.FunctionCall{Name: spawnSubagentToolName, Arguments: `{"goal":"port the module","agent_type":"coder"}`}},
+		{Index: 1, ID: "call_second", Type: "function",
+			Function: client.FunctionCall{Name: spawnSubagentToolName, Arguments: `{"goal":"fix the flaky test","agent_type":"coder"}`}},
+	}); err != nil {
+		t.Fatalf("AddAssistantMessageWithTools: %v", err)
+	}
+
+	if err := sess.SaveSubagentRecord(session.SubagentRecord{
+		ID: "coder-subagent-7", AgentType: "coder", Goal: "port the module",
+		Status: session.SubagentStatusRunning, SpawnedAt: nowMinus(t, time.Hour),
+		HistoryPath: "/s/coder-subagent-7.json",
+	}); err != nil {
+		t.Fatalf("SaveSubagentRecord: %v", err)
+	}
+
+	saved, err := session.LoadHistory(sess.HistoryPath)
+	if err != nil {
+		t.Fatalf("LoadHistory: %v", err)
+	}
+	resumed := session.New(nil, sess.HistoryPath, saved, "prompt", false)
+	if _, err := synthesizeDanglingSpawnResults(resumed); err != nil {
+		t.Fatalf("synthesizeDanglingSpawnResults: %v", err)
+	}
+	results := map[string]string{}
+	for _, m := range resumed.History {
+		if m.Role == "tool" {
+			results[m.ToolCallID] = m.Content.String()
+		}
+	}
+	if results["call_first"] == "" || results["call_second"] == "" {
+		t.Fatalf("both dangling calls must be synthesized: %q / %q", results["call_first"], results["call_second"])
+	}
+	// The matched call carries the directive; the unmatched call must not
+	// advertise ANY resume id — least of all its tool-call ID.
+	if !strings.Contains(results["call_first"], `{"resume": "coder-subagent-7"}`) {
+		t.Errorf("matched call lost the resume directive:\n%s", results["call_first"])
+	}
+	if strings.Contains(results["call_second"], `"resume"`) {
+		t.Errorf("unmatched call must not advertise a resume call (its tool-call ID can never resolve):\n%s", results["call_second"])
+	}
+	if !strings.Contains(results["call_second"], "Review it and continue or re-spawn as needed.") {
+		t.Errorf("unmatched call lost the generic review wording:\n%s", results["call_second"])
+	}
+}
+
 // TestMatchSpawnRecordNeverCrossesAgentType pins the correlation guard: a
 // spawn call that names an agent_type must never be matched to a record of
 // a DIFFERENT type — the directive wording names the record's resume ID,
