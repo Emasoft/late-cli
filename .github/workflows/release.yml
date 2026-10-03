@@ -75,7 +75,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             OUTPUT_NAME="${OUTPUT_NAME}.exe"
           fi
-          go build -ldflags "-X late/internal/common.Version=${{ github.ref_name }}" -o $OUTPUT_NAME ./cmd/late
+          go build -ldflags "-X late/internal/common.Version=${{ github.ref_name }} -X late/internal/common.BuildNumber=${{ github.run_number }} -X late/internal/common.Commit=${{ github.sha }} -X 'late/internal/common.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" -o $OUTPUT_NAME ./cmd/late
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
