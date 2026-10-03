@@ -298,9 +298,14 @@ func main() {
 	// writing files outside the session folder.
 	effectiveSessionID := deriveEffectiveSessionID(historyPath)
 
-	// Load existing history
-	history, err := session.LoadHistory(historyPath)
+	// Load existing history. A corrupt/unreadable file is backed up
+	// (LoadHistoryRecovering) before the first save can overwrite it, and
+	// the run degrades to an empty history with a loud warning — silently
+	// starting over (the old behavior) also silently destroyed the user's
+	// session on the next save.
+	history, err := session.LoadHistoryRecovering(historyPath)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load history %s (%v); starting with an empty history (the previous bytes were backed up alongside it if they could be read)\n", historyPath, err)
 		history = []client.ChatMessage{}
 	}
 	// Initialize MCP client
