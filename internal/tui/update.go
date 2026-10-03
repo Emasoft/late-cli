@@ -1416,7 +1416,22 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			next := (idx + 1) % len(all)
 			m.Focused = all[next]
 			// Initialize state if missing
-			m.GetAgentState(m.Focused.ID())
+			state := m.GetAgentState(m.Focused.ID())
+			// A restored subagent (agent.RestoredSubagentOrchestrator)
+			// carries its status line — "restored — was interrupted" with
+			// the recorded cause — through an interface method. Without
+			// this seed the freshly created state says "Ready", hiding the
+			// one fact the user needs when tabbing to a historical child:
+			// that its transcript is the record of an interrupted run, not
+			// a live agent. Only the default seeding is overridden, so a
+			// state that already carries real status text keeps it.
+			if state.StatusText == "Ready" {
+				if texter, ok := m.Focused.(interface{ StatusText() string }); ok {
+					if text := texter.StatusText(); text != "" {
+						state.StatusText = text
+					}
+				}
+			}
 			m.updateViewport()
 			return m, nil
 

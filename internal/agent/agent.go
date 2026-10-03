@@ -235,7 +235,12 @@ func newSubagentOrchestrator(
 	childSession := session.NewSubagentSession(c, subagentHistoryPath, []client.ChatMessage{}, systemPrompt)
 	registerSubagentTools(childSession, parent, config, enabledTools)
 
-	// Construct Initial Context
+	// Construct Initial Context. Unreadable ctx_files are NAMED, not
+	// silently skipped: a dropped entry used to leave "Context Files:" with
+	// nothing under it while the model believed the file's contents were
+	// attached — a silent context loss the child then rediscovered (or
+	// reported as done). The annotation keeps the spawn alive and tells the
+	// child exactly which path is missing.
 	initialMsg := fmt.Sprintf("Goal: %s", goal)
 	if len(ctxFiles) > 0 {
 		initialMsg += "\n\nContext Files:\n"
@@ -243,6 +248,8 @@ func newSubagentOrchestrator(
 			content, err := os.ReadFile(f)
 			if err == nil {
 				initialMsg += fmt.Sprintf("- %s:\n```\n%s\n```\n", f, string(content))
+			} else {
+				initialMsg += fmt.Sprintf("- %s: (could not be read: %v)\n", f, err)
 			}
 		}
 	}
@@ -340,6 +347,16 @@ func NewResumedSubagentOrchestrator(
 	history, err := session.LoadHistory(record.HistoryPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("resume %s: failed to load preserved history: %w", record.ID, err)
+	}
+	// An EMPTY load — a manually deleted file, or a record whose run
+	// persisted nothing — means there is nothing to restore: the loaded
+	// history is the child's only goal and context (no goal re-append on
+	// resume), so continuing here would run a live child with NO task at
+	// all, silently. Refuse with the spawn-fresh hint instead, mirroring
+	// validateResumeRecord's HistoryPath == "" rule one level deeper (the
+	// file was recorded, then lost).
+	if len(history) == 0 {
+		return nil, "", fmt.Errorf("resume %s: the preserved history at %s is empty or missing — its conversation cannot be restored; spawn a fresh agent instead", record.ID, record.HistoryPath)
 	}
 
 	// The resumed child appends new turns to the SAME history file its

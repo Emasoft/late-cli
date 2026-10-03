@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -295,4 +296,133 @@ func validateBranch(t *testing.T, repo, branch string) ([]byte, error) {
 	cmd := exec.Command("git", "branch", branch)
 	cmd.Dir = repo
 	return cmd.CombinedOutput()
+}
+
+// TestSpawnSubagentTool_FreshSpawnArgumentValidation pins the tool-level
+// validation of the fresh-spawn argument surface (the schema cannot rely on
+// provider-side "required" enforcement, and an empty string satisfies every
+// JSON type). Every failure is an error RESULT (nil Go error) with the
+// runner NEVER invoked — before the worktree check, so no branch or
+// directory is created for a spawn that is going to be rejected anyway.
+func TestSpawnSubagentTool_FreshSpawnArgumentValidation(t *testing.T) {
+	tmp := t.TempDir()
+	existing := filepath.Join(tmp, "notes.md")
+	if err := os.WriteFile(existing, []byte("context"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		args        string
+		wantInError string // substring the error result must carry
+	}{
+		{
+			name:        "empty goal is rejected",
+			args:        `{"goal":"","agent_type":"coder"}`,
+			wantInError: `empty goal`,
+		},
+		{
+			name:        "whitespace goal is rejected",
+			args:        `{"goal":"   ","agent_type":"coder"}`,
+			wantInError: `empty goal`,
+		},
+		{
+			name:        "missing goal is rejected",
+			args:        `{"agent_type":"coder"}`,
+			wantInError: `empty goal`,
+		},
+		{
+			name:        "unknown agent_type is rejected with the valid set",
+			args:        `{"goal":"g","agent_type":"astronaut"}`,
+			wantInError: `unknown agent_type "astronaut"`,
+		},
+		{
+			name:        "empty agent_type is rejected",
+			args:        `{"goal":"g"}`,
+			wantInError: `empty agent_type`,
+		},
+		{
+			name:        "missing ctx_file is rejected with the path named",
+			args:        `{"goal":"g","agent_type":"coder","ctx_files":["` + filepath.Join(tmp, "gone.md") + `"]}`,
+			wantInError: filepath.Join(tmp, "gone.md"),
+		},
+		{
+			name:        "directory ctx_file is rejected",
+			args:        `{"goal":"g","agent_type":"coder","ctx_files":["` + tmp + `"]}`,
+			wantInError: "is a directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerCalled := false
+			spawnTool := SpawnSubagentTool{
+				Runner: func(ctx context.Context, request SubagentSpawnRequest) (string, error) {
+					runnerCalled = true
+					return "ok", nil
+				},
+			}
+
+			result, err := spawnTool.Execute(context.Background(), json.RawMessage(tt.args))
+			if err != nil {
+				t.Fatalf("Execute() Go error = %v, want nil (an error result the model can read)", err)
+			}
+			if runnerCalled {
+				t.Fatal("runner must not be invoked for invalid spawn arguments")
+			}
+			if !strings.Contains(result, tt.wantInError) {
+				t.Fatalf("error result = %q, want it to contain %q", result, tt.wantInError)
+			}
+			if !strings.Contains(result, "Error:") {
+				t.Fatalf("error result = %q, want the Error: prefix the other validation results carry", result)
+			}
+		})
+	}
+
+	t.Run("valid arguments reach the runner", func(t *testing.T) {
+		var got SubagentSpawnRequest
+		spawnTool := SpawnSubagentTool{
+			Runner: func(ctx context.Context, request SubagentSpawnRequest) (string, error) {
+				got = request
+				return "ok", nil
+			},
+		}
+		args := fmt.Sprintf(`{"goal":" port the module ","agent_type":"coder","ctx_files":[%q]}`, existing)
+		result, err := spawnTool.Execute(context.Background(), json.RawMessage(args))
+		if err != nil {
+			t.Fatalf("Execute() Go error = %v, want nil", err)
+		}
+		if result != "ok" {
+			t.Fatalf("result = %q, want the runner's ok", result)
+		}
+		if got.Goal != " port the module " {
+			t.Errorf("goal = %q, want it passed through untrimmed (the trim is only a validation check)", got.Goal)
+		}
+		if len(got.CtxFiles) != 1 || got.CtxFiles[0] != existing {
+			t.Errorf("ctx_files = %v, want the existing file", got.CtxFiles)
+		}
+	})
+
+	t.Run("resume requests skip fresh-spawn validation", func(t *testing.T) {
+		// A resume names the child and ignores every other field — the
+		// goal-less request is exactly the shape a resume call takes when
+		// the provider does not enforce the schema's required list.
+		runnerCalled := false
+		spawnTool := SpawnSubagentTool{
+			Runner: func(ctx context.Context, request SubagentSpawnRequest) (string, error) {
+				runnerCalled = true
+				return "ok", nil
+			},
+		}
+		result, err := spawnTool.Execute(context.Background(), json.RawMessage(`{"resume":"coder-subagent-0"}`))
+		if err != nil {
+			t.Fatalf("Execute() Go error = %v, want nil", err)
+		}
+		if !runnerCalled {
+			t.Fatal("runner must be invoked for a resume request")
+		}
+		if result != "ok" {
+			t.Fatalf("result = %q, want the runner's ok", result)
+		}
+	})
 }
