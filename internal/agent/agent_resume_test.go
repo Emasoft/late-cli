@@ -432,3 +432,121 @@ func TestNewResumedSubagentOrchestrator_TypeMismatch(t *testing.T) {
 		t.Fatal("resume with an empty record ID must fail")
 	}
 }
+
+// TestNewResumedSubagentOrchestrator_EmptyHistoryRefused pins the
+// deleted-history edge case: a record whose history file was removed by hand
+// (or never got its bytes) loads as an EMPTY conversation, and a live resume
+// of it would run a child with no goal at all — the loaded history is the
+// child's only task statement, because resume never re-appends the goal. The
+// constructor must refuse with the spawn-fresh hint instead of restoring a
+// task-less agent, and must not add the child to the parent.
+func TestNewResumedSubagentOrchestrator_EmptyHistoryRefused(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) string{
+		// The file was deleted after the manifest recorded it.
+		"missing history file": func(t *testing.T) string {
+			t.Helper()
+			return filepath.Join(t.TempDir(), "subagents", "coder-subagent-9.json")
+		},
+		// The file exists but holds zero messages (a manually emptied or
+		// truncated file; LoadHistory treats it like missing).
+		"empty history file": func(t *testing.T) string {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "subagents", "coder-subagent-9.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			setSessionDirForTest(t, tmp)
+
+			historyPath := setup(t)
+			c := client.NewClient(client.Config{BaseURL: "http://localhost:8080"})
+			parentSess := session.New(c, filepath.Join(tmp, "session-empty-hist.json"), nil, "parent prompt", true)
+			parent := orchestrator.NewBaseOrchestrator(common.MainAgentID, parentSess, nil, 0)
+
+			record := session.SubagentRecord{
+				ID:          "coder-subagent-9",
+				AgentType:   "coder",
+				Goal:        "half-done work",
+				Status:      session.SubagentStatusRunning,
+				HistoryPath: historyPath,
+				WorkingDir:  "/projects/late",
+			}
+			if err := parentSess.SaveSubagentRecord(record); err != nil {
+				t.Fatalf("SaveSubagentRecord: %v", err)
+			}
+
+			child, id, err := NewResumedSubagentOrchestrator(c, record, "coder", map[string]bool{}, false, false, 10, parent, nil)
+			if err == nil {
+				t.Fatal("resuming a child with no preserved history must fail")
+			}
+			if child != nil {
+				t.Errorf("child = %v, want nil", child)
+			}
+			if id != "" {
+				t.Errorf("id = %q, want empty on failure", id)
+			}
+			if !strings.Contains(err.Error(), "empty or missing") || !strings.Contains(err.Error(), "spawn a fresh agent") {
+				t.Errorf("err = %v, want the empty-history wording with the spawn-fresh hint", err)
+			}
+			if n := len(parent.Children()); n != 0 {
+				t.Errorf("parent holds %d children, want 0 (the refused child must not be wired in)", n)
+			}
+		})
+	}
+}
+
+// TestNewSubagentOrchestrator_UnreadableCtxFileAnnotated pins the goal
+// message contract for unreadable context files: a ctx_file whose read fails
+// (missing between validation and spawn, permission, directory) is NAMED in
+// the initial message instead of being silently dropped, so the child knows
+// the context it was promised is absent.
+func TestNewSubagentOrchestrator_UnreadableCtxFileAnnotated(t *testing.T) {
+	tmp := t.TempDir()
+	setSessionDirForTest(t, tmp)
+
+	dir := filepath.Join(tmp, "docs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	c := client.NewClient(cfg)
+	mockSession := session.New(c, filepath.Join(tmp, "session-ctx.json"), []client.ChatMessage{}, "prompt", true)
+	parent := orchestrator.NewBaseOrchestrator("parent", mockSession, nil, 10)
+
+	child, err := NewSubagentOrchestrator(
+		c, "refactor the parser", []string{filepath.Join(tmp, "missing.md"), dir}, "researcher",
+		map[string]bool{}, false, false, 10, "session-ctx", true, parent, nil,
+	)
+	if err != nil {
+		t.Fatalf("NewSubagentOrchestrator: %v", err)
+	}
+
+	first := child.History()[0].Content.String()
+	if !strings.Contains(first, "Goal: refactor the parser") {
+		t.Errorf("initial message lost the goal:\n%s", first)
+	}
+	if !strings.Contains(first, "Context Files:") {
+		t.Errorf("initial message lost the context-file section:\n%s", first)
+	}
+	for _, want := range []string{
+		filepath.Join(tmp, "missing.md"),
+		"could not be read",
+		dir + ": (could not be read:",
+	} {
+		if !strings.Contains(first, want) {
+			t.Errorf("initial message must annotate the unreadable file, want substring %q in:\n%s", want, first)
+		}
+	}
+	// The directory annotation must name the underlying reason, not a bare path.
+	if !strings.Contains(first, "is a directory") {
+		t.Errorf("directory ctx_file annotation must carry the read error, got:\n%s", first)
+	}
+}

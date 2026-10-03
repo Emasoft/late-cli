@@ -19,6 +19,7 @@ type mockOrchestrator struct {
 	supportsVision  bool
 	history         []client.ChatMessage
 	queuedMessages  []string
+	resetCount      int
 }
 
 func (m *mockOrchestrator) ID() string { return "mock" }
@@ -28,8 +29,11 @@ func (m *mockOrchestrator) Submit(text string, images []string) error {
 	m.submitCount++
 	return m.submitErr
 }
-func (m *mockOrchestrator) Execute(text string) (string, error)      { return "", nil }
-func (m *mockOrchestrator) Reset() error                             { return nil }
+func (m *mockOrchestrator) Execute(text string) (string, error) { return "", nil }
+func (m *mockOrchestrator) Reset() error {
+	m.resetCount++
+	return nil
+}
 func (m *mockOrchestrator) Rewind(index int) error                   { return nil }
 func (m *mockOrchestrator) Cancel()                                  {}
 func (m *mockOrchestrator) IsStopRequested() bool                    { return false }

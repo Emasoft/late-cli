@@ -123,6 +123,15 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 		return t.Runner(ctx, params, timeoutOverride)
 	}
 
+	// Fresh-spawn input validation: every failure is an error RESULT (nil
+	// Go error) and must land BEFORE the worktree check — worktree creation
+	// has side effects (a branch and a directory), so a spawn with an empty
+	// goal or unreadable context files must be rejected before any of them
+	// happen. The model reads the hint and retries with fixed arguments.
+	if hint := validateFreshSpawnArgs(params); hint != "" {
+		return hint, nil
+	}
+
 	if params.Worktree != "" {
 		wtPath, wtErr := ValidateWorktree(params.Worktree)
 		if wtErr != nil {
@@ -138,6 +147,85 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	return t.Runner(ctx, params, timeoutOverride)
+}
+
+// validateFreshSpawnArgs checks the fresh-spawn argument surface the schema
+// cannot guarantee (a provider may not enforce "required", and empty strings
+// satisfy JSON types). Returns an error-RESULT string when validation fails —
+// the spawn never reaches the runner — or "" when the arguments are usable:
+//
+//   - goal: non-empty after trimming. An empty goal would spawn a child whose
+//     only instruction is "Goal: " — the child has nothing to do, yet the
+//     manifest records it as running work.
+//   - agent_type: one of the configured subagent types (the same source the
+//     schema enum is built from). Without this check an unknown type fails
+//     deeper in the runner with a bare Go error instead of a retryable hint.
+//   - ctx_files: every entry must exist and be a readable FILE. Missing
+//     entries used to be dropped silently when the goal message was built
+//     (os.ReadFile error → skipped), so the model believed context was
+//     attached when it was not.
+func validateFreshSpawnArgs(params SubagentSpawnRequest) string {
+	if strings.TrimSpace(params.Goal) == "" {
+		return `Error: empty goal — pass the task for the subagent in the "goal" field`
+	}
+
+	if strings.TrimSpace(params.AgentType) == "" {
+		return fmt.Sprintf("Error: empty agent_type — valid types: %s", configuredAgentTypes())
+	}
+	if !isConfiguredAgentType(params.AgentType) {
+		return fmt.Sprintf("Error: unknown agent_type %q — valid types: %s", params.AgentType, configuredAgentTypes())
+	}
+
+	if len(params.CtxFiles) > 0 {
+		var problems []string
+		for _, f := range params.CtxFiles {
+			info, err := os.Stat(f)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%q does not exist (%v)", f, err))
+				continue
+			}
+			if info.IsDir() {
+				problems = append(problems, fmt.Sprintf("%q is a directory, not a file", f))
+			}
+		}
+		if len(problems) > 0 {
+			return fmt.Sprintf("Error: unusable ctx_files entries — %s. Remove them or pass existing file paths, then spawn again",
+				strings.Join(problems, "; "))
+		}
+	}
+	return ""
+}
+
+// isConfiguredAgentType reports whether name is a configured subagent type.
+// A broken/empty embedded registry disables the check (spawns then fail
+// deeper in the runner with the historical "unknown agent type" error
+// instead of being bricked at the door).
+func isConfiguredAgentType(name string) bool {
+	configs := assets.GetSubagents()
+	if len(configs) == 0 {
+		return true
+	}
+	for _, c := range configs {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// configuredAgentTypes renders the configured subagent type names for
+// model-facing hints (falls back to a pointer at the config when the
+// embedded registry is unavailable).
+func configuredAgentTypes() string {
+	configs := assets.GetSubagents()
+	names := make([]string, 0, len(configs))
+	for _, c := range configs {
+		names = append(names, c.Name)
+	}
+	if len(names) == 0 {
+		return "see the subagent registry"
+	}
+	return strings.Join(names, ", ")
 }
 
 // parseSubagentTimeout parses the optional per-spawn "timeout" argument.

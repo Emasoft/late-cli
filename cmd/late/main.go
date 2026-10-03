@@ -332,9 +332,14 @@ func main() {
 	// writing files outside the session folder.
 	effectiveSessionID := deriveEffectiveSessionID(historyPath)
 
-	// Load existing history
-	history, err := session.LoadHistory(historyPath)
+	// Load existing history. A corrupt/unreadable file is backed up
+	// (LoadHistoryRecovering) before the first save can overwrite it, and
+	// the run degrades to an empty history with a loud warning — silently
+	// starting over (the old behavior) also silently destroyed the user's
+	// session on the next save.
+	history, err := session.LoadHistoryRecovering(historyPath)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load history %s (%v); starting with an empty history (the previous bytes were backed up alongside it if they could be read)\n", historyPath, err)
 		history = []client.ChatMessage{}
 	}
 	// Initialize MCP client
@@ -2108,8 +2113,12 @@ func historyCompactionRunner(sess *session.Session, scorer session.HistoryScorer
 		if !shadow {
 			// The walk mutated (or partially mutated — a mid-walk scorer
 			// failure leaves consistent pointers and stored originals)
-			// history: persist it even when err != nil.
-			if saveErr := session.SaveHistory(sess.HistoryPath, sess.History); saveErr != nil {
+			// history: persist it even when err != nil. PersistHistory reads
+			// the history under historyMu (a plain session.SaveHistory of
+			// sess.History raced the snapshot ticker's copy) and is
+			// generation-checked; for a fully-walked session it rewrites the
+			// same bytes the walk itself just persisted.
+			if saveErr := sess.PersistHistory(); saveErr != nil {
 				err = errors.Join(err, fmt.Errorf("saving compacted history: %w", saveErr))
 			}
 		}

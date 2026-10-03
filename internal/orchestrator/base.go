@@ -617,7 +617,13 @@ func (o *BaseOrchestrator) Submit(text string, images []string) error {
 	if o.isRunning {
 		o.pendingMsgs = append(o.pendingMsgs, msg)
 		o.mu.Unlock()
-		o.eventCh <- common.MessageQueuedEvent{ID: o.id, Text: text}
+		// Transient queued-message notice: non-blocking with drop counting
+		// (see trySendProgress). The queued message itself is already
+		// safely stored in pendingMsgs above; a stalled consumer must not
+		// wedge the Submit caller (the TUI input path) on a cosmetic
+		// event — the next turn-boundary or terminal event refreshes the
+		// viewport anyway.
+		o.trySendProgress(common.MessageQueuedEvent{ID: o.id, Text: text})
 		return nil
 	}
 
@@ -670,6 +676,18 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 
 	if strings.TrimSpace(text) != "" {
 		if err := o.sess.AddUserMessage(text); err != nil {
+			// The run never started, but isRunning was already set and the
+			// watchdog is live. Undo the flag HERE — the terminal defer
+			// below is not registered yet — or every later Execute fails
+			// with "orchestrator is already running" and every Submit
+			// queues into a run that will never start (the terminal-error
+			// hang class). The cancel() defer above still stops the
+			// watchdog; the terminal status resolves a waiting consumer
+			// out of its running state.
+			o.mu.Lock()
+			o.isRunning = false
+			o.mu.Unlock()
+			o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
 			return "", err
 		}
 	}
@@ -680,10 +698,19 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 	// running state ("Stopping..."), so this send stays blocking even if the
 	// consumer is stalled. It fires once, after all work is done.
 	defer func() {
+		// Report any progress events dropped while the consumer was stalled
+		// during the run: onEndTurn only fires on a turn that committed a
+		// stream, so drops from a turn that ended in an error or a stop
+		// would otherwise go unreported.
+		o.reportDroppedEvents()
 		o.mu.Lock()
 		o.isRunning = false
-		o.pendingMsgs = nil
 		o.mu.Unlock()
+		// Queued messages are deliberately PRESERVED (same contract as
+		// run()): a message submitted while this run executed must not be
+		// silently dropped at completion. A later run's first turn
+		// (onStartTurn) drains them; interrupting before that restores
+		// them to the input via DrainQueuedMessages.
 		o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
 	}()
 
@@ -983,12 +1010,17 @@ func (o *BaseOrchestrator) run() {
 			if strings.Contains(errStr, "image input is not supported") ||
 				strings.Contains(errStr, "image_input") ||
 				strings.Contains(errStr, "does not support image") {
-				// Remove the last user message from history
-				if len(o.sess.History) > 0 && o.sess.History[len(o.sess.History)-1].Role == "user" {
-					// TruncateHistory takes historyMu, the same lock the
-					// mid-turn snapshot reader (SnapshotHistory) holds while
-					// copying, so the rollback cannot race a snapshot.
-					o.sess.TruncateHistory(len(o.sess.History) - 1)
+				// PopLastUserMessage does the tail-user check, the truncate
+				// and the high-water clamp atomically under historyMu — and,
+				// unlike the old truncate-only rollback, it PERSISTS the
+				// removal. The user message was already on disk when the
+				// request failed (AddUserMessage saved it), so a memory-only
+				// rollback left the poisoned image turn in the file and
+				// --continue reloaded it into the same terminal error on the
+				// next run. A persistence failure is logged, never fatal: the
+				// run is already terminating with the error status below.
+				if popped, popErr := o.sess.PopLastUserMessage(); popped && popErr != nil {
+					common.LogErrorf("orchestrator", "rolling back unsupported-image user message: %v", popErr)
 				}
 				// Terminal status: kept BLOCKING — the TUI must observe the
 				// run's final status or it stays wedged in its running state.
@@ -1045,6 +1077,12 @@ func (o *BaseOrchestrator) run() {
 	o.mu.Lock()
 	o.isRunning = false
 	o.mu.Unlock()
+
+	// Report progress events dropped while the consumer was stalled during
+	// the run's turns: onEndTurn reports per turn, but a turn that ended in
+	// an error or a stop never reaches onEndTurn, so its drops are reported
+	// here instead of being lost with the run.
+	o.reportDroppedEvents()
 
 	// Check if stop was requested and send StopRequestedEvent
 	if o.IsStopRequested() {
@@ -1175,7 +1213,10 @@ func (o *BaseOrchestrator) Rewind(index int) error {
 	// below persists the clamp.
 	o.sess.ClampCompactionHighWater(index)
 	if o.sess.HistoryPath != "" {
-		if err := session.SaveHistory(o.sess.HistoryPath, o.sess.History); err != nil {
+		// PersistHistory copies under historyMu (a plain SaveHistory of
+		// sess.History read the slice header unlocked) and is
+		// generation-checked against concurrent writers.
+		if err := o.sess.PersistHistory(); err != nil {
 			return err
 		}
 		return o.sess.UpdateSessionMetadata()

@@ -1354,6 +1354,20 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.ShowAutocomplete = false
 				m.AutocompleteItems = nil
 				m.AutocompleteIndex = 0
+				// A compaction run holds the session's historyMu for its
+				// whole walk (scorer round trips included) and rewrites the
+				// history it walked. StartNewConversation blocks on that
+				// same lock — running /new mid-walk would freeze the whole
+				// TUI with no feedback for the walk's duration, and the
+				// finished run's report would then land on the fresh
+				// conversation as if it had compacted it. Refuse instead;
+				// the run ends and the user retries. The status line (not
+				// Model.Err) carries the refusal: Err has no renderer.
+				if m.CompactionRunning {
+					m.GetAgentState(m.Focused.ID()).StatusText = "cannot start a new conversation while a context compaction is running — try again when it finishes"
+					m.updateViewport()
+					return m, nil
+				}
 				if err := m.Root.Reset(); err != nil {
 					m.Err = fmt.Errorf("failed to start new conversation: %w", err)
 					return m, nil
@@ -1625,7 +1639,22 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			next := (idx + 1) % len(all)
 			m.Focused = all[next]
 			// Initialize state if missing
-			m.GetAgentState(m.Focused.ID())
+			state := m.GetAgentState(m.Focused.ID())
+			// A restored subagent (agent.RestoredSubagentOrchestrator)
+			// carries its status line — "restored — was interrupted" with
+			// the recorded cause — through an interface method. Without
+			// this seed the freshly created state says "Ready", hiding the
+			// one fact the user needs when tabbing to a historical child:
+			// that its transcript is the record of an interrupted run, not
+			// a live agent. Only the default seeding is overridden, so a
+			// state that already carries real status text keeps it.
+			if state.StatusText == "Ready" {
+				if texter, ok := m.Focused.(interface{ StatusText() string }); ok {
+					if text := texter.StatusText(); text != "" {
+						state.StatusText = text
+					}
+				}
+			}
 			m.updateViewport()
 			return m, nil
 

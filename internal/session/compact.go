@@ -363,9 +363,11 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 	// wins; concurrent runs simply wait. The pre-walk metadata (mark, frozen
 	// floor, start length, token totals, task) is snapshotted under the same
 	// lock so report numbers and the walk bound come from one consistent
-	// history state. Persistence (history save, high-water sidecar) happens
-	// OUTSIDE the lock in the callers (SaveHistory on sess.HistoryPath is
-	// the caller's job; UpdateCompactionHighWater takes compactionMu only).
+	// history state. Persistence is ordered history-file-first, mark-second,
+	// both under this lock (see the tail of the walk): the caller's own
+	// SaveHistory afterwards is idempotent and additionally covers the
+	// partially-mutated history of a mid-walk abort, whose persistence this
+	// walk deliberately does not attempt.
 	s.historyMu.Lock()
 	defer s.historyMu.Unlock()
 
@@ -623,15 +625,36 @@ func (s *Session) CompactContext(ctx context.Context, scorer HistoryScorer, stor
 
 	report.TokensSaved = report.TokensBefore - report.TokensAfter
 	// The walk reached the end of history: a mutating run freezes everything
-	// it covered by advancing the mark to the run-start length and persisting
-	// it (shadow runs mutate nothing and report only; a mid-walk abort
-	// returned above without advancing). A failed persistence rolls the
-	// in-memory advance back and surfaces here — the next run re-walks the
-	// uncovered tail, where pointer-bearing messages are skipped, so nothing
-	// is ever rewritten twice.
-	if !opts.ShadowOnly && startLen > mark {
-		if err := s.UpdateCompactionHighWater(startLen); err != nil {
-			walkErrs = append(walkErrs, fmt.Errorf("persisting compaction high-water mark: %w", err))
+	// it covered — but the ORDER of the two persistence writes is the
+	// commit protocol. The history file carries the [[elided …]] pointers,
+	// so it goes first; the high-water sidecar (the commit record that makes
+	// everything below the mark untouchable) advances only once the bytes it
+	// freezes are durable. Persisting the mark first — then crashing or
+	// failing the history save — would permanently freeze messages the
+	// compacted version of which never reached disk: the next run starts at
+	// the mark and can never re-walk them. With this order a crash in the
+	// gap leaves the mark where it was, and the next run re-walks the
+	// uncovered tail, where pointer-bearing messages are skipped and
+	// PutRecord is idempotent, so nothing is ever rewritten twice. A failed
+	// history save keeps the mark (and reports the error); a failed mark
+	// write surfaces via UpdateCompactionHighWater, which rolls its
+	// in-memory advance back so memory and disk never disagree.
+	if !opts.ShadowOnly {
+		saveErr := error(nil)
+		if s.HistoryPath != "" {
+			// Safe under historyMu (held for the whole walk): the mutated
+			// slice is read while concurrent appends are fenced out. The
+			// marshal+write cost is the same class as the scorer round
+			// trips the lock already covers — correctness wins.
+			if err := SaveHistory(s.HistoryPath, s.History); err != nil {
+				saveErr = err
+				walkErrs = append(walkErrs, fmt.Errorf("saving compacted history: %w", err))
+			}
+		}
+		if saveErr == nil && startLen > mark {
+			if err := s.UpdateCompactionHighWater(startLen); err != nil {
+				walkErrs = append(walkErrs, fmt.Errorf("persisting compaction high-water mark: %w", err))
+			}
 		}
 	}
 	// Fail-open scorer errors accumulated along the walk surface here; a
