@@ -1254,6 +1254,20 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.ShowAutocomplete = false
 				m.AutocompleteItems = nil
 				m.AutocompleteIndex = 0
+				// A compaction run holds the session's historyMu for its
+				// whole walk (scorer round trips included) and rewrites the
+				// history it walked. StartNewConversation blocks on that
+				// same lock — running /new mid-walk would freeze the whole
+				// TUI with no feedback for the walk's duration, and the
+				// finished run's report would then land on the fresh
+				// conversation as if it had compacted it. Refuse instead;
+				// the run ends and the user retries. The status line (not
+				// Model.Err) carries the refusal: Err has no renderer.
+				if m.CompactionRunning {
+					m.GetAgentState(m.Focused.ID()).StatusText = "cannot start a new conversation while a context compaction is running — try again when it finishes"
+					m.updateViewport()
+					return m, nil
+				}
 				if err := m.Root.Reset(); err != nil {
 					m.Err = fmt.Errorf("failed to start new conversation: %w", err)
 					return m, nil

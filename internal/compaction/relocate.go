@@ -436,6 +436,9 @@ func (p *Pipeline) CompactToolOutput(ctx context.Context, toolName, output strin
 		for i := range elide {
 			elide[i] = false
 		}
+		// (elidedTokens is not re-zeroed here: nothing below reads it — the
+		// tripwire decision is expressed entirely through the cleared elide
+		// flags and out.Tripwire.)
 		out.Tripwire = TripwireMaxElideFraction
 		p.logTripwire(scores.TaskHash, totalTokens)
 	}

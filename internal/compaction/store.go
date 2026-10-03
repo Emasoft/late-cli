@@ -389,6 +389,12 @@ func (s *Store) upsertLocked(rec Record, lastWriterWins bool) (*Record, bool) {
 // one Write of the whole line — the ShadowLog.Append crash-atomic shape:
 // concurrent processes interleave whole lines, and a crash leaves either a
 // complete line or a torn trailing one that loads skip.
+//
+// A failed append is swallowed by contract (Put/PutRecord cannot return an
+// error) but never silently: the record lives in memory while the backing
+// file does not have it, so the session's pointers resolve until restart and
+// then become "unknown elided id" — exactly the operational failure the
+// critical-error log exists to record.
 func (s *Store) persistLocked(rec Record) {
 	if s.path == "" {
 		return
@@ -400,10 +406,13 @@ func (s *Store) persistLocked(rec Record) {
 	line = append(line, '\n')
 	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
+		common.LogErrorf("compaction-store", "append to %s failed (record %s stays memory-only): %v", s.path, rec.ID, err)
 		return
 	}
 	defer f.Close()
-	_, _ = f.Write(line)
+	if _, err := f.Write(line); err != nil {
+		common.LogErrorf("compaction-store", "append to %s failed (record %s stays memory-only): %v", s.path, rec.ID, err)
+	}
 }
 
 // repairTornTail terminates a torn trailing line — the residue of a crash
