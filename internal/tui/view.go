@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"late/internal/common"
+	"late/internal/pathutil"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -1443,8 +1444,20 @@ func (m *Model) renderModelPickerView() {
 	lines = append(lines, header, "")
 
 	if len(m.ModelPickerModels) <= 1 && (m.AppConfig == nil || len(m.AppConfig.Models) == 0) {
-		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render("No models configured in ~/.config/late/config.json"))
-		lines = append(lines, "", viewEmptyStyle.Render("Please add a 'models' array to your config file first."))
+		// Point the user at the real OS config location; fall back to the
+		// literal only if the platform config dir cannot be resolved.
+		configPath := "~/.config/late/config.json"
+		if cfgDir, dirErr := pathutil.LateConfigDir(); dirErr == nil {
+			configPath = filepath.Join(cfgDir, "config.json")
+		}
+		emptyMsg := fmt.Sprintf("No models configured in %s", configPath)
+		hint := "Please add a 'models' array to your config file first."
+		if m.AppConfig != nil && m.AppConfig.Degraded {
+			emptyMsg = fmt.Sprintf("config.json could not be loaded; fix %s first", configPath)
+			hint = "Your settings cannot be saved until the config file is fixed."
+		}
+		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render(emptyMsg))
+		lines = append(lines, "", viewEmptyStyle.Render(hint))
 	} else {
 		// Instructions
 		lines = append(lines, viewEmptyStyle.Render("Use ↑/↓ to choose an agent, and ←/→ to select a model."), "")

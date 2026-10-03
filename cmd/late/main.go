@@ -364,8 +364,12 @@ func main() {
 			}
 		}
 	}
-	// Load App configuration
+	// Load App configuration. A load error means the run proceeds with
+	// degraded defaults (LoadConfig already wraps the error with the exact
+	// config path); keep the message so the TUI status bar can surface it
+	// before backend discovery reports.
 	appConfig, err := appconfig.LoadConfig()
+	configLoadWarning := initialBootstrapStatus(err)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to load app config: %v\n", err)
 	}
@@ -678,7 +682,15 @@ func main() {
 		pOpts = append(pOpts, tea.WithWindowSize(w, h))
 	}
 
-	model.BootstrapStatus = "Starting..."
+	// A degraded app config surfaces as the initial status-bar text so the
+	// user sees it on the first paint; the async BootstrapStatusMsg traffic
+	// below replaces it as soon as backend discovery reports. "Starting..."
+	// only applies to a clean config load.
+	if configLoadWarning != "" {
+		model.BootstrapStatus = configLoadWarning
+	} else {
+		model.BootstrapStatus = "Starting..."
+	}
 	p := tea.NewProgram(model, pOpts...)
 
 	// diag is the mid-session diagnostics sink: hook timeouts/errors, hook
@@ -742,7 +754,7 @@ func main() {
 
 		// Wait only in this background goroutine: the TUI remains usable while
 		// connections and discovery finish, but --prompt needs their results.
-		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, *suppressThinkingWordsReq, explicitUserLogitBias, explicitSubagentLogitBias)
+		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, *suppressThinkingWordsReq, explicitUserLogitBias, explicitSubagentLogitBias, configLoadWarning)
 
 		if *promptReq != "" {
 			p.Send(tui.StartPromptMsg(*promptReq))
@@ -821,6 +833,18 @@ func deriveEffectiveSessionID(historyPath string) string {
 	}
 	return id
 }
+
+// initialBootstrapStatus decides what the TUI status bar shows before the
+// async backend-discovery messages arrive. A failed app-config load returns
+// the "config error: ..." warning (the error already names the exact config
+// path); a clean load returns "" so the caller falls back to "Starting...".
+func initialBootstrapStatus(loadErr error) string {
+	if loadErr != nil {
+		return fmt.Sprintf("config error: %v", loadErr)
+	}
+	return ""
+}
+
 func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableImages bool, logitBias map[string]int) *client.Client {
 	c := client.NewClient(client.Config{
 		BaseURL:      setting.URL,
@@ -1322,7 +1346,7 @@ func ForwardOrchestratorEvents(p *tea.Program, o common.Orchestrator) {
 // runBootstrap runs startup work (MCP connections and LLM backend discovery)
 // concurrently in the background so the TUI renders immediately. It streams live
 // animated status updates into the UI and completes when all tasks finish.
-func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, c *client.Client, subagentClient *client.Client, sess *session.Session, enabledTools map[string]bool, pluginManager *plugin.PluginManager, toolSync *pluginToolSync, suppressThinkingWords bool, explicitUserLogitBias, explicitSubagentLogitBias map[string]int) {
+func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, c *client.Client, subagentClient *client.Client, sess *session.Session, enabledTools map[string]bool, pluginManager *plugin.PluginManager, toolSync *pluginToolSync, suppressThinkingWords bool, explicitUserLogitBias, explicitSubagentLogitBias map[string]int, configLoadWarning string) {
 	var (
 		wg             sync.WaitGroup
 		mu             sync.Mutex
@@ -1491,11 +1515,26 @@ func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, 
 		summary = strings.Join(parts, " • ")
 	}
 
-	sendMsg(tui.BootstrapStatusMsg{
+	sendMsg(finalBootstrapStatus(summary, warn, configLoadWarning, logitBiasToast))
+}
+
+func finalBootstrapStatus(summary string, warn bool, configLoadWarning string, logitBiasToast *tui.ToastMsg) tui.BootstrapStatusMsg {
+	nextToast := logitBiasToast
+	if configLoadWarning != "" {
+		nextToast = &tui.ToastMsg{
+			Text:     configLoadWarning,
+			Warning:  true,
+			Duration: 10 * time.Second,
+		}
+		if logitBiasToast != nil {
+			nextToast.Text += " • " + logitBiasToast.Text
+		}
+	}
+	return tui.BootstrapStatusMsg{
 		Text:        summary,
 		Warning:     warn,
 		Active:      false,
 		RefreshView: true,
-		NextToast:   logitBiasToast,
-	})
+		NextToast:   nextToast,
+	}
 }

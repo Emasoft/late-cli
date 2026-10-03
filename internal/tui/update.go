@@ -681,7 +681,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 						m.ToastExpireTime = time.Now().UnixMilli() + 3000
 						if m.AppConfig != nil {
 							m.AppConfig.Theme = info.ID
-							_ = config.SaveConfig(m.AppConfig)
+							if err := config.SaveConfig(m.AppConfig); err != nil {
+								// The theme IS applied for this session, but a
+								// degraded config (config.json existed but could
+								// not be read/parsed) makes SaveConfig refuse to
+								// overwrite it: say so instead of silently
+								// dropping the user's choice on the next start.
+								focusedState.StatusText = "settings changed but won't persist: " + err.Error()
+							}
 						}
 					}
 					clearCmd := tea.Tick(4*time.Second, func(t time.Time) tea.Msg {
@@ -1307,7 +1314,14 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					m.ToastExpireTime = time.Now().UnixMilli() + 3000
 					if m.AppConfig != nil {
 						m.AppConfig.Theme = info.ID
-						_ = config.SaveConfig(m.AppConfig)
+						if err := config.SaveConfig(m.AppConfig); err != nil {
+							// The theme IS applied for this session, but a
+							// degraded config (config.json existed but could
+							// not be read/parsed) makes SaveConfig refuse to
+							// overwrite it: say so instead of silently
+							// dropping the user's choice on the next start.
+							focusedState.StatusText = "settings changed but won't persist: " + err.Error()
+						}
 					}
 				}
 				clearCmd := tea.Tick(4*time.Second, func(t time.Time) tea.Msg {
