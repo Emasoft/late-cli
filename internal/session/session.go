@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,26 @@ type Session struct {
 	// the history without racing a live stream's appends and without
 	// blocking the streaming goroutine on marshal or disk I/O.
 	historyMu sync.Mutex
+
+	// historyGen counts history mutations (appends, truncations, pops,
+	// append-to-last, conversation resets). Every writer that persists the
+	// history — a commit-path saveAndNotify, the mid-turn snapshot, an
+	// out-of-package PersistHistory — captures the generation together with
+	// its history copy (both under historyMu) and, immediately before the
+	// rename, skips the write when the generation has moved on. This closes
+	// the stale-write race the lock alone cannot: marshal and disk I/O run
+	// outside historyMu, so a slow snapshot taken before a commit could
+	// otherwise finish writing AFTER the commit's save and revert the file
+	// to the pre-commit bytes — dropping a committed message from disk, or
+	// resurrecting a popped/rolled-back turn for --continue to reload.
+	historyGen atomic.Uint64
+
+	// persistMu serializes the final write of every history writer — the
+	// generation check and the atomic rename happen inside it — so two
+	// writers can never interleave their writes to the same history file.
+	// Marshaling stays outside (marshal cost must not serialize writers);
+	// the lock is held only for the short rename-atomic write.
+	persistMu sync.Mutex
 }
 
 func New(c *client.Client, historyPath string, history []client.ChatMessage, systemPrompt string, useTools bool) *Session {
@@ -117,6 +138,7 @@ func (s *Session) ExecuteTool(ctx context.Context, tc client.ToolCall) (string, 
 func (s *Session) appendMessage(msg client.ChatMessage) error {
 	s.historyMu.Lock()
 	s.History = append(s.History, msg)
+	s.historyGen.Add(1) // invalidates stale in-flight snapshots (see persistHistorySnapshot)
 	s.historyMu.Unlock()
 	return s.saveAndNotify()
 }
@@ -132,23 +154,72 @@ func (s *Session) appendMessage(msg client.ChatMessage) error {
 // Concurrency: the history slice is copied under historyMu — the same lock
 // appendMessage holds while appending — so the copy never races a live
 // stream's appends. Marshaling and the disk write run OUTSIDE the lock, so
-// the streaming goroutine is never blocked by snapshot cost. Idempotent
-// with the commit-path write (same writeAtomic primitive), and a no-op for
+// the streaming goroutine is never blocked by snapshot cost, and the write
+// is generation-checked (persistHistorySnapshot) so a snapshot that was
+// copied before a concurrent commit cannot clobber the commit's newer bytes
+// on disk. Idempotent with the commit-path write (same writeAtomic primitive), and a no-op for
 // in-memory sessions (no history path) and empty histories (a snapshot
 // must not materialize a file for a child that never produced anything).
 func (s *Session) SnapshotHistory() error {
-	if s.HistoryPath == "" {
-		return nil
-	}
 	s.historyMu.Lock()
 	snapshot := make([]client.ChatMessage, len(s.History))
 	copy(snapshot, s.History)
+	gen := s.historyGen.Load()
 	s.historyMu.Unlock()
 
 	if len(snapshot) == 0 {
 		return nil
 	}
-	return SaveHistory(s.HistoryPath, snapshot)
+	return s.persistHistorySnapshot(snapshot, gen)
+}
+
+// persistHistorySnapshot marshals snapshot and writes it to the history path
+// through writeAtomic — the shared persistence tail of every history writer
+// (commit saves, mid-turn snapshots, out-of-package PersistHistory). The
+// write is generation-checked: under persistMu, immediately before the
+// rename, the current historyGen must still equal capturedGen. If a
+// concurrent mutation moved the generation, this writer's bytes are stale —
+// a newer writer either already wrote or is about to write the newer state
+// (both writers go through persistMu, so their writes cannot interleave and
+// the newest state always lands last) — and the write is skipped.
+func (s *Session) persistHistorySnapshot(snapshot []client.ChatMessage, capturedGen uint64) error {
+	if s.HistoryPath == "" {
+		return nil // in-memory session: nothing to persist
+	}
+	if len(snapshot) == 0 {
+		return nil
+	}
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal history: %w", err)
+	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	if s.historyGen.Load() != capturedGen {
+		// Stale: the history changed between the copy and this write; the
+		// mutation's own save persists the newer state.
+		return nil
+	}
+	if err := writeAtomic(s.HistoryPath, data, historyFileMode, 0700); err != nil {
+		return fmt.Errorf("failed to save history: %w", err)
+	}
+	return nil
+}
+
+// PersistHistory saves the session's current history to its history path —
+// the concurrency-safe persistence entry point for out-of-package writers
+// (rewind, the compaction runner) that used to read sess.History directly.
+// The history is copied under historyMu and written generation-checked like
+// every other writer; the .meta.json sidecar is NOT refreshed (callers that
+// move the metadata — rewind's clamp, the compaction high-water — write it
+// explicitly).
+func (s *Session) PersistHistory() error {
+	s.historyMu.Lock()
+	snapshot := make([]client.ChatMessage, len(s.History))
+	copy(snapshot, s.History)
+	gen := s.historyGen.Load()
+	s.historyMu.Unlock()
+	return s.persistHistorySnapshot(snapshot, gen)
 }
 
 // TruncateHistory drops the history tail below index — the rollback primitive
@@ -163,6 +234,7 @@ func (s *Session) TruncateHistory(index int) {
 		return
 	}
 	s.History = s.History[:index]
+	s.historyGen.Add(1) // invalidates stale in-flight snapshots (see persistHistorySnapshot)
 	s.historyMu.Unlock()
 }
 
@@ -231,6 +303,7 @@ func (s *Session) PopLastUserMessage() (bool, error) {
 		return false, nil
 	}
 	s.History = s.History[:len(s.History)-1]
+	s.historyGen.Add(1) // invalidates stale in-flight snapshots (see persistHistorySnapshot)
 	s.historyMu.Unlock()
 
 	// Popping the first-and-only message empties the history. saveAndNotify()
@@ -268,23 +341,34 @@ func (s *Session) AppendToLastMessage(content, reasoning string) error {
 	}
 	lastIdx := len(s.History) - 1
 	if len(s.History[lastIdx].Content.Parts) > 0 {
+		// Clone the parts slice before mutating: History[lastIdx].Content.Parts
+		// shares its backing array with the struct copy a concurrent snapshot
+		// holds (SnapshotHistory copies the slice of structs under historyMu,
+		// but slice FIELDS still alias the same array), so an in-place
+		// Parts[i].Text write here would race that snapshot's marshal, which
+		// runs outside the lock. Rebinding the header leaves the snapshot's
+		// array untouched; Text and ReasoningContent are strings (immutable,
+		// rebind-only) and need no clone.
 		// If it's multimodal, we append to the last text part if it exists, or add a new one
 		// For now, let's just append to the simple text field if it's used, or the last part.
 		// Actually, let's keep it simple: if Parts is not empty, append to the last part if it's text.
+		parts := make([]client.ContentPart, len(s.History[lastIdx].Content.Parts))
+		copy(parts, s.History[lastIdx].Content.Parts)
 		found := false
-		for i := len(s.History[lastIdx].Content.Parts) - 1; i >= 0; i-- {
-			if s.History[lastIdx].Content.Parts[i].Type == client.ContentPartText {
-				s.History[lastIdx].Content.Parts[i].Text += content
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Type == client.ContentPartText {
+				parts[i].Text += content
 				found = true
 				break
 			}
 		}
 		if !found {
-			s.History[lastIdx].Content.Parts = append(s.History[lastIdx].Content.Parts, client.ContentPart{
+			parts = append(parts, client.ContentPart{
 				Type: client.ContentPartText,
 				Text: content,
 			})
 		}
+		s.History[lastIdx].Content.Parts = parts
 	} else {
 		s.History[lastIdx].Content.Text += content
 	}
@@ -295,6 +379,7 @@ func (s *Session) AppendToLastMessage(content, reasoning string) error {
 			s.History[lastIdx].ReasoningContent = reasoning
 		}
 	}
+	s.historyGen.Add(1) // invalidates stale in-flight snapshots (see persistHistorySnapshot)
 	// Persistence runs with the lock released, mirroring appendMessage.
 	s.historyMu.Unlock()
 	return s.saveAndNotify()
@@ -307,8 +392,16 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any, onC
 	outCh := make(chan common.StreamResult)
 	errCh := make(chan error, 1)
 
+	// Copy the history under historyMu — StartStream can be invoked while a
+	// concurrent mutator (append, truncate, pop) holds historyMu for its
+	// slice write; SanitizeForRequest then works on the pinned copy.
+	s.historyMu.Lock()
+	currentHistory := make([]client.ChatMessage, len(s.History))
+	copy(currentHistory, s.History)
+	s.historyMu.Unlock()
+
 	// Prepare messages with system prompt
-	messages := make([]client.ChatMessage, 0, len(s.History)+1)
+	messages := make([]client.ChatMessage, 0, len(currentHistory)+1)
 	if s.systemPrompt != "" {
 		messages = append(messages, client.ChatMessage{Role: "system", Content: client.TextContent(s.systemPrompt)})
 	}
@@ -317,7 +410,7 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any, onC
 	// which strict OpenAI-compatible endpoints reject with HTTP 400. The
 	// sanitizer repairs the copy sent to the API; the saved history is
 	// intentionally left untouched.
-	messages = append(messages, SanitizeForRequest(s.History)...)
+	messages = append(messages, SanitizeForRequest(currentHistory)...)
 
 	var onConn func()
 	if len(onConnect) > 0 && onConnect[0] != nil {
@@ -479,8 +572,14 @@ func (s *Session) UpdateSessionMetadata() error {
 // session to a fresh history file. The new file is created when the first
 // message is saved, matching startup behavior for an empty session.
 func (s *Session) StartNewConversation() error {
-	if s.HistoryPath != "" && len(s.History) > 0 {
-		if err := SaveHistory(s.HistoryPath, s.History); err != nil {
+	// Copy the preserved conversation under historyMu (concurrent appends and
+	// snapshots hold the same lock).
+	s.historyMu.Lock()
+	preserved := make([]client.ChatMessage, len(s.History))
+	copy(preserved, s.History)
+	s.historyMu.Unlock()
+	if s.HistoryPath != "" && len(preserved) > 0 {
+		if err := SaveHistory(s.HistoryPath, preserved); err != nil {
 			return err
 		}
 		if err := s.UpdateSessionMetadata(); err != nil {
@@ -501,9 +600,13 @@ func (s *Session) StartNewConversation() error {
 	sessionID := fmt.Sprintf("session-%s-%09d", now.Format("20060102-150405"), now.Nanosecond())
 	s.HistoryPath = filepath.Join(dir, sessionID+".json")
 	// historyMu guards the slice header against the mid-turn snapshot
-	// reader (SnapshotHistory).
+	// reader (SnapshotHistory). The generation bump matters most here: an
+	// in-flight snapshot copied before the reset would otherwise write the
+	// OLD conversation's bytes into the NEW history path (persistHistorySnapshot
+	// reads HistoryPath at write time); the bump makes its write a no-op.
 	s.historyMu.Lock()
 	s.History = []client.ChatMessage{}
+	s.historyGen.Add(1)
 	s.historyMu.Unlock()
 	return nil
 }
@@ -514,13 +617,25 @@ func (s *Session) SystemPrompt() string {
 }
 
 func (s *Session) saveAndNotify() error {
+	// Copy under historyMu: saveAndNotify runs on whatever goroutine mutated
+	// the history, but other goroutines may truncate/append concurrently —
+	// reading s.History unlocked here was a data race (and the copy pins the
+	// exact state the captured generation belongs to).
+	s.historyMu.Lock()
 	if len(s.History) == 0 {
+		s.historyMu.Unlock()
 		return nil
 	}
 	if s.HistoryPath == "" {
+		s.historyMu.Unlock()
 		return nil // Skip saving if no path provided (e.g., in-memory sessions, subagents without history opt-in)
 	}
-	if err := SaveHistory(s.HistoryPath, s.History); err != nil {
+	snapshot := make([]client.ChatMessage, len(s.History))
+	copy(snapshot, s.History)
+	gen := s.historyGen.Load()
+	s.historyMu.Unlock()
+
+	if err := s.persistHistorySnapshot(snapshot, gen); err != nil {
 		return err
 	}
 	return s.UpdateSessionMetadata()
