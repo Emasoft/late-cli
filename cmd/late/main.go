@@ -754,7 +754,7 @@ func main() {
 
 		// Wait only in this background goroutine: the TUI remains usable while
 		// connections and discovery finish, but --prompt needs their results.
-		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, *suppressThinkingWordsReq, explicitUserLogitBias, explicitSubagentLogitBias)
+		runBootstrap(p, mcpClient, config, c, subagentClient, sess, enabledTools, pluginManager, toolSync, *suppressThinkingWordsReq, explicitUserLogitBias, explicitSubagentLogitBias, configLoadWarning)
 
 		if *promptReq != "" {
 			p.Send(tui.StartPromptMsg(*promptReq))
@@ -1346,7 +1346,7 @@ func ForwardOrchestratorEvents(p *tea.Program, o common.Orchestrator) {
 // runBootstrap runs startup work (MCP connections and LLM backend discovery)
 // concurrently in the background so the TUI renders immediately. It streams live
 // animated status updates into the UI and completes when all tasks finish.
-func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, c *client.Client, subagentClient *client.Client, sess *session.Session, enabledTools map[string]bool, pluginManager *plugin.PluginManager, toolSync *pluginToolSync, suppressThinkingWords bool, explicitUserLogitBias, explicitSubagentLogitBias map[string]int) {
+func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, c *client.Client, subagentClient *client.Client, sess *session.Session, enabledTools map[string]bool, pluginManager *plugin.PluginManager, toolSync *pluginToolSync, suppressThinkingWords bool, explicitUserLogitBias, explicitSubagentLogitBias map[string]int, configLoadWarning string) {
 	var (
 		wg             sync.WaitGroup
 		mu             sync.Mutex
@@ -1515,11 +1515,26 @@ func runBootstrap(p *tea.Program, mcpClient *mcp.Client, config *mcp.MCPConfig, 
 		summary = strings.Join(parts, " • ")
 	}
 
-	sendMsg(tui.BootstrapStatusMsg{
+	sendMsg(finalBootstrapStatus(summary, warn, configLoadWarning, logitBiasToast))
+}
+
+func finalBootstrapStatus(summary string, warn bool, configLoadWarning string, logitBiasToast *tui.ToastMsg) tui.BootstrapStatusMsg {
+	nextToast := logitBiasToast
+	if configLoadWarning != "" {
+		nextToast = &tui.ToastMsg{
+			Text:     configLoadWarning,
+			Warning:  true,
+			Duration: 10 * time.Second,
+		}
+		if logitBiasToast != nil {
+			nextToast.Text += " • " + logitBiasToast.Text
+		}
+	}
+	return tui.BootstrapStatusMsg{
 		Text:        summary,
 		Warning:     warn,
 		Active:      false,
 		RefreshView: true,
-		NextToast:   logitBiasToast,
-	})
+		NextToast:   nextToast,
+	}
 }

@@ -217,3 +217,31 @@ func TestModelPickerEmptyStateShowsRealConfigPath(t *testing.T) {
 		t.Fatalf("model picker empty state shows hardcoded ~ path, got:\n%s", plain)
 	}
 }
+
+func TestModelPickerEmptyStateExplainsDegradedConfig(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("HOME", configHome)
+	t.Setenv("APPDATA", configHome)
+
+	cfgDir, err := pathutil.LateConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := NewModel(&mockOrchestrator{}, nil, &config.Config{Degraded: true})
+	model.Viewport.SetWidth(200)
+	model.Viewport.SetHeight(40)
+	model.Mode = ViewModelPicker
+	model.ModelPickerAgents = []string{"orchestrator"}
+	model.ModelPickerModels = []string{"default"}
+	model.renderModelPickerView()
+
+	plain := ansi.Strip(model.Viewport.View())
+	want := "config.json could not be loaded; fix " + filepath.Join(cfgDir, "config.json") + " first"
+	if !strings.Contains(plain, want) {
+		t.Fatalf("missing degraded config hint %q, got:\n%s", want, plain)
+	}
+	if strings.Contains(plain, "No models configured") || strings.Contains(plain, "Please add a 'models' array") {
+		t.Fatalf("degraded config shown as an empty config:\n%s", plain)
+	}
+}

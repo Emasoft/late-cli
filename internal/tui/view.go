@@ -1446,12 +1446,18 @@ func (m *Model) renderModelPickerView() {
 	if len(m.ModelPickerModels) <= 1 && (m.AppConfig == nil || len(m.AppConfig.Models) == 0) {
 		// Point the user at the real OS config location; fall back to the
 		// literal only if the platform config dir cannot be resolved.
-		emptyMsg := "No models configured in ~/.config/late/config.json"
+		configPath := "~/.config/late/config.json"
 		if cfgDir, dirErr := pathutil.LateConfigDir(); dirErr == nil {
-			emptyMsg = fmt.Sprintf("No models configured in %s", filepath.Join(cfgDir, "config.json"))
+			configPath = filepath.Join(cfgDir, "config.json")
+		}
+		emptyMsg := fmt.Sprintf("No models configured in %s", configPath)
+		hint := "Please add a 'models' array to your config file first."
+		if m.AppConfig != nil && m.AppConfig.Degraded {
+			emptyMsg = fmt.Sprintf("config.json could not be loaded; fix %s first", configPath)
+			hint = "Your settings cannot be saved until the config file is fixed."
 		}
 		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render(emptyMsg))
-		lines = append(lines, "", viewEmptyStyle.Render("Please add a 'models' array to your config file first."))
+		lines = append(lines, "", viewEmptyStyle.Render(hint))
 	} else {
 		// Instructions
 		lines = append(lines, viewEmptyStyle.Render("Use ↑/↓ to choose an agent, and ←/→ to select a model."), "")

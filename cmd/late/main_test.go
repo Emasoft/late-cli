@@ -440,7 +440,7 @@ func TestRunBootstrap_DynamicLogitBias(t *testing.T) {
 	sess := session.New(c, "", nil, "prompt", false)
 
 	// Run bootstrap with suppressThinkingWords enabled
-	runBootstrap(nil, nil, nil, c, subagentClient, sess, nil, nil, nil, true, explicitUser, explicitSub)
+	runBootstrap(nil, nil, nil, c, subagentClient, sess, nil, nil, nil, true, explicitUser, explicitSub, "")
 
 	if !c.IsLlamaCPP() {
 		t.Fatalf("expected c to be detected as llama.cpp")
