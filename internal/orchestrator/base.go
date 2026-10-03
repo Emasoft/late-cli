@@ -509,7 +509,17 @@ func (o *BaseOrchestrator) Submit(text string, images []string) error {
 	if o.isRunning {
 		o.pendingMsgs = append(o.pendingMsgs, msg)
 		o.mu.Unlock()
-		o.eventCh <- common.MessageQueuedEvent{ID: o.id, Text: text}
+		// Transient queued-message notice: non-blocking best-effort send.
+		// The queued message itself is already safely stored in pendingMsgs
+		// above; a stalled consumer must not wedge the Submit caller (the
+		// TUI input path) on a cosmetic event — the next turn-boundary or
+		// terminal event refreshes the viewport anyway. (d532a31 uses
+		// trySendProgress with drop counting; this branch does not carry
+		// that infrastructure, so the drop is silent here.)
+		select {
+		case o.eventCh <- common.MessageQueuedEvent{ID: o.id, Text: text}:
+		default:
+		}
 		return nil
 	}
 
@@ -559,6 +569,18 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 
 	if strings.TrimSpace(text) != "" {
 		if err := o.sess.AddUserMessage(text); err != nil {
+			// The run never started, but isRunning was already set and the
+			// watchdog is live. Undo the flag HERE — the terminal defer
+			// below is not registered yet — or every later Execute fails
+			// with "orchestrator is already running" and every Submit
+			// queues into a run that will never start (the terminal-error
+			// hang class). The cancel() defer above still stops the
+			// watchdog; the terminal status resolves a waiting consumer
+			// out of its running state. (Port of the d532a31 audit fix.)
+			o.mu.Lock()
+			o.isRunning = false
+			o.mu.Unlock()
+			o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
 			return "", err
 		}
 	}
