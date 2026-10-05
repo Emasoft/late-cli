@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,10 +12,19 @@ import (
 )
 
 // TestDanglingSubagentInterruptedTextDirective pins the Phase C directive
-// wording for interrupted children: the exact spawn_subagent resume JSON
-// snippet, the ignored-parameters note, and the do-not-respawn warning.
+// wording for interrupted children whose history file EXISTS at notify
+// time: the exact spawn_subagent resume JSON snippet, the
+// ignored-parameters note, and the do-not-respawn warning.
 func TestDanglingSubagentInterruptedTextDirective(t *testing.T) {
-	got := danglingSubagentInterruptedText("coder-subagent-0", "coder", "/s/subagents/coder-subagent-0.json", "/t/transcript.md")
+	historyPath := filepath.Join(t.TempDir(), "coder-subagent-0.json")
+	if err := os.WriteFile(historyPath, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	transcriptPath := filepath.Join(t.TempDir(), "transcript.md")
+	if err := os.WriteFile(transcriptPath, []byte("transcript"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	got := danglingSubagentInterruptedText("coder-subagent-0", "coder", historyPath, transcriptPath)
 	for _, want := range []string{
 		"Subagent coder-subagent-0 (coder) was interrupted by a previous late exit",
 		"Its full work state is preserved",
@@ -22,26 +32,56 @@ func TestDanglingSubagentInterruptedTextDirective(t *testing.T) {
 		"all other parameters are ignored",
 		"restores with its complete history and continues its task",
 		"Do NOT re-state the goal or spawn a new agent for this work unless resume fails",
-		"/s/subagents/coder-subagent-0.json",
-		"/t/transcript.md",
+		historyPath,
+		transcriptPath,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("directive wording missing %q:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "DISABLED") {
+		t.Errorf("existing history file must keep the preserved wording, got:\n%s", got)
+	}
 }
 
-// TestDanglingSubagentInterruptedTextWithoutHistory pins the no-history
-// variant: the record ID is still resumable (resume surfaces the
-// missing-history error), so the directive call stays present.
-func TestDanglingSubagentInterruptedTextWithoutHistory(t *testing.T) {
-	got := danglingSubagentInterruptedText("coder-subagent-1", "researcher", "", "")
-	if !strings.Contains(got, `{"resume": "coder-subagent-1"}`) {
-		t.Errorf("resume call missing from the no-history wording: %s", got)
-	}
-	if strings.Contains(got, "transcript") {
-		t.Errorf("no transcript should be mentioned: %s", got)
-	}
+// TestDanglingSubagentInterruptedTextPersistenceDisabled pins the honest
+// wording when the child's history file does NOT exist at notify time:
+// persistence was disabled for that run, no resume directive is advertised
+// (it can only fail with "no persisted history"), and the parent is told to
+// re-dispatch. Covers both the empty-path (persistence off) and the
+// path-set-but-file-missing variants.
+func TestDanglingSubagentInterruptedTextPersistenceDisabled(t *testing.T) {
+	t.Run("empty history path (persistence disabled for the run)", func(t *testing.T) {
+		got := danglingSubagentInterruptedText("coder-subagent-1", "researcher", "", "")
+		for _, want := range []string{
+			"Subagent coder-subagent-1 (researcher) was interrupted",
+			"subagent history persistence was DISABLED for this session",
+			"enable save-subagent-histories or update late",
+			"its in-flight work could not be preserved",
+			"re-dispatch the mission",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("disabled wording missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, `"resume"`) {
+			t.Errorf("disabled wording must not advertise a resume call: %s", got)
+		}
+		if strings.Contains(got, "preserved in the session manifest") {
+			t.Errorf("disabled wording must not claim manifest-preserved work: %s", got)
+		}
+	})
+
+	t.Run("history path set but file missing at notify time", func(t *testing.T) {
+		gone := filepath.Join(t.TempDir(), "deleted.json")
+		got := danglingSubagentInterruptedText("coder-subagent-2", "coder", gone, "")
+		if !strings.Contains(got, "subagent history persistence was DISABLED for this session") {
+			t.Errorf("missing history file must use the disabled wording:\n%s", got)
+		}
+		if strings.Contains(got, `"resume"`) {
+			t.Errorf("missing history file must not advertise a resume call: %s", got)
+		}
+	})
 }
 
 // TestDanglingSubagentInterruptedTextUnknownCallID pins the generic
@@ -123,10 +163,16 @@ func TestResumeWorktreeWordingThroughSynthesis(t *testing.T) {
 	}
 
 	worktree := filepath.Join(t.TempDir(), "repo-worktrees", "feature-x")
+	// The directive wording is only honest when the child's history file
+	// exists at notify time — give the record a real one.
+	historyPath := filepath.Join(t.TempDir(), "coder-subagent-12.json")
+	if err := os.WriteFile(historyPath, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	if err := sess.SaveSubagentRecord(session.SubagentRecord{
 		ID: "coder-subagent-12", AgentType: "coder", Goal: "port",
 		Status: session.SubagentStatusRunning, SpawnedAt: nowMinus(t, time.Hour),
-		HistoryPath: "/s/coder-subagent-12.json", WorktreePath: worktree, WorkingDir: "/repo",
+		HistoryPath: historyPath, WorktreePath: worktree, WorkingDir: "/repo",
 		ResumeCount: 1,
 	}); err != nil {
 		t.Fatalf("SaveSubagentRecord: %v", err)

@@ -679,9 +679,24 @@ func ResolveSubagentSettingsWithEnv(cfg *Config, openAI OpenAISettings, lookup E
 // the new default ON — a session folder always gets child histories and the
 // subagent manifest — while an explicit false disables persistence. The
 // built-in default is exported as DefaultSaveSubagentHistories.
+//
+// Legacy meta migration: sessions created by versions whose built-in
+// default was OFF persisted save_subagent_histories:false into the session
+// meta unconditionally — that false records the old default, not a user
+// choice. Honoring it on resume would silently disable the new default-ON
+// persistence (the resume then fails with "no persisted history"). A saved
+// false is therefore demoted to "absent" when nothing explicit contradicts
+// it: no CLI flag was passed and the config has no explicit entry. An
+// explicit config entry keeps the saved-preference precedence (the user
+// made a config-level choice), and an explicit CLI flag always wins.
 func ResolveSaveSubagentHistories(cfg *Config, cliExplicit bool, cliValue bool, savedPreference *bool) bool {
 	if cliExplicit {
 		return cliValue
+	}
+	if savedPreference != nil && !*savedPreference && (cfg == nil || cfg.SaveSubagentHistories == nil) {
+		// Legacy default-false meta noise: treat the saved preference as
+		// absent and fall through to the config/default resolution.
+		savedPreference = nil
 	}
 	if savedPreference != nil {
 		return *savedPreference

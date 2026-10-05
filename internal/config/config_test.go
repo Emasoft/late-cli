@@ -725,6 +725,75 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 			cliValue:    false,
 			want:        true,
 		},
+		// Legacy meta migration matrix: metas written by default-false
+		// versions carry save_subagent_histories:false that records the old
+		// default, not a user choice. With no CLI flag and no explicit
+		// config entry, that saved false is treated as absent (new ON
+		// default); explicit user choices are still honored.
+		{
+			name:            "legacy saved false with no explicit choice migrates to on",
+			cfg:             &Config{},
+			cliExplicit:     false,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            true,
+		},
+		{
+			name:            "legacy saved false with nil config migrates to on",
+			cfg:             nil,
+			cliExplicit:     false,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            true,
+		},
+		{
+			name:            "legacy saved false keeps explicit config false",
+			cfg:             &Config{SaveSubagentHistories: flexOff},
+			cliExplicit:     false,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            false,
+		},
+		{
+			name:            "legacy saved false keeps saved-over-config precedence",
+			cfg:             &Config{SaveSubagentHistories: flexOn},
+			cliExplicit:     false,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            false,
+		},
+		{
+			name:            "legacy saved false with explicit config off and CLI flag off stays off",
+			cfg:             &Config{SaveSubagentHistories: flexOff},
+			cliExplicit:     true,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            false,
+		},
+		{
+			name:            "legacy saved false with CLI flag on migrates to on",
+			cfg:             &Config{},
+			cliExplicit:     true,
+			cliValue:        true,
+			savedPreference: &disabled,
+			want:            true,
+		},
+		{
+			name:            "explicit CLI false wins over legacy saved false and config on",
+			cfg:             &Config{SaveSubagentHistories: flexOn},
+			cliExplicit:     true,
+			cliValue:        false,
+			savedPreference: &disabled,
+			want:            false,
+		},
+		{
+			name:            "saved true with no config entry stays on",
+			cfg:             &Config{},
+			cliExplicit:     false,
+			cliValue:        false,
+			savedPreference: &enabled,
+			want:            true,
+		},
 	}
 
 	for _, tt := range tests {

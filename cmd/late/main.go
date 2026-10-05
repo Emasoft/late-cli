@@ -603,6 +603,10 @@ func main() {
 	// DefaultSaveSubagentHistories, which is ON since the subagent manifest
 	// landed: interrupted children's work only survives when the session
 	// folder persists their histories).
+	// Legacy meta migration: metas written by default-false versions carry
+	// save_subagent_histories:false that records the old default, not a user
+	// choice — ResolveSaveSubagentHistories demotes that saved false to
+	// "absent" (new ON default) unless the config has an explicit entry.
 	saveSubagentHistoriesCLI := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "save-subagent-histories" {

@@ -158,6 +158,14 @@ func TestSynthesizeDanglingSpawnResults_PersistedAndIdempotent(t *testing.T) {
 
 	// The manifest knows the child as running (interrupted at exit).
 	childHistory := filepath.Join(filepath.Dir(historyPath), sessionID, "subagents", "coder-subagent-0.json")
+	// The directive wording is only honest when the child's history file
+	// exists at notify time — create it like a persisted run would.
+	if err := os.MkdirAll(filepath.Dir(childHistory), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(childHistory, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	if err := sess.SaveSubagentRecord(session.SubagentRecord{
 		ID:          "coder-subagent-0",
 		AgentType:   "coder",
@@ -244,7 +252,12 @@ func TestSynthesizeDanglingSpawnResults_StatusWordings(t *testing.T) {
 	}
 
 	transcript := "/t/coder-subagent-7-transcript.md"
-	childHistory := "/s/coder-subagent-7.json"
+	// The directive wording is only honest when the child's history file
+	// exists at notify time — give the running record a real one.
+	childHistory := filepath.Join(t.TempDir(), "coder-subagent-7.json")
+	if err := os.WriteFile(childHistory, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	records := []session.SubagentRecord{
 		{ID: "coder-subagent-7", AgentType: "coder", Goal: "g", Status: session.SubagentStatusRunning, SpawnedAt: nowMinus(t, time.Hour), HistoryPath: childHistory, TranscriptPath: transcript},
 		{ID: "coder-subagent-8", AgentType: "coder", Goal: "g", Status: session.SubagentStatusCompleted, SpawnedAt: nowMinus(t, time.Hour), ResultPreview: "the finished thing"},

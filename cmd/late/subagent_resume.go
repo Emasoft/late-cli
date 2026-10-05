@@ -229,7 +229,11 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 // the generic interrupted wording.
 func manifestInterruptedText(manifest *session.SubagentManifest, tc client.ToolCall, record *session.SubagentRecord) string {
 	if record == nil {
-		return danglingSubagentInterruptedText(tc.ID, "", "", "")
+		// No manifest record matched the dangling call: there is no child
+		// ID or history to vouch for, so use the generic fallback (the
+		// tool-call ID is not a resume ID, and nothing here may claim
+		// preserved work state).
+		return danglingSubagentInterruptedText("", "", "", "")
 	}
 	switch record.Status {
 	case session.SubagentStatusRunning:
@@ -254,19 +258,36 @@ func manifestInterruptedText(manifest *session.SubagentManifest, tc client.ToolC
 	}
 }
 
+// subagentHistoryPersisted reports whether a child's persisted history file
+// exists on disk at notify time. An empty path (history persistence was
+// disabled for that run) or a missing file means the child's in-flight work
+// was NOT preserved — the manifest record alone is not work state.
+func subagentHistoryPersisted(historyPath string) bool {
+	if historyPath == "" {
+		return false
+	}
+	info, err := os.Stat(historyPath)
+	return err == nil && info.Mode().IsRegular()
+}
+
 // danglingSubagentInterruptedText is the model-facing wording for a spawn
 // call interrupted by a previous late exit. It is DIRECTIVE (Phase C live
 // resume): the parent is told exactly how to restore the child — the
 // spawn_subagent {"resume": "<id>"} call — and warned not to re-state the
 // goal or spawn a replacement, because the preserved history is the child's
 // full state and resuming it continues the task where it stopped.
+//
+// The directive wording is conditional on the child's history file existing
+// at notify time: when persistence was disabled for that run (or the file
+// vanished), advertising a resume can only fail with "no persisted
+// history", so the wording tells the parent to re-dispatch instead.
 func danglingSubagentInterruptedText(id, agentType, historyPath, transcriptPath string) string {
 	if id == "" {
 		// No manifest record matched the dangling call: the generic
 		// fallback keeps the historical review-the-transcript shape (the
 		// tool-call ID is not a resume ID).
 		text := "This subagent was interrupted by a previous late exit before completing."
-		if historyPath != "" {
+		if subagentHistoryPersisted(historyPath) {
 			text += fmt.Sprintf(" Its work up to the interruption is preserved at %s", historyPath)
 		} else {
 			text += " Its work up to the interruption could not be preserved"
@@ -277,12 +298,14 @@ func danglingSubagentInterruptedText(id, agentType, historyPath, transcriptPath 
 		text += ". Review it and continue or re-spawn as needed."
 		return text
 	}
-	text := fmt.Sprintf("Subagent %s (%s) was interrupted by a previous late exit. Its full work state is preserved", id, agentType)
-	if historyPath != "" {
-		text += fmt.Sprintf(" at %s", historyPath)
-	} else {
-		text += " in the session manifest"
+	if !subagentHistoryPersisted(historyPath) {
+		// Honesty fix (resume incident): a child whose history file does
+		// not exist cannot be resumed — resume fails with "no persisted
+		// history". Name the real cause and re-dispatch instead of
+		// advertising preserved work that is not there.
+		return fmt.Sprintf("Subagent %s (%s) was interrupted; subagent history persistence was DISABLED for this session (enable save-subagent-histories or update late) — its in-flight work could not be preserved; re-dispatch the mission.", id, agentType)
 	}
+	text := fmt.Sprintf("Subagent %s (%s) was interrupted by a previous late exit. Its full work state is preserved at %s", id, agentType, historyPath)
 	if transcriptPath != "" {
 		text += fmt.Sprintf(" (transcript: %s)", transcriptPath)
 	}
