@@ -70,14 +70,34 @@ func (a *StreamAccumulator) Reset() {
 // --- Tool Execution ---
 
 // ArchiveThresholdChars is the tool-result size above which ExecuteToolCalls
-// archives the full output to disk and replaces it in history with the
-// compact reference form (session.FormatReference). Results at or under the
-// threshold enter history inline, unchanged.
+// archives the full output to disk under the session folder
+// (session.OutputArchive). Results at or under the threshold enter history
+// inline, unchanged.
 const ArchiveThresholdChars = 1024
+
+// ArchiveInlineFullChars is the upper bound of the inline-first band.
+// Results above ArchiveThresholdChars (1024) but at or under this size are
+// archived for durability yet returned to history FULL — the text is small
+// enough to be immediately useful, and the archive is only a backup. Above
+// this size the result enters history as the compact reference form
+// (session.FormatReference: head + tail + archive pointer).
+//
+// The banding rule is hysteresis-free: two byte-length comparisons against
+// these fixed constants, no state and no time-dependence, so the same
+// output always maps to the same history form.
+const ArchiveInlineFullChars = 3072
 
 // ArchiveHeadChars is how many leading characters of the original output
 // the archived reference form keeps inline.
 const ArchiveHeadChars = 2000
+
+// ArchiveTailChars is how many trailing characters of the original output
+// the archived reference form keeps inline (after the archive marker), so
+// the agent sees how the output ended — errors, summaries, final lines
+// usually live there — without a second read. The reference form is only
+// rendered above ArchiveInlineFullChars (3072 > ArchiveHeadChars +
+// ArchiveTailChars = 2500), so head and tail never overlap in practice.
+const ArchiveTailChars = 500
 
 // toolResultArchiver is the process-wide output archive consulted by
 // ExecuteToolCalls before a tool result enters history. One archive per
@@ -100,18 +120,24 @@ func SetToolResultArchiver(a *session.OutputArchive) {
 }
 
 // maybeArchiveToolResult returns the (possibly archived) form of result for
-// history: an oversized result is written to the archive and replaced by
-// the compact, deterministic reference form. Guards, in order:
+// history. Three bands, evaluated hysteresis-free against fixed constants:
 //
 //   - no archive installed → inline unchanged;
 //   - result at or under ArchiveThresholdChars → inline unchanged;
+//   - above ArchiveThresholdChars and at or under ArchiveInlineFullChars
+//     (3072) → inline-first: a copy is archived for durability, but the
+//     FULL text stays inline — at this size it is immediately useful and
+//     the archive is only a backup, so no marker is added.
+//   - above ArchiveInlineFullChars → archived and replaced by the compact,
+//     deterministic reference form (head + tail + self-documenting archive
+//     pointer naming read_file; see session.FormatReference).
 //
 // Fail-open: an Archive error is logged and the full output stays inline —
 // a full-disk condition must never lose a tool result from the
-// conversation. On success the reference form (small) is what history
-// stores; the session.OutputArchive determinism contract guarantees it is
-// byte-identical for identical outputs, and it is generated once here at
-// admission and never regenerated or substituted afterward.
+// conversation. On success in the reference band, the reference form (small)
+// is what history stores; the session.OutputArchive determinism contract
+// guarantees it is byte-identical for identical outputs, and it is generated
+// once here at admission and never regenerated or substituted afterward.
 func maybeArchiveToolResult(toolName, result string) string {
 	toolResultArchiverMu.RLock()
 	a := toolResultArchiver
@@ -124,7 +150,12 @@ func maybeArchiveToolResult(toolName, result string) string {
 		fmt.Fprintf(os.Stderr, "late: failed to archive %s tool output (%d chars), keeping it inline: %v\n", toolName, len(result), err)
 		return result
 	}
-	return session.FormatReference(archived, result, ArchiveHeadChars)
+	if len(result) <= ArchiveInlineFullChars {
+		// Inline-first band: the archive copy exists for durability, the
+		// conversation keeps the full text.
+		return result
+	}
+	return session.FormatReference(archived, result, ArchiveHeadChars, ArchiveTailChars)
 }
 
 // ExecuteToolCalls runs a slice of tool calls against the session.

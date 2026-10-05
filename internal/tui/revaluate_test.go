@@ -93,6 +93,18 @@ func forceRevaluateCtx() context.Context {
 
 var otpCodePattern = regexp.MustCompile(`\b\d{7}\b`)
 
+// gateExecCwd returns the execution cwd the gate resolves for calls that pass
+// no cwd parameter and have no worktree in their context: the process working
+// directory (resolveShellExecCwd's final fallback).
+func gateExecCwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	return wd
+}
+
 // extractOTP asserts the message contains exactly one 7-digit code and
 // returns it.
 func extractOTP(t *testing.T, msg string) string {
@@ -296,18 +308,34 @@ func TestHandleForceRevaluate_OTPSingleUse(t *testing.T) {
 		t.Fatalf("expected valid OTP to approve the command, got approved=%v blockMsg=%q", approved, approveMsg)
 	}
 
-	// The consumed OTP must not work again: the command is blocked once more
-	// and a DIFFERENT code is issued for the next attempt.
-	_, _, reblockMsg, rehandled := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: command, OTPCode: code}))
-	if !rehandled {
-		t.Fatalf("expected gate to handle the re-used OTP attempt")
+	// The consumed OTP must not work again at the OTP layer: the code was
+	// deleted on success, so re-validating it fails (single use).
+	if tool.ConsumeOTP(gateExecCwd(t), command, code) {
+		t.Errorf("expected the OTP to be single-use, but it validated twice")
 	}
-	if reblockMsg == "" {
-		t.Fatalf("expected re-used OTP to be rejected (command blocked again)")
+
+	// Issue #1: re-presenting the stale OTP still lets the command through —
+	// not because the code is valid, but because the successful approval
+	// persisted the exact command string into the persistent global
+	// allow-list. The command now classifies as safe, so the gate does not
+	// apply at all (handled == false → the middleware auto-approves it).
+	_, _, reMsg, reHandled := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: command, OTPCode: code}))
+	if reHandled {
+		t.Fatalf("expected the exact command to bypass the gate entirely via the persisted allow-list, got handled=true blockMsg=%q", reMsg)
 	}
-	fresh := extractOTP(t, reblockMsg)
-	if fresh == code {
-		t.Errorf("expected a fresh code after consumption, got the same code %q", code)
+
+	// The stale code is worthless for any OTHER command: it must not approve
+	// a command that was never approved.
+	other := "rm -rf " + filepath.Join(tmp, "other")
+	_, _, otherBlockMsg, otherHandled := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: other, OTPCode: code}))
+	if !otherHandled {
+		t.Fatalf("expected gate to handle the other command")
+	}
+	if otherBlockMsg == "" {
+		t.Fatalf("expected stale OTP to be rejected for a different command")
+	}
+	if tool.CountExactCommandApprovals(gateExecCwd(t), other) != 0 {
+		t.Errorf("expected no exact approval for the other command, got %d", tool.CountExactCommandApprovals(gateExecCwd(t), other))
 	}
 }
 
@@ -391,15 +419,15 @@ func TestHandleForceRevaluate_SafeCommandPassesThrough(t *testing.T) {
 
 	// A stray otp_code on the safe path must be ignored entirely: no approval
 	// flow, and no pending OTP is consumed by the pass-through.
-	code := tool.IssueOTP(safeCommand)
+	code := tool.IssueOTP(gateExecCwd(t), safeCommand)
 	_, _, strayMsg, strayHandled := handleForceRevaluate(ctx, reg, bashCall(t, bashArgs{Command: safeCommand, OTPCode: code}))
 	if strayHandled {
 		t.Fatalf("expected safe command with stray otp_code to still pass through, got blockMsg=%q", strayMsg)
 	}
-	if !tool.ConsumeOTP(safeCommand, code) {
+	if !tool.ConsumeOTP(gateExecCwd(t), safeCommand, code) {
 		t.Fatalf("expected the stray otp_code to NOT be consumed by the safe pass-through (it should still be pending)")
 	}
-	if tool.ConsumeOTP(safeCommand, code) {
+	if tool.ConsumeOTP(gateExecCwd(t), safeCommand, code) {
 		t.Fatalf("expected the code to be single-use once explicitly consumed")
 	}
 }
@@ -505,14 +533,14 @@ func TestShellToolResetConversationStateClearsOTPs(t *testing.T) {
 	isolateTestEnv(t)
 
 	command := "rm -rf reset-state-probe"
-	code := tool.IssueOTP(command)
+	code := tool.IssueOTP(gateExecCwd(t), command)
 	if len(code) != 7 {
 		t.Fatalf("expected a 7-digit pending code, got %q", code)
 	}
 
 	(&tool.ShellTool{}).ResetConversationState()
 
-	if tool.ConsumeOTP(command, code) {
+	if tool.ConsumeOTP(gateExecCwd(t), command, code) {
 		t.Fatalf("expected pending OTP to be cleared by ResetConversationState")
 	}
 }

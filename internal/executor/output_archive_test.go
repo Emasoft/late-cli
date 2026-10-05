@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"late/internal/client"
 	"late/internal/session"
+	"late/internal/tool"
 )
 
 // archiveDumpTool is a fake tool returning a configurable output, mirroring
@@ -142,30 +144,36 @@ func TestOutputArchiveWriteDedupeAndFormat(t *testing.T) {
 	}
 
 	// Deterministic reference form: same inputs twice → identical bytes,
-	// head kept, pointer line present.
-	ref1 := session.FormatReference(p1, output, 100)
-	ref2 := session.FormatReference(p1, output, 100)
+	// head kept, marker + tail present, self-documenting read_file pointer.
+	ref1 := session.FormatReference(p1, output, 100, 50)
+	ref2 := session.FormatReference(p1, output, 100, 50)
 	if ref1 != ref2 {
 		t.Error("FormatReference must be deterministic (identical inputs → identical string)")
 	}
-	if got, want := ref1, strings.Repeat("late-archive\n", 13)[:100]+"\n…[full output archived: "+p1+"]"; got != want {
-		t.Errorf("FormatReference = %q, want %q", got, want)
+	runes := []rune(output)
+	wantMarker := fmt.Sprintf("…[output truncated: %d chars total. Head above / tail below. Full output archived: %s — read_file it to view everything]", len(runes), p1)
+	want := string(runes[:100]) + "\n" + wantMarker + "\n" + string(runes[len(runes)-50:])
+	if ref1 != want {
+		t.Errorf("FormatReference = %q, want %q", ref1, want)
 	}
 }
 
-// TestOutputArchiveRuneSafeHead checks the rune-safe head cut: a multi-byte
-// string must not be split mid-rune.
-func TestOutputArchiveRuneSafeHead(t *testing.T) {
+// TestOutputArchiveRuneSafeHeadAndTail checks the rune-safe head and tail
+// cuts: a multi-byte string must not be split mid-rune on either side.
+func TestOutputArchiveRuneSafeHeadAndTail(t *testing.T) {
 	output := strings.Repeat("é", 300) // 600 bytes, 300 runes
-	ref := session.FormatReference("/tmp/x", output, 100)
+	ref := session.FormatReference("/tmp/x", output, 100, 50)
 	if !strings.HasPrefix(ref, strings.Repeat("é", 100)) {
 		t.Errorf("reference head is not the first 100 runes: %q", ref[:40])
 	}
+	if !strings.HasSuffix(ref, strings.Repeat("é", 50)) {
+		t.Errorf("reference tail is not the last 50 runes: %q", ref[len(ref)-60:])
+	}
 	// Invalid UTF-8 at the cut boundary must never produce a torn rune.
 	torn := strings.Repeat("a", 99) + "\xff\xff" + strings.Repeat("b", 50)
-	refTorn := session.FormatReference("/tmp/y", torn, 100)
+	refTorn := session.FormatReference("/tmp/y", torn, 100, 20)
 	if strings.Contains(refTorn, "\xffb") {
-		t.Error("head cut split a byte sequence across the boundary")
+		t.Error("head or tail cut split a byte sequence across the boundary")
 	}
 }
 
@@ -204,34 +212,61 @@ func TestMaybeArchiveToolResultGuards(t *testing.T) {
 	if got := maybeArchiveToolResult("large_dump", at); got != at {
 		t.Error("results at ArchiveThresholdChars must stay inline")
 	}
-	// Above the threshold → reference form. For an output barely over the
-	// threshold the head (2000 chars) keeps the whole text, so the form is
-	// not necessarily shorter — assert the exact reference bytes instead.
-	got := maybeArchiveToolResult("large_dump", big)
-	if want := session.FormatReference(mustArchive(t, a, big), big, ArchiveHeadChars); got != want {
-		t.Errorf("oversized result = %q, want the exact reference form", got[:min(120, len(got))])
+
+	// Inline-first band (ArchiveThresholdChars, ArchiveInlineFullChars]: the
+	// full text stays inline AND a durability copy is archived — no marker.
+	// Pin both band boundaries.
+	if got := maybeArchiveToolResult("large_dump", big); got != big {
+		t.Errorf("result just above ArchiveThresholdChars must stay full inline, got %d chars prefix %q", len(got), got[:min(60, len(got))])
 	}
-	// An output far over the threshold shrinks: head capped at 2000 chars
-	// plus the pointer line.
+	mid := strings.Repeat("m", ArchiveInlineFullChars)
+	if got := maybeArchiveToolResult("large_dump", mid); got != mid {
+		t.Errorf("result at ArchiveInlineFullChars must stay full inline, got %d chars prefix %q", len(got), got[:min(60, len(got))])
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("inline-first band must archive anyway: archive dir holds %d files, want 2", len(entries))
+	}
+
+	// Above the band → the exact reference form. Pin the lower boundary too.
+	over := strings.Repeat("o", ArchiveInlineFullChars+1)
+	got := maybeArchiveToolResult("large_dump", over)
+	if want := session.FormatReference(mustArchive(t, a, over), over, ArchiveHeadChars, ArchiveTailChars); got != want {
+		t.Errorf("result above ArchiveInlineFullChars = %q, want the exact reference form", got[:min(120, len(got))])
+	}
+
+	// An output far over the band shrinks: head 2000 + marker + tail 500.
 	huge := strings.Repeat("y", 4*ArchiveHeadChars)
 	got = maybeArchiveToolResult("large_dump", huge)
-	if want := session.FormatReference(mustArchive(t, a, huge), huge, ArchiveHeadChars); got != want {
+	if want := session.FormatReference(mustArchive(t, a, huge), huge, ArchiveHeadChars, ArchiveTailChars); got != want {
 		t.Errorf("huge result = %q, want the exact reference form", got[:min(120, len(got))])
 	}
 	if len(got) >= len(huge) {
 		t.Errorf("reference form (%d chars) must be smaller than the huge output (%d chars)", len(got), len(huge))
 	}
-	if !strings.Contains(got, "[full output archived: ") {
-		t.Errorf("reference form missing the archive pointer: %q", got[:min(120, len(got))])
+	if !strings.Contains(got, "[output truncated: 8000 chars total. Head above / tail below.") ||
+		!strings.Contains(got, "read_file it to view everything") {
+		t.Errorf("reference form missing size metadata or the read_file pointer: %q", got[:min(200, len(got))])
 	}
 }
 
 // TestExecuteToolCallsArchivesLargeOutputs is the integration check: with
-// the archiver installed, a >1024-char tool result enters history as the
-// reference form naming the archive file, the archive file holds the full
-// original, and a small result stays inline.
+// the archiver installed, a >ArchiveInlineFullChars tool result enters
+// history as the reference form naming the archive file, the archive file
+// holds the full original and is readable by the read_file tool (the
+// sanctioned retrieval path the marker names — absolute path outside the
+// worktree must NOT be rejected), a mid-band result (1024, 3072] enters
+// history FULL with a durability copy archived, and a small result stays
+// inline unarchived.
 func TestExecuteToolCallsArchivesLargeOutputs(t *testing.T) {
-	output := strings.Repeat("stdout line\n", 150) // ~1800 chars
+	lines := make([]string, 500)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("stdout line-%04d", i)
+	}
+	output := strings.Join(lines, "\n") // well above ArchiveInlineFullChars
 	sess := newArchiveSession(t, output)
 	dir := filepath.Join(t.TempDir(), "tool-outputs")
 	a, err := session.NewOutputArchive(dir)
@@ -242,17 +277,18 @@ func TestExecuteToolCallsArchivesLargeOutputs(t *testing.T) {
 	t.Cleanup(func() { SetToolResultArchiver(nil) })
 
 	got := runArchivedTool(t, sess, "call_big")
-	if !strings.Contains(got, "[full output archived: "+dir+string(os.PathSeparator)) {
-		t.Fatalf("history tool result does not reference the archive path:\n%s", got[:min(200, len(got))])
+	if !strings.Contains(got, fmt.Sprintf("[output truncated: %d chars total.", len(output))) ||
+		!strings.Contains(got, "Full output archived: "+dir+string(os.PathSeparator)) {
+		t.Fatalf("history tool result does not carry the truncation marker + archive path:\n%s", got[:min(200, len(got))])
 	}
-	if strings.Contains(got, "stdout line") && len(got) > ArchiveHeadChars+200 {
+	if len(got) >= len(output) {
 		t.Errorf("history tool result still carries the full output (%d chars)", len(got))
 	}
 
 	// The referenced file exists and holds the original, byte for byte.
-	idx := strings.Index(got, "[full output archived: ")
-	rest := got[idx+len("[full output archived: "):]
-	path := rest[:strings.Index(rest, "]")]
+	idx := strings.Index(got, "Full output archived: ")
+	rest := got[idx+len("Full output archived: "):]
+	path := rest[:strings.Index(rest, " — read_file")]
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("archived file %s missing: %v", path, err)
@@ -261,7 +297,38 @@ func TestExecuteToolCallsArchivesLargeOutputs(t *testing.T) {
 		t.Error("archived content differs from the tool output")
 	}
 
-	// A small result stays inline, unchanged.
+	// read_file — the retrieval tool the marker names — must accept the
+	// absolute archive path (outside the worktree, inside the session dir)
+	// without path-safety rejection and return the FULL original.
+	rfArgs, err := json.Marshal(map[string]string{"path": path})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	rfOut, err := tool.NewReadFileTool().Execute(context.Background(), rfArgs)
+	if err != nil {
+		t.Fatalf("read_file rejected the archive path %s (path-safety bug): %v", path, err)
+	}
+	if !strings.Contains(rfOut, "stdout line-0250") { // middle: absent from head AND tail
+		t.Error("read_file output missing the middle of the original — archive read incomplete")
+	}
+	if !strings.Contains(rfOut, "stdout line-0499") { // tail: dropped from the reference head
+		t.Error("read_file output missing the tail of the original")
+	}
+
+	// Mid-band integration: (ArchiveThresholdChars, ArchiveInlineFullChars]
+	// enters history FULL (no marker) with a durability copy archived.
+	mid := strings.Repeat("mid line\n", 300) // 2700 chars
+	sess.Registry.Register(archiveDumpTool{name: "mid_dump", output: mid})
+	if err := ExecuteToolCalls(context.Background(), sess, []client.ToolCall{
+		{ID: "call_mid", Function: client.FunctionCall{Name: "mid_dump", Arguments: "{}"}},
+	}, nil); err != nil {
+		t.Fatalf("ExecuteToolCalls(mid) error = %v", err)
+	}
+	if got := historyTail(t, sess, "call_mid"); got != mid {
+		t.Errorf("mid-band result must enter history full inline, got %d chars prefix %q", len(got), got[:min(60, len(got))])
+	}
+
+	// A small result stays inline, unchanged, and is NOT archived.
 	small := "tiny"
 	sess.Registry.Register(archiveDumpTool{name: "small_dump", output: small})
 	if err := ExecuteToolCalls(context.Background(), sess, []client.ToolCall{
@@ -271,6 +338,15 @@ func TestExecuteToolCallsArchivesLargeOutputs(t *testing.T) {
 	}
 	if got := historyTail(t, sess, "call_small"); got != small {
 		t.Errorf("small result was altered: %q", got)
+	}
+
+	// Exactly two archived files: the big one and the mid-band one.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("archive dir holds %d files, want 2 (big + mid-band; small must not archive)", len(entries))
 	}
 }
 
@@ -305,6 +381,52 @@ func TestExecuteToolCallsArchiveFailOpen(t *testing.T) {
 	got := runArchivedTool(t, sess, "call_failopen")
 	if got != output {
 		t.Errorf("fail-open must keep the full output inline, got %d chars", len(got))
+	}
+}
+
+// TestFormatReferenceHeadTailComposition pins the richer reference form:
+// head (2000) + size-carrying marker + tail (500), byte-deterministic
+// across calls, no middle content, and self-documenting — the marker names
+// read_file as the sanctioned retrieval tool and never suggests gated shell
+// tools (cat/grep).
+func TestFormatReferenceHeadTailComposition(t *testing.T) {
+	lines := make([]string, 1000)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("dump line-%04d", i)
+	}
+	output := strings.Join(lines, "\n") // ~15k chars
+	path := "/sessions/s1/tool-outputs/abcdef0123456789.txt"
+
+	ref := session.FormatReference(path, output, ArchiveHeadChars, ArchiveTailChars)
+	runes := []rune(output)
+	if !strings.HasPrefix(ref, string(runes[:ArchiveHeadChars])) {
+		t.Error("reference does not start with the first ArchiveHeadChars runes")
+	}
+	if !strings.HasSuffix(ref, string(runes[len(runes)-ArchiveTailChars:])) {
+		t.Error("reference does not end with the last ArchiveTailChars runes")
+	}
+	marker := fmt.Sprintf("…[output truncated: %d chars total. Head above / tail below. Full output archived: %s — read_file it to view everything]", len(runes), path)
+	if !strings.Contains(ref, "\n"+marker+"\n") {
+		t.Errorf("reference marker missing or malformed:\nwant %q", marker)
+	}
+	if strings.Contains(ref, "dump line-0500") {
+		t.Error("reference must not carry the middle of the output")
+	}
+	if strings.Contains(ref, "cat ") || strings.Contains(ref, "grep ") {
+		t.Error("marker must not suggest gated shell retrieval tools")
+	}
+	// Deterministic: same (output, path) → identical bytes (cache-stability
+	// invariant — no timestamps, no randomness).
+	if again := session.FormatReference(path, output, ArchiveHeadChars, ArchiveTailChars); again != ref {
+		t.Error("FormatReference must be deterministic (identical inputs → identical string)")
+	}
+
+	// Output shorter than the head: nothing cut → whole text kept, no
+	// truncation language, pointer still names the tool.
+	shortRef := session.FormatReference(path, "short", ArchiveHeadChars, ArchiveTailChars)
+	wantShort := "short\n…[full output archived: " + path + " — read_file it to view everything]"
+	if shortRef != wantShort {
+		t.Errorf("short-output reference = %q, want %q", shortRef, wantShort)
 	}
 }
 
