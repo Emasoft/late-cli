@@ -47,9 +47,10 @@ type PolicyEngine struct {
 //  5. Dynamic invocation (Invoke-Expression / iex) → NeedsConfirmation.
 //  6. Subshell / command substitution → NeedsConfirmation.
 //  7. Variable/parameter expansion → NeedsConfirmation.
-//  8. Destructive filesystem operation (Remove-Item, Copy-Item, etc.) → NeedsConfirmation.
-//  9. Shell operators (&&, ||, ;, |) with any non-allow-listed command → NeedsConfirmation.
-//  10. All commands in ir.Commands are allow-listed + no blocking signals
+//  8. Read-only statement (every invocation classified read-only) → auto-approve (issue #1, suggestion #2).
+//  9. Destructive filesystem operation (Remove-Item, Copy-Item, etc.) → NeedsConfirmation.
+//  10. Shell operators (&&, ||, ;, |) with any non-allow-listed command → NeedsConfirmation.
+//  11. All commands in ir.Commands are allow-listed + no blocking signals
 //     → auto-approve (NeedsConfirmation = false).
 func (p *PolicyEngine) Decide(ir ParsedIR) Decision {
 	d := Decision{ReasonCodes: ir.RiskFlags}
@@ -118,6 +119,22 @@ func (p *PolicyEngine) Decide(ir ParsedIR) Decision {
 		}
 	}
 
+	// Read-only operations (issue #1, suggestion #2; header rule 8): when the adapters
+	// classified EVERY invocation in the statement as read-only (gh/git
+	// read-only subcommands or plain text filters), the statement cannot
+	// mutate state: auto-approve without confirmation or OTP re-evaluation.
+	// This overrides only the operator and unknown-command gates — syntax
+	// errors, cd, unsafe redirects, deletion, subshells, dynamic invocation
+	// and expansions are all handled above and keep their existing gates, so
+	// e.g. `gh pr view $(cmd)` or `gh pr view && rm -rf` still gate. The
+	// bypass also yields to explicit allow-list entries: when a command HAS
+	// an entry whose stored flag set does not cover the flags actually used
+	// (strict flag matching, see allCommandsAllowlisted), the entry wins and
+	// the statement keeps the gate.
+	if hasRisk(ir, ReasonReadOnly) && !p.allowListContradicts(ir) {
+		return d
+	}
+
 	// 7. Allow-list check: if every command is explicitly allow-listed, approve.
 	// This overrides ReasonDestructive and ReasonOperator.
 	isAllowlisted := len(ir.Commands) > 0 && p.allCommandsAllowlisted(ir)
@@ -167,4 +184,27 @@ func (p *PolicyEngine) allCommandsAllowlisted(ir ParsedIR) bool {
 		}
 	}
 	return true
+}
+
+// allowListContradicts reports whether any command in ir has an allow-list
+// entry whose stored flag set does NOT cover the flags actually used. Such a
+// stricter stored approval must keep gating (flag validation stays strict):
+// the read-only bypass (issue #1, suggestion #2) widens only commands with no
+// contradicting entry — it never supersedes an explicit user approval.
+func (p *PolicyEngine) allowListContradicts(ir ParsedIR) bool {
+	if len(p.AllowedCommands) == 0 {
+		return false
+	}
+	for _, cmd := range ir.Commands {
+		allowedFlags, ok := p.AllowedCommands[cmd]
+		if !ok {
+			continue // no entry: the read-only classification is free to apply
+		}
+		for _, flag := range ir.CommandArgs[cmd] {
+			if !allowedFlags[flag] {
+				return true
+			}
+		}
+	}
+	return false
 }

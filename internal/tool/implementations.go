@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -374,13 +375,39 @@ func (t ShellTool) Parameters() json.RawMessage {
 		"properties": {
 			"command": { "type": "string", "description": "The full %s command to execute." },
 			"cwd": { "type": "string", "description": "Working directory for execution. Use this instead of 'cd' commands to change directories." },
-			"otp_code": { "type": "string", "description": "One-time code required to re-run a command that was blocked by the -force-revaluate-dangerous-commands re-evaluation gate. Re-run the exact same command passing the issued OTP code here; codes are single-use and bound to the exact command string." },
+			"otp_code": { "type": "string", "description": "One-time code required to re-run a command that was blocked by the -force-revaluate-dangerous-commands re-evaluation gate. Re-run the exact same command with the same cwd passing the issued OTP code here; codes are single-use and bound to the exact command string AND its working directory." },
 			"timeout": { "type": "string", "description": "Optional per-call time bound, e.g. 30m or 2h. 0 means unlimited. Defaults to the configured global timeout." }
 
 		},
 		"required": ["command"]
 	}`, shellDisplayName()))
 }
+
+// ResolveShellExecCwd mirrors ShellTool.Execute's working-directory
+// resolution — the directory a command would actually execute in (cmd.Dir):
+// the call's explicit `cwd` parameter > the agent run's worktree
+// (WorktreeDirKey, set for children spawned with spawn_subagent's "worktree"
+// argument) > the process working directory. The result is cleaned; a
+// relative `cwd` parameter stays relative (os/exec resolves a relative
+// cmd.Dir against the process working directory, and the exact-allowlist key
+// canonicalization applies the same rule). The error is the process-CWD
+// lookup failure. Callers that need the exact-string allowlist or the OTP
+// binding (force-revaluate gate) MUST go through this helper so an approval
+// is evaluated against the same directory the command runs in.
+func ResolveShellExecCwd(ctx context.Context, cwdParam string) (string, error) {
+	if cwdParam != "" {
+		return filepath.Clean(cwdParam), nil
+	}
+	if worktree := common.GetWorktreeDir(ctx); worktree != "" {
+		return filepath.Clean(worktree), nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
+	}
+	return filepath.Clean(cwd), nil
+}
+
 func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Command string `json:"command"`
@@ -415,30 +442,30 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		}
 	}
 
-	// Validate and set working directory. Priority: the call's explicit
-	// `cwd` parameter > the agent run's worktree (WorktreeDirKey, set for
-	// children spawned with spawn_subagent's "worktree" argument) > the
-	// process working directory. The worktree default keeps a worktree
-	// child's unqualified commands running inside its worktree without
-	// every call needing a `cwd` parameter.
-	if params.Cwd != "" {
-		if !IsSafePath(params.Cwd) && !isInsideWorktree(ctx, params.Cwd) {
-			return "", fmt.Errorf("cwd '%s' is outside the allowed directory", params.Cwd)
-		}
-	} else if worktree := common.GetWorktreeDir(ctx); worktree != "" {
-		params.Cwd = worktree
-	} else {
-		// Default to current directory
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", fmt.Errorf("failed to get current working directory: %w", err)
-		}
-		params.Cwd = cwd
+	// Validate the explicit `cwd` parameter: outside the allowed directory
+	// (and outside the run's worktree) is refused before anything runs.
+	if params.Cwd != "" && !IsSafePath(params.Cwd) && !isInsideWorktree(ctx, params.Cwd) {
+		return "", fmt.Errorf("cwd '%s' is outside the allowed directory", params.Cwd)
+	}
+
+	// Resolve the working directory the command will execute in (cmd.Dir).
+	// Priority: the call's explicit `cwd` parameter > the agent run's
+	// worktree (WorktreeDirKey, set for children spawned with
+	// spawn_subagent's "worktree" argument) > the process working directory.
+	// The worktree default keeps a worktree child's unqualified commands
+	// running inside its worktree without every call needing a `cwd`
+	// parameter. ResolveShellExecCwd mirrors this resolution exactly and is
+	// the single source of truth: the force-revaluate gate uses it to bind
+	// OTP approvals and exact-string allowlist entries to the directory the
+	// command actually runs in.
+	execCwd, err := ResolveShellExecCwd(ctx, params.Cwd)
+	if err != nil {
+		return "", err
 	}
 
 	// Execute command using a platform-specific shell wrapper.
 	cmd := newShellCommand(execCtx, params.Command)
-	cmd.Dir = params.Cwd
+	cmd.Dir = execCwd
 
 	output, err := cmd.CombinedOutput()
 
@@ -517,6 +544,20 @@ func (t ShellTool) RequiresConfirmation(args json.RawMessage) bool {
 	}
 
 	_, _, needsConfirmation := t.analyzeBashCommand(params.Command, params.Cwd)
+	return needsConfirmation
+}
+
+// RequiresConfirmationForCwd reports whether the command needs the
+// confirmation gate when it would execute with cmd.Dir == execCwd. execCwd
+// must already be the RESOLVED execution cwd (ResolveShellExecCwd: explicit
+// cwd param > worktree > process CWD): the exact-string allowlist is keyed
+// by (cwd, command), so the confirmation decision and any persisted approval
+// must be evaluated against the same directory the command actually runs in.
+// The force-revaluate gate uses this instead of RequiresConfirmation because
+// only the gate holds the request context needed to resolve the worktree
+// default for calls that pass no cwd parameter.
+func (t ShellTool) RequiresConfirmationForCwd(command, execCwd string) bool {
+	_, _, needsConfirmation := t.analyzeBashCommand(command, execCwd)
 	return needsConfirmation
 }
 

@@ -72,18 +72,48 @@ func (a *OutputArchive) Archive(output string) (string, error) {
 }
 
 // FormatReference renders the compact, deterministic form that stands in
-// history for an archived output: the first headChars characters
-// (rune-safe) of the original output followed by the archive pointer. It
-// contains no timestamps and no randomness — the same output always
-// produces the byte-identical form, which is what keeps the request
+// history for an archived output: the first headChars characters of the
+// original output (rune-safe), then a self-documenting marker carrying the
+// total size and the archive path, then the last tailChars characters
+// (rune-safe) when anything was actually cut. The marker names the
+// sanctioned retrieval tool — read_file with the archive path — so the agent
+// can view the rest without guessing (cat/grep are gated).
+//
+// It contains no timestamps and no randomness — the same (output, path) pair
+// always produces the byte-identical form, which is what keeps the request
 // prefix (and the prompt cache behind it) stable. See the OutputArchive
 // determinism contract above: this form is written to history once and
 // never regenerated.
-func FormatReference(path string, output string, headChars int) string {
+//
+// Sizes in the marker are rune counts ("chars"); callers band on byte
+// length (see executor.ArchiveThresholdChars and
+// executor.ArchiveInlineFullChars). When the output fits in headChars
+// nothing is cut and the tail is omitted; head and tail can only overlap
+// when the output is at most headChars+tailChars runes — impossible for the
+// executor, which renders this form only above ArchiveInlineFullChars
+// (3072 > 2000+500).
+func FormatReference(path string, output string, headChars, tailChars int) string {
 	if headChars < 0 {
 		headChars = 0
 	}
-	return fmt.Sprintf("%s\n…[full output archived: %s]", truncateRunes(output, headChars), path)
+	if tailChars < 0 {
+		tailChars = 0
+	}
+	runes := []rune(output)
+	head := truncateRunes(output, headChars)
+	if len(runes) <= headChars {
+		// Nothing was cut: keep the whole output, still point at the archive.
+		return fmt.Sprintf("%s\n…[full output archived: %s — read_file it to view everything]", head, path)
+	}
+	tail := ""
+	if tailChars > 0 {
+		if tailChars > len(runes) {
+			tailChars = len(runes)
+		}
+		tail = string(runes[len(runes)-tailChars:])
+	}
+	return fmt.Sprintf("%s\n…[output truncated: %d chars total. Head above / tail below. Full output archived: %s — read_file it to view everything]\n%s",
+		head, len(runes), path, tail)
 }
 
 // OutputArchiveDir returns the directory holding a session's archived tool
