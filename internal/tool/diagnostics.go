@@ -31,13 +31,6 @@ func SetDiagnostics(fn func(msg string)) {
 	diagnosticsFuncs = fn
 }
 
-// diagnosticsSink returns the installed sink or nil (thread-safe).
-func diagnosticsSink() func(msg string) {
-	diagnosticsMu.RLock()
-	defer diagnosticsMu.RUnlock()
-	return diagnosticsFuncs
-}
-
 // reportf formats one diagnostic line and routes it to the installed
 // diagnostics sink, or — when no sink is installed — to os.Stderr with the
 // exact same format string, pinning the pre-sink behavior.

@@ -63,7 +63,9 @@ type CommandDef struct {
 
 // AvailableCommands lists all slash commands available in the TUI.
 var AvailableCommands = []CommandDef{
+	{Name: "/collapse", Description: "Collapse tool output to one-line summaries"},
 	{Name: "/compose", Description: "Compose a message with an editor"},
+	{Name: "/expand", Description: "Expand collapsed tool output (default)"},
 	{Name: "/help", Description: "Show help and shortcuts"},
 	{Name: "/infobar", Description: "Toggle the info bar footer"},
 	{Name: "/jev-compact-context", Description: "Compact the conversation context with Jev"},

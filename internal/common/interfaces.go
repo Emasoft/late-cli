@@ -117,11 +117,16 @@ func (e RecoveryEvent) OrchestratorID() string { return e.ID }
 // SubagentIdleEvent is sent when an agent has been truly idle — no stream
 // progress, no in-flight tool, no in-flight nested subagent — for longer
 // than the configured idle threshold. Probe carries the last few transcript
-// entries so the recipient can decide whether the agent is stuck.
+// entries so the recipient can decide whether the agent is stuck. Stalled
+// (worker S) marks the auto-resume emission: the run was WEDGED (a blocked
+// in-flight tool call past the idle threshold), the stall callback fired,
+// and the run is being cancelled — state preserved, resumable via spawn
+// {"resume": "<ID>"}.
 type SubagentIdleEvent struct {
 	ID      string
 	IdleFor time.Duration
 	Probe   []string
+	Stalled bool
 }
 
 func (e SubagentIdleEvent) OrchestratorID() string { return e.ID }

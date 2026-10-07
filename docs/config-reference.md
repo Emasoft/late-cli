@@ -217,7 +217,7 @@ equivalent; Go's flag package accepts one or two dashes (`-flag` / `--flag`).
 
 | Key | Type | Default | CLI flag | Description |
 | --- | --- | --- | --- | --- |
-| `models` | array | `[]` | — | Model registry for `/model` and `agent_models`; each entry is `{id, url, key, model, jev-autocompact-percent}` (see below). |
+| `models` | array | `[]` | — | Model registry for `/model` and `agent_models`; each entry is `{id, url, key, model, jev-autocompact-percent, context-size-tokens, allow_parallel_execution}` (see below). |
 | `agent_models` | object | `{}` | — | Maps agent roles (`orchestrator`, `researcher`, `coder`, …) to a `models` entry `id` (or, legacy, its model name); persisted by `/model`. |
 | `openai_base_url` | string | `http://localhost:8080` | — | Base URL of the main OpenAI-compatible API; `OPENAI_BASE_URL` env overrides when set. |
 | `openai_api_key` | string | `""` | — | API key for the main provider; `OPENAI_API_KEY` env overrides when set. |
@@ -335,6 +335,20 @@ Each element of the `models` array is an object:
   `32768`) and late behaves as if the backend had advertised it: the
   declared value OVERRIDES discovery (a probe result never clobbers it) and
   also back-fills when discovery finds nothing. Values `<= 0` are ignored.
+* `allow_parallel_execution` (boolean, optional, default `false`; accepts the
+  boolean synonyms — `true`/`on`/`enabled`/`yes`/`1` vs `false`/`off`/`no`/`0`)
+  — per-model gate for background parallel subagent execution: a
+  `spawn_subagent` call asking for `"execution": "parallel"` only runs in
+  parallel when the agent's `agent_models`-routed entry sets this to `true`.
+  On `false` or an absent key the spawn is DOWNGRADED to serial — it joins
+  the serial queue in request order and runs alone after everything else has
+  drained — and the manifest record shows the effective mode plus this model
+  reference. ABSENT = FALSE: parallel requires an explicit per-model opt-in,
+  because the conservative default is the safe one for single-instance local
+  servers (one model process serializes concurrent requests anyway) and
+  rate-limited providers (bursts answer with 429s). Agents with no
+  `agent_models` routing run on the default subagent model and are never
+  allowed parallel. The orchestrator itself is never affected.
 
 ### `agent_models` values
 

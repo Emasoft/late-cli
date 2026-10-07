@@ -298,6 +298,20 @@ Subagents run under wall-clock budgets and an idle watchdog:
 
 The orchestrator can also budget a single run: `spawn_subagent` accepts an optional `timeout` argument (e.g. `"45m"`, `"2h"`; `"0"` = unlimited; omitted = the global value).
 
+### Background Execution (`execution`: `parallel` / `serial`)
+
+By default every subagent runs **synchronously**: the `spawn_subagent` call blocks until the child finishes and its result lands in the orchestrator's history. For independent tasks the orchestrator can pass an optional `execution` argument instead:
+
+| Mode | Behavior |
+| --- | --- |
+| `sync` (default) | The spawn blocks until the subagent finishes; its full result is the tool result. |
+| `parallel` | The subagent starts in the background right away (unless a serial subagent is running — then it queues and launches as one parallel batch when the serial chain drains). The spawn returns immediately with a launch acknowledgement. |
+| `serial` | The subagent is queued and runs **alone** — only when no other subagent (parallel or serial) is running. The spawn returns immediately with its queue position. |
+
+Background subagents deliver their outcome as a `[late harness]` message appended to the orchestrator's history (with a 200-character preview of the result), and the full result is stored on disk at `<sessions>/<session>/subagents/<id>.result.txt`. The orchestrator fetches it with the `subagent_results` tool (`{"id": "<id>"}`), which also reports live state (`still running`, `queued`) and frozen (interrupted-by-exit) subagents. Queue state is not persisted: subagents queued or running when `late` exits are lost, and the next resume marks them frozen with a resume hint — the same recovery semantics as synchronous subagents.
+
+**Per-model parallel gate:** a `parallel` request is honored only when the subagent's `agent_models`-routed `models[]` entry explicitly sets `"allow_parallel_execution": true` (boolean, default `false`; the usual on/off synonyms are accepted). Otherwise the spawn is downgraded to `serial` — the child queues and runs alone after the live parallel batch and any serials ahead of it have drained — and the downgrade is stated in the spawn acknowledgement. Agents without a model routing use the default subagent model and are never allowed parallel; the orchestrator itself is never blocked.
+
 Every `bash` call accepts an optional per-call `timeout` argument (e.g. `"30m"`; `"0"` = unlimited; omitted = the global default of 10m). Timed-out processes are killed with their whole process group, so runaway pipes and grandchildren cannot hang the session.
 
 ---

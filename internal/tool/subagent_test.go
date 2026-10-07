@@ -133,6 +133,23 @@ func TestSpawnSubagentTool_ParametersDocumentTimeout(t *testing.T) {
 	}
 }
 
+// TestSpawnSubagentTool_ParametersDocumentModelGate guards the JSON schema:
+// the execution property must state the per-model parallel gate — a
+// requested parallel is downgraded to serial when the agent's model does
+// not explicitly set allow_parallel_execution: true.
+func TestSpawnSubagentTool_ParametersDocumentModelGate(t *testing.T) {
+	schema := string(SpawnSubagentTool{Runner: nil}.Parameters())
+	if !strings.Contains(schema, "allow_parallel_execution") {
+		t.Fatal("execution schema description does not name the allow_parallel_execution gate")
+	}
+	if !strings.Contains(schema, `is downgraded to`) {
+		t.Fatal("execution schema description does not document the parallel-to-serial downgrade")
+	}
+	if !strings.Contains(schema, "models[] entry") {
+		t.Fatal("execution schema description does not point at the models[] entry that closes or opens the gate")
+	}
+}
+
 // TestSpawnSubagentTool_ParametersDocumentResumeAndWorktree guards the JSON
 // schema: the resume and worktree extensions must stay advertised with
 // their semantics (resume ignores everything else; worktree takes a

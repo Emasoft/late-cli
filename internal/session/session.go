@@ -192,7 +192,10 @@ func (s *Session) UpdateCompactionHighWater(n int) error {
 	if s.skipMetadata || s.HistoryPath == "" {
 		return nil
 	}
-	if err := s.UpdateSessionMetadata(); err != nil {
+	// The compaction walk calls this while still holding historyMu (its
+	// commit protocol: history file first, mark second, both under the
+	// walk's lock), so the metadata write must use the locked variant.
+	if err := s.updateSessionMetadataLocked(); err != nil {
 		s.compactionMu.Lock()
 		s.compactionHighWater = previous
 		s.compactionMu.Unlock()
@@ -242,6 +245,20 @@ func (s *Session) appendMessage(msg client.ChatMessage) error {
 	s.historyGen.Add(1) // invalidates stale in-flight snapshots (see persistHistorySnapshot)
 	s.historyMu.Unlock()
 	return s.saveAndNotify()
+}
+
+// HistorySnapshot returns a point-in-time copy of the history under
+// historyMu — the concurrent-safe reader for callers outside the session's
+// own goroutine: the subagent scheduler's completion path and tests that
+// poll for a notification while a background child appends. Reading the
+// exported History slice directly from another goroutine races the append
+// path's slice-header write.
+func (s *Session) HistorySnapshot() []client.ChatMessage {
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	out := make([]client.ChatMessage, len(s.History))
+	copy(out, s.History)
+	return out
 }
 
 // SnapshotHistory writes a point-in-time copy of the session's history to
@@ -635,6 +652,16 @@ func (s *Session) Impersonate(ctx context.Context) (string, error) {
 
 // GenerateSessionMeta creates metadata from session state
 func (s *Session) GenerateSessionMeta() SessionMeta {
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	return s.generateSessionMetaLocked()
+}
+
+// generateSessionMetaLocked is GenerateSessionMeta for callers already
+// holding historyMu (the compaction walk's persistence tail). It reads the
+// live History slice, which is exactly what the walk's lock guarantees:
+// concurrent appends are fenced out for the duration.
+func (s *Session) generateSessionMetaLocked() SessionMeta {
 	title := "Untitled Session"
 	lastPrompt := ""
 
@@ -685,8 +712,25 @@ func (s *Session) UpdateSessionMetadata() error {
 	if s.skipMetadata {
 		return nil
 	}
-	meta := s.GenerateSessionMeta()
+	// The history copy runs under historyMu: this method is reached from
+	// several unlocked contexts (append persistence, seq updates, pop
+	// resets), and a background subagent's completion notification can
+	// append concurrently — reading the live slice unlocked raced the
+	// append's slice-header write.
+	s.historyMu.Lock()
+	meta := s.generateSessionMetaLocked()
+	s.historyMu.Unlock()
 	return SaveSessionMeta(meta)
+}
+
+// updateSessionMetadataLocked is UpdateSessionMetadata for callers already
+// holding historyMu — the compaction walk's mark write, whose commit
+// protocol runs under the walk's lock (history file first, mark second).
+func (s *Session) updateSessionMetadataLocked() error {
+	if s.skipMetadata {
+		return nil
+	}
+	return SaveSessionMeta(s.generateSessionMetaLocked())
 }
 
 // StartNewConversation preserves the current conversation and switches this

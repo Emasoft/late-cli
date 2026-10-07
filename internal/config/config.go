@@ -101,6 +101,24 @@ type ModelSetting struct {
 	// result never clobbers it) and also back-fills when discovery finds
 	// nothing. 0/unset = unknown (auto-discovery only).
 	ContextSizeTokens int `json:"context-size-tokens,omitempty"`
+
+	// AllowParallelExecution is the per-model gate for background parallel
+	// execution of subagents. A spawn_subagent call asking for
+	// "execution": "parallel" only runs in parallel when the agent's
+	// agent_models-routed models[] entry sets this key to true; on false or
+	// an absent key the spawn is downgraded to serial — it joins the serial
+	// queue and runs alone after everything else finishes. ABSENT = FALSE:
+	// parallel requires an explicit per-model opt-in, because the safe
+	// default is the conservative one — a single-instance local server
+	// (one llama.cpp/llamafile process) serializes concurrent requests
+	// anyway and rate-limited providers answer bursts with 429s, so a model
+	// must be declared able to take parallel traffic before the scheduler
+	// sends any. Plain FlexBool (not a pointer): the zero value false is
+	// also the intended default, and omitempty keeps a false out of the
+	// saved file. Agents with NO agent_models routing run on the default
+	// subagent model and are never allowed parallel (same conservative
+	// fallback). The orchestrator itself is never affected by this key.
+	AllowParallelExecution FlexBool `json:"allow_parallel_execution,omitempty"`
 }
 
 // ContextSizeOverride reports the entry's declared context window. The
@@ -114,6 +132,12 @@ func (m ModelSetting) ContextSizeOverride() (int, bool) {
 	}
 	return 0, false
 }
+
+// AllowsParallelExecution reports whether subagents routed to this model may
+// execute in parallel in the background scheduler. It is the typed accessor
+// for AllowParallelExecution; the zero value (key absent) is false, so
+// parallel stays an explicit per-model opt-in.
+func (m ModelSetting) AllowsParallelExecution() bool { return m.AllowParallelExecution.Bool() }
 
 // Reference returns the stable value stored in agent_models. Model is retained
 // as a fallback for configurations created before model IDs were introduced.

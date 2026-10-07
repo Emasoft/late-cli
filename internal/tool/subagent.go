@@ -14,6 +14,31 @@ import (
 	"late/internal/git"
 )
 
+// Subagent execution modes (the spawn_subagent "execution" argument).
+// Sync is the default and preserves the historical blocking behavior
+// exactly; parallel and serial hand the child to the parent process's
+// background scheduler (cmd/late/subagent_scheduler.go) and return to the
+// model immediately.
+const (
+	SubagentExecutionSync     = "sync"     // block the tool call until the child finishes (default)
+	SubagentExecutionParallel = "parallel" // run in the background immediately, unless a serial child is running
+	SubagentExecutionSerial   = "serial"   // queue; runs alone when no other subagent is running
+)
+
+// NormalizeSubagentExecution maps an absent/empty "execution" argument to
+// the sync default and passes known modes through. The bool result reports
+// whether raw is an acceptable value at all.
+func NormalizeSubagentExecution(raw string) (string, bool) {
+	switch raw {
+	case "":
+		return SubagentExecutionSync, true
+	case SubagentExecutionSync, SubagentExecutionParallel, SubagentExecutionSerial:
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
 // SubagentRunner executes one subagent run. timeoutOverride carries the
 // per-spawn wall-clock budget parsed from the spawn_subagent "timeout"
 // argument: nil = no override (the global --subagent-timeout/config value
@@ -42,6 +67,17 @@ type SubagentSpawnRequest struct {
 	// the runner and replaces branch names with the created worktree's
 	// path, so the runner always sees a real directory here.
 	Worktree string `json:"worktree"`
+	// Execution selects how the child is scheduled: "sync" (the default —
+	// the tool call blocks until the child finishes and its result becomes
+	// the tool result), "parallel" (the child runs in the background right
+	// away unless a serial child is running; the spawn returns
+	// immediately), or "serial" (the child is queued and runs alone when no
+	// other subagent is running; the spawn returns immediately). A
+	// requested "parallel" is downgraded to "serial" by the per-model gate
+	// when the agent's model has allow_parallel_execution != true (see the
+	// execution schema description). Ignored for resume requests, which
+	// always run synchronously.
+	Execution string `json:"execution"`
 }
 
 // IsResume reports whether this request restores an existing child instead
@@ -94,6 +130,11 @@ func (t SpawnSubagentTool) Parameters() json.RawMessage {
 			"worktree": {
 				"type": "string",
 				"description": "Optional git worktree for this subagent to work in: either the path of an existing worktree of the current repository, or a branch name — a worktree for that branch is created first. The subagent's working directory becomes the worktree."
+			},
+			"execution": {
+				"type": "string",
+				"enum": ["sync", "parallel", "serial"],
+				"description": "How this subagent is scheduled. \"sync\" (default) blocks this tool call until the subagent finishes and returns its full result. \"parallel\" runs the subagent in the background immediately (unless a serial subagent is running — then it queues and launches as a parallel batch when the serial chain drains) and returns to you at once. \"serial\" queues the subagent to run ALONE when no other subagent is running and returns to you at once. Model gate: a requested \"parallel\" is downgraded to \"serial\" when this agent's model has allow_parallel_execution != true (the config.json models[] entry routed to this agent must explicitly set \"allow_parallel_execution\": true; agents with no model routing are always downgraded) — the downgrade is stated in the spawn acknowledgement. Parallel/serial subagents report their outcome with a [late harness] history notification; fetch the full result with the subagent_results tool using the reported ID. Ignored for resume requests."
 			}
 		},
 		"required": ["goal", "agent_type"]
@@ -160,6 +201,8 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 //   - agent_type: one of the configured subagent types (the same source the
 //     schema enum is built from). Without this check an unknown type fails
 //     deeper in the runner with a bare Go error instead of a retryable hint.
+//   - execution: one of the three scheduling modes (or absent for the sync
+//     default). A typo would otherwise surface as a scheduler surprise only.
 //   - ctx_files: every entry must exist and be a readable FILE. Missing
 //     entries used to be dropped silently when the goal message was built
 //     (os.ReadFile error → skipped), so the model believed context was
@@ -174,6 +217,11 @@ func validateFreshSpawnArgs(params SubagentSpawnRequest) string {
 	}
 	if !isConfiguredAgentType(params.AgentType) {
 		return fmt.Sprintf("Error: unknown agent_type %q — valid types: %s", params.AgentType, configuredAgentTypes())
+	}
+
+	if _, ok := NormalizeSubagentExecution(params.Execution); !ok {
+		return fmt.Sprintf("Error: unknown execution %q — valid modes: %q (default), %q, %q",
+			params.Execution, SubagentExecutionSync, SubagentExecutionParallel, SubagentExecutionSerial)
 	}
 
 	if len(params.CtxFiles) > 0 {
@@ -259,7 +307,76 @@ func (t SpawnSubagentTool) CallString(args json.RawMessage) string {
 	if goal == "" {
 		goal = "unknown goal"
 	}
-	return fmt.Sprintf("Spawning subagent for: %s", truncate(goal, 50))
+	suffix := ""
+	if mode, ok := NormalizeSubagentExecution(params.Execution); ok && mode != SubagentExecutionSync {
+		suffix = " (" + mode + ")"
+	}
+	return fmt.Sprintf("Spawning subagent for: %s%s", truncate(goal, 50), suffix)
+}
+
+// SubagentResultsTool is the read side of background subagent execution:
+// a child spawned with execution "parallel" or "serial" returns only a
+// launch/queue acknowledgement, and its FULL result reaches the parent as
+// a disk-backed artifact (manifest ResultPath → subagents/<id>.result.txt)
+// announced by a [late harness] history notification. This tool resolves a
+// child ID to that full result — or to the child's live scheduler state
+// ("still running", "queued") when it has not finished yet.
+//
+// Like SpawnSubagentTool it is a thin shell over an injected closure: the
+// tool package cannot import internal/session (import cycle), so the
+// lookup — scheduler state, manifest, result file — lives in cmd/late and
+// is wired in at registration, exactly like the spawn Runner.
+type SubagentResultsTool struct {
+	// Lookup resolves one subagent ID to its full stored result or live
+	// state text. It never returns an empty string; not-found and other
+	// degenerate cases are error-RESULT strings (nil Go error) so the
+	// model can read the hint and correct the ID.
+	Lookup func(ctx context.Context, id string) (string, error)
+}
+
+func (t SubagentResultsTool) Name() string { return "subagent_results" }
+
+func (t SubagentResultsTool) Description() string {
+	return "Fetch the full stored result of a background subagent — one spawned with the spawn_subagent execution argument set to \"parallel\" or \"serial\". Returns the complete final report for a finished subagent, or its live state (\"still running\", \"queued\") for one that has not finished yet. Background subagents announce completion with a [late harness] message; pass that message's id here. Sync subagents do not need this tool: their result already arrives in the spawn_subagent tool result."
+}
+
+func (t SubagentResultsTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"id": {
+				"type": "string",
+				"description": "The subagent ID exactly as the launch acknowledgement or the [late harness] completion notification reported it (e.g. \"coder-subagent-2\")"
+			}
+		},
+		"required": ["id"]
+	}`)
+}
+
+func (t SubagentResultsTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if t.Lookup == nil {
+		return "", fmt.Errorf("subagent results lookup not configured")
+	}
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("failed to parse arguments: %v", err)
+	}
+	if strings.TrimSpace(params.ID) == "" {
+		return `Error: empty id — pass the subagent ID exactly as the launch acknowledgement or the [late harness] notification reported it (e.g. "coder-subagent-2")`, nil
+	}
+	return t.Lookup(ctx, params.ID)
+}
+
+func (t SubagentResultsTool) RequiresConfirmation(args json.RawMessage) bool { return false }
+
+func (t SubagentResultsTool) CallString(args json.RawMessage) string {
+	id := getToolParam(args, "id")
+	if id == "" {
+		id = "unknown id"
+	}
+	return fmt.Sprintf("Fetching subagent result: %s", truncate(id, 50))
 }
 
 // ValidateWorktree resolves the spawn_subagent "worktree" argument to a

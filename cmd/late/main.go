@@ -1450,6 +1450,16 @@ func main() {
 			idleKillAfter:    resolvedSubagentIdleKillAfter,
 		}
 
+		// The background half of subagent execution (spawn_subagent
+		// "execution": "parallel"/"serial"): one scheduler per session owns
+		// the parallel/serial state machine, the completion notifications
+		// into this session, and the scheduler-driven manifest transitions
+		// (queued at enqueue, running at actual launch). Terminal statuses
+		// stay with the run closure via classifyAndReportSubagentOutcome.
+		scheduler := newSubagentScheduler(sess, func(id, status string) error {
+			return sess.MarkSubagentStatus(id, status, "", "", "")
+		})
+
 		// resumeSubagent implements spawn_subagent's "resume" argument
 		// (Phase C): the parent asks for a dead/crashed subagent by ID and
 		// gets the SAME child back — same ID, full persisted history,
@@ -1495,6 +1505,10 @@ func main() {
 			if runBudget > 0 {
 				runCtx, runCancel = context.WithTimeout(ctx, runBudget)
 			}
+			// Carry the cancel inside the context for the stall watchdog
+			// (withStallCancel) — a resumed run can wedge exactly like a
+			// fresh one.
+			runCtx = withStallCancel(runCtx, runCancel)
 			defer runCancel()
 
 			var currentSubagentClient *client.Client
@@ -1543,6 +1557,9 @@ func main() {
 			// of spawning fresh. The manifest record must exist and be
 			// non-terminal — a completed/failed/cancelled child is done
 			// for good, and the parent is told to spawn fresh instead.
+			// Resume runs synchronously regardless of the (ignored)
+			// "execution" argument: the parent explicitly waits for the
+			// restored child's continuation.
 			if request.IsResume() {
 				return resumeSubagent(ctx, request, timeoutOverride)
 			}
@@ -1552,26 +1569,21 @@ func main() {
 			agentType := request.AgentType
 			worktree := request.Worktree
 
-			// Effective wall-clock budget for this run. Context layering:
-			// parent ctx (cancellation) ⊇ run budget (deadline) — runCtx is
-			// derived from ctx, so cancelling the parent still cancels the
-			// child while the budget only adds a deadline. Precedence:
-			// per-spawn override when positive > global resolved budget; an
-			// explicit per-spawn "0" (unlimited) suppresses the global
-			// budget; an absent override falls back to the global value.
-			// runBudget is kept in a local var so error classification can
-			// report e.g. "time budget exhausted (2h)".
-			runBudget := effectiveSubagentBudget(timeoutOverride, resolvedSubagentTimeout)
-			runCtx := ctx
-			var runCancel context.CancelFunc = func() {}
-			if runBudget > 0 {
-				runCtx, runCancel = context.WithTimeout(ctx, runBudget)
-			}
-			defer runCancel()
-
 			var currentSubagentClient *client.Client
+			// The child's agent_models routing decides two things: which
+			// client it runs on, and (via the per-model parallel gate)
+			// whether a requested "parallel" execution may actually run in
+			// parallel. No routing = default subagent client = conservative
+			// serial: a model must explicitly opt in with
+			// "allow_parallel_execution": true on its models[] entry (see
+			// appconfig.ModelSetting for the single-instance/rate-limit
+			// motivation).
+			var modelAllowsParallel bool
+			var modelRef string
 			if appConfig != nil {
 				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
+					modelAllowsParallel = setting.AllowsParallelExecution()
+					modelRef = setting.Reference()
 					var biasForSubagent map[string]int
 					if setting.Model == resolvedSubagentConfig.Model {
 						biasForSubagent = subagentClient.LogitBias()
@@ -1596,6 +1608,47 @@ func main() {
 				return "", err
 			}
 
+			// Execution mode (validated by the tool; "" normalized to the
+			// sync default). Sync keeps the historical blocking path;
+			// parallel/serial hand the fully built child to the scheduler
+			// and return a launch/queue acknowledgement immediately. The
+			// EFFECTIVE mode applies the per-model parallel gate first: a
+			// requested parallel on a model without
+			// "allow_parallel_execution": true (or with no agent_models
+			// routing at all) is downgraded to serial, so the scheduler only
+			// ever receives effective modes.
+			execMode, _ := tool.NormalizeSubagentExecution(request.Execution)
+			if execMode != tool.SubagentExecutionSync {
+				scheduling := subagentScheduling{
+					Requested: execMode,
+					Effective: effectiveSubagentExecutionMode(execMode, modelAllowsParallel),
+					ModelRef:  modelRef,
+				}
+				return launchBackgroundSubagent(scheduler, runEnv, sess, effectiveSessionID, child, agentType, goal, worktree, ctx, timeoutOverride, resolvedSubagentTimeout, scheduling)
+			}
+
+			// Effective wall-clock budget for this run. Context layering:
+			// parent ctx (cancellation) ⊇ run budget (deadline) — runCtx is
+			// derived from ctx, so cancelling the parent still cancels the
+			// child while the budget only adds a deadline. Precedence:
+			// per-spawn override when positive > global resolved budget; an
+			// explicit per-spawn "0" (unlimited) suppresses the global
+			// budget; an absent override falls back to the global value.
+			// runBudget is kept in a local var so error classification can
+			// report e.g. "time budget exhausted (2h)".
+			runBudget := effectiveSubagentBudget(timeoutOverride, resolvedSubagentTimeout)
+			runCtx := ctx
+			var runCancel context.CancelFunc = func() {}
+			if runBudget > 0 {
+				runCtx, runCancel = context.WithTimeout(ctx, runBudget)
+			}
+			defer runCancel()
+
+			// Carry the cancel inside the context for the stall watchdog
+			// (withStallCancel) — a wedged run must be cancellable even when
+			// the budget is unlimited (runCancel stays a noop then).
+			runCtx = withStallCancel(runCtx, runCancel)
+
 			// Everything the fresh-spawn and resume paths share — archive
 			// reinstall, retrieval hook, diagnostics, run context (parent
 			// ctx + budget + worktree), idle policy, parent heartbeat and
@@ -1617,6 +1670,9 @@ func main() {
 
 		sess.Registry.Register(tool.SpawnSubagentTool{
 			Runner: runner,
+		})
+		sess.Registry.Register(tool.SubagentResultsTool{
+			Lookup: subagentResultsLookup(sess, scheduler, effectiveSessionID),
 		})
 	}
 
@@ -1642,17 +1698,20 @@ func effectiveSubagentBudget(timeoutOverride *time.Duration, globalBudget time.D
 }
 
 // validateResumeRecord decides whether a manifest record can be live-resumed
-// (spawn_subagent's "resume" argument): only an interrupted child — a record
-// still "running" when this process reads it, i.e. killed by a previous late
-// exit — is resumable. Terminal records are done for good: completed work
+// (spawn_subagent's "resume" argument): only an interrupted child — a
+// non-terminal record (running, queued, or frozen) that a previous late exit
+// killed — is resumable. Terminal records are done for good: completed work
 // needs no resume, and failed/cancelled work was already terminated with a
 // recorded cause, so the parent must spawn fresh instead. A record without
 // a persisted history cannot be restored either: the conversation was
 // in-memory only and is gone.
 func validateResumeRecord(record *session.SubagentRecord) error {
 	switch record.Status {
-	case session.SubagentStatusRunning:
-		// The resumable case: running-at-read = interrupted by exit.
+	case session.SubagentStatusRunning, session.SubagentStatusQueued, session.SubagentStatusFrozen:
+		// The resumable cases: running-at-read = interrupted by exit
+		// (legacy manifests); queued = accepted by the scheduler but
+		// never launched before the exit; frozen = the explicit
+		// interrupted status the resume synthesis persists.
 	case session.SubagentStatusCompleted, session.SubagentStatusFailed, session.SubagentStatusCancelled:
 		return terminalResumeError(record)
 	default:
@@ -1710,6 +1769,14 @@ func classifyAndReportSubagentOutcome(sess *session.Session, child common.Orches
 	}
 	var cause string
 	switch {
+	case strings.HasPrefix(childIdleKillReason, "stalled:"):
+		// Stall auto-resume (worker S): the watchdog's stall verdict is
+		// already a complete, model-readable cause ("stalled: no activity
+		// for ...; blocked in-flight tool call"). Use it VERBATIM — the
+		// "stalled:" prefix must survive into the manifest record and the
+		// parent notification, because the subagent_results lookup and the
+		// resume directive branch below both key on it.
+		cause = childIdleKillReason
 	case childIdleKillReason != "":
 		cause = fmt.Sprintf("idle: killed by the harness idle watchdog (%s)", childIdleKillReason)
 	case octx.runBudget > 0 && octx.runCtx.Err() == context.DeadlineExceeded:
@@ -1731,6 +1798,15 @@ func classifyAndReportSubagentOutcome(sess *session.Session, child common.Orches
 		result := fmt.Sprintf("The %s subagent %s (%s).\nFull pruned transcript: %s\nLast actions:\n%s", agentType, abnormal, cause, transcriptPath, summary)
 		if terr != nil {
 			result += fmt.Sprintf("\n(transcript unavailable: %v)", terr)
+		}
+		// Stall auto-resume directive: a STALLED child is the one failure
+		// shape whose checkpoint IS the preserved history — the parent can
+		// restore it exactly and continue where it wedged. Spell the
+		// directive out in the parent-facing text so the orchestrator can
+		// act without guessing (both the sync result and the background
+		// completion notification flow through here).
+		if strings.HasPrefix(childIdleKillReason, "stalled:") {
+			result += fmt.Sprintf("\nThis agent's conversation is fully preserved. Resume it to continue exactly where it stopped: call spawn_subagent with {\"resume\": %q}.", child.ID())
 		}
 		// Manifest terminal record (Phase 1): the parent can now see
 		// at resume time that this child ended abnormally, with the
@@ -1766,6 +1842,21 @@ func classifyAndReportSubagentOutcome(sess *session.Session, child common.Orches
 		return octx.finalWords, nil
 	}
 	return fmt.Sprintf("The subagent successfully completed its task. Final result:\n\n%s", res), nil
+}
+
+// stallCancelKey is the context key carrying a child run's cancel func so
+// the stall watchdog callback (installed in buildAndWireChild) can cancel
+// the WEDGED run. The cancel func travels in the same context it cancels —
+// self-referential but safe: cancel() is stored before the watchdog can
+// ever fire (the watchdog starts inside child.Execute, after SetContext).
+type stallCancelKey struct{}
+
+// withStallCancel returns ctx carrying its own cancel func under
+// stallCancelKey. Call it at run-context construction in both spawn paths
+// (the sync runner's budget context, the background closure's) so the stall
+// watchdog can always reach the kill switch.
+func withStallCancel(ctx context.Context, cancel context.CancelFunc) context.Context {
+	return context.WithValue(ctx, stallCancelKey{}, cancel)
 }
 
 // wireChildConfig carries the per-run values buildAndWireChild needs beyond
@@ -1849,6 +1940,29 @@ func buildAndWireChild(env *subagentRunEnv, child common.Orchestrator, cfg wireC
 		bo.SetDiagnostics(env.diag)
 	}
 
+	// Stall auto-resume (Worker S): install the child's stall watchdog
+	// callback — the ONE install for this child. A tool call blocked past
+	// the idle threshold with no output is a WEDGE, not work — the
+	// watchdog cancels the run context so the wedged agent unwinds instead
+	// of holding its tool slot (and, for a background child, its serial
+	// scheduler queue) forever. The runner's outcome path then records the
+	// stall and notifies the parent with the resume directive
+	// (classifyAndReportSubagentOutcome). The cancel func travels inside
+	// the run context (withStallCancel), so the callback needs no other
+	// wiring. SetStallPolicy REPLACES any previous callback, so no second
+	// install may follow this one.
+	if sa, ok := child.(interface {
+		SetStallPolicy(cb func(id, cause string))
+	}); ok && env.idleTimeout > 0 && cfg.runCtx != nil {
+		runCtx := cfg.runCtx
+		sa.SetStallPolicy(func(id, cause string) {
+			common.LogErrorf("subagent-stall", "subagent %s %s — cancelled; state preserved, resumable", id, cause)
+			if rc, ok := runCtx.Value(stallCancelKey{}).(context.CancelFunc); ok && rc != nil {
+				rc()
+			}
+		})
+	}
+
 	// NewSubagentOrchestrator/NewResumedSubagentOrchestrator already
 	// set the child's context from the parent (agent.go:
 	// child.SetContext(parent.Context())) — keep that inheritance
@@ -1873,6 +1987,13 @@ func buildAndWireChild(env *subagentRunEnv, child common.Orchestrator, cfg wireC
 	}); ok {
 		sa.SetIdlePolicy(env.idleTimeout, env.idleKillAfter)
 	}
+
+	// Stall auto-resume is installed ONCE, above: SetStallPolicy REPLACES the
+	// previous callback rather than composing, so a second install here would
+	// silently disarm the cancelling hook (a callback that only logs and never
+	// cancels) and leave a wedged background child holding its scheduler slot
+	// forever — the stall → cancel → notify → resume loop depends on the
+	// watchdog cancel reaching runCtx through the stallCancelKey wiring above.
 
 	// The child streams on its own session, so the parent shows no
 	// progress while the nested run executes. Keep the parent's

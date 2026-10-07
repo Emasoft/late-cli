@@ -15,12 +15,39 @@ import (
 // when the manifest is next read means the process exited (crash, kill,
 // terminal close) before the runner could write a terminal state. Resume
 // interprets running-at-exit as "interrupted" (see cmd/late).
+//
+// Background execution (spawn_subagent "execution": "parallel"/"serial")
+// adds two states to the lifecycle:
+//
+//   - "queued": the scheduler accepted the child but has not launched it
+//     yet (a parallel child waiting for a serial chain to drain, or a
+//     serial child waiting for an empty field). A queued-at-crash record
+//     means the child never started; its history holds only the goal.
+//   - "frozen": the interrupted state made explicit. The next process
+//     flips non-terminal records (running OR queued) to frozen when it
+//     synthesizes the interruption, so an interrupted child is a persisted
+//     status instead of the "still running at read time" idiom. Resume
+//     paths accept running, queued, and frozen alike for compatibility
+//     with manifests written before the field existed.
 const (
 	SubagentStatusRunning   = "running"
+	SubagentStatusQueued    = "queued"
+	SubagentStatusFrozen    = "frozen"
 	SubagentStatusCompleted = "completed"
 	SubagentStatusFailed    = "failed"
 	SubagentStatusCancelled = "cancelled"
 )
+
+// IsTerminalSubagentStatus reports whether status is a terminal manifest
+// status (the run has definitively ended and its outcome is recorded).
+func IsTerminalSubagentStatus(status string) bool {
+	switch status {
+	case SubagentStatusCompleted, SubagentStatusFailed, SubagentStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // manifestFileName is the manifest file inside <sessionsDir>/<sessionID>/subagents.
 const manifestFileName = "manifest.json"
@@ -83,11 +110,34 @@ type SubagentRecord struct {
 	// ResultPreview is the first slice (200 chars) of the completed child's
 	// final result. Empty for every other status.
 	ResultPreview string `json:"result_preview,omitempty"`
+	// ResultPath is the file holding a BACKGROUND child's full final
+	// result (<sessionsDir>/<sessionID>/subagents/<id>.result.txt), written
+	// when a parallel/serial child finishes; the manifest itself stores
+	// only the 200-char ResultPreview and the parent's completion
+	// notification points at this file (the subagent_results tool reads
+	// it). Full results can be huge, so the inline history surface is a
+	// preview and the file is the durable copy. Empty for sync children —
+	// their full result lives in the parent history already — and when
+	// persistence failed.
+	ResultPath string `json:"result_path,omitempty"`
 	// Cause is the runner's termination classification ("idle: killed by
 	// the harness idle watchdog (...)", "time budget exhausted (2h)",
 	// "cancelled or killed by the user", "crashed: ..."). Empty while
 	// running and for completed children.
 	Cause string `json:"cause,omitempty"`
+	// Execution is the child's EFFECTIVE background execution mode —
+	// "parallel" or "serial" — after the per-model parallel gate
+	// (config.json models[] "allow_parallel_execution"): a requested
+	// parallel on a model without the flag is recorded here as "serial",
+	// so the manifest shows WHY a child serialized and not just that it
+	// did. Empty for synchronous children (the default) — they never reach
+	// the scheduler.
+	Execution string `json:"execution,omitempty"`
+	// Model is the agent_models reference of the model the child was routed
+	// to (the models[] entry's id, or its model name for legacy name-based
+	// routing). Empty when the child ran on the default subagent model (no
+	// agent_models entry) — which also means the parallel gate was closed.
+	Model string `json:"model,omitempty"`
 }
 
 // SubagentManifest is the JSON document persisted at
@@ -323,5 +373,65 @@ func (s *Session) MarkSubagentResumed(id string) error {
 	}
 	manifest.SessionID = sessionID
 	manifest.MarkResumed(id)
+	return manifest.Save()
+}
+
+// MarkSubagentExecution stamps a background child's EFFECTIVE execution mode
+// and its agent_models model reference onto the record (see the Execution and
+// Model fields). It runs right after the spawn constructor wrote the running
+// record, before the scheduler's own queued/running transitions, so a queued
+// child is already labeled with why it is queued. It is a no-op for an
+// in-memory session, when the manifest cannot be loaded, or for an unknown
+// ID — an execution stamp may only refine an existing spawn record, never
+// invent one.
+func (s *Session) MarkSubagentExecution(id, execution, model string) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" {
+		return nil // in-memory session: no session folder, no manifest
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	rec, ok := manifest.Get(id)
+	if !ok {
+		return nil
+	}
+	rec.Execution = execution
+	rec.Model = model
+	return manifest.Save()
+}
+
+// MarkSubagentResultPath records where a background child's FULL final
+// result was persisted (<sessionsDir>/<session>/subagents/<id>.result.txt,
+// written by the runner before this call). The manifest stores only the
+// path — the preview lives in ResultPreview, the bytes in the file — so the
+// subagent_results tool can stream the full result back to the parent model
+// on demand. Unknown IDs are a no-op: the record exists because the child's
+// constructor wrote it, and a missing record would mean the file belongs to
+// no manifest entry. It is a no-op for an in-memory session or when the
+// manifest cannot be loaded, mirroring MarkSubagentStatus.
+func (s *Session) MarkSubagentResultPath(id, resultPath string) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" {
+		return nil // in-memory session: no session folder, no manifest
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	rec, ok := manifest.Get(id)
+	if !ok {
+		return nil
+	}
+	rec.ResultPath = resultPath
 	return manifest.Save()
 }

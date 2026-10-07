@@ -695,6 +695,42 @@ func (m *Model) statusBarView() string {
 		}
 	}
 
+	// Live child activity: while the user watches the parent (or any agent
+	// other than a working child), a compact one-line indicator names the
+	// busy background child and what it is doing right now — thinking,
+	// running a tool, or streaming. Full transcripts stay in the child's own
+	// view (tab); this is only the pointer to it. The focused agent's own
+	// state is already on display and is never summarized here.
+	if m.Focused != nil {
+		for id, cs := range m.AgentStates {
+			if id == m.Focused.ID() || cs.Closed || (cs.State != StateThinking && cs.State != StateStreaming) {
+				continue
+			}
+			activity := "thinking"
+			if cs.State == StateStreaming {
+				// A pending tool call with no streamed prose yet means the
+				// child is executing that tool; otherwise it is producing
+				// output (or still reasoning — shown as plain working).
+				activity = "working"
+				if cs.StreamingState.Content == "" {
+					if len(cs.StreamingState.ToolCalls) > 0 {
+						activity = "tool " + cs.StreamingState.ToolCalls[0].Function.Name
+					} else if cs.StreamingState.ReasoningContent != "" {
+						activity = "thinking"
+					}
+				}
+			}
+			indicator := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor).Italic(true).
+				Render(formatAgentBreadcrumb(id) + ": " + activity)
+			if status != "" {
+				status += " · " + indicator
+			} else {
+				status = indicator
+			}
+			break
+		}
+	}
+
 	// Right: Context, Attachments
 	var rightItems []string
 	maxTokens := m.Focused.MaxTokens()
@@ -1017,6 +1053,10 @@ func (m *Model) updateViewport() {
   **/quit**           Exit Late
   **/rewind**         Time-travel back to previous prompt
   **/themes**         List and switch themes
+
+### Transcript Visibility
+  **/collapse**       Fold tool output to one-line summaries
+  **/expand**         Show full tool output again (default)
 `
 
 		// Plugin-provided slash commands

@@ -82,9 +82,15 @@ type BaseOrchestrator struct {
 	// means notify only. idleTickInterval defaults to defaultIdleTickInterval
 	// and is overridable (same package) so tests can drive the watchdog
 	// deterministically.
+	//
+	// stallCb (SetStallPolicy) is the AUTO-RESUME hook: when the run stalls
+	// (a blocked tool call wedging the agent), the watchdog invokes it once
+	// and CANCELS the run context so the wedged agent unblocks. Guarded by
+	// mu; nil (the default) keeps the notify-only watchdog behavior.
 	idleTimeout      time.Duration
 	idleKillAfter    time.Duration
 	idleTickInterval time.Duration
+	stallCb          func(id, cause string)
 
 	// retrievalHookFn runs at every turn start — right before that turn's
 	// stream request — when installed (main wires it behind the
@@ -181,6 +187,49 @@ func (o *BaseOrchestrator) reportDroppedEvents() {
 	}
 }
 
+// sendEvent delivers ev to o.eventCh without ever blocking the caller,
+// counting a failed delivery in droppedEvents — the same accounting as
+// trySendProgress. It is for events that MUST be attempted immediately
+// (a status the caller's contract expects to be observable) but whose loss
+// to a wedged consumer is strictly better than wedging the agent: the
+// run-loop's unwedgeSend covers the state-machine-critical deliveries.
+func (o *BaseOrchestrator) sendEvent(ev common.Event) {
+	select {
+	case o.eventCh <- ev:
+	default:
+		o.droppedEvents.Add(1)
+	}
+}
+
+// unwedgeTimeout bounds one unwedgeSend attempt.
+const unwedgeTimeout = 5 * time.Second
+
+// unwedgeSend delivers a state-machine-critical terminal event (Execute's
+// final "idle") WITHOUT the old unconditional blocking send: it waits a
+// bounded unwedgeTimeout for the consumer to drain, then gives up with the
+// standard drop accounting (droppedEvents) plus a direct report line. The
+// bounded fallback keeps the terminal delivery reliable for a merely SLOW
+// consumer (the usual case — the TUI frame clock catches up in
+// milliseconds), while a fully WEDGED pipeline (a blocked tea.Program.Send,
+// a dead consumer goroutine) can only cost unwedgeTimeout, never an
+// infinite agent hang. The caller of unwedgeSend is a terminal path that
+// has no recovery value left, so the bounded wait does not delay live work.
+func (o *BaseOrchestrator) unwedgeSend(ev common.Event) {
+	timer := time.NewTimer(unwedgeTimeout)
+	defer timer.Stop()
+	select {
+	case o.eventCh <- ev:
+		return
+	case <-timer.C:
+	}
+	// The bounded wait expired: count the loss (the same droppedEvents
+	// accounting as trySendProgress) so the next reportDroppedEvents
+	// surfaces the stalled consumer, and log the terminal loss directly —
+	// nothing later in this run will report it.
+	o.droppedEvents.Add(1)
+	o.reportf("late: terminal status event dropped (consumer still stalled after %s)\n", unwedgeTimeout)
+}
+
 // SetDiagnostics installs fn as this orchestrator's diagnostics sink: reportf
 // lines (e.g. the dropped-events notice) are routed to fn instead of
 // os.Stderr, so a TUI session can surface them as toasts without raw text
@@ -240,6 +289,39 @@ func (o *BaseOrchestrator) SetIdlePolicy(idle, killAfter time.Duration) {
 	o.idleKillAfter = killAfter
 }
 
+// SetStallPolicy installs the STALL callback — the auto-resume hook. A
+// stalled run is not a merely idle one: the agent is wedged (typically a
+// tool call blocked forever inside an API or subprocess that never
+// returns), and no amount of waiting recovers it. When the watchdog sees a
+// BLOCKED tool call older than the idle threshold — the same threshold that
+// governs idleness — it invokes cb exactly once with the orchestrator ID
+// and a human-readable cause, then CANCELS the run context so the wedged
+// agent unwinds. The callback fires from the watchdog goroutine; it must
+// never call back into this orchestrator's mu-protected methods (the
+// callback's own synchronization is its responsibility).
+//
+// The stall check is INDEPENDENT of the idle/kill machinery: it fires even
+// while the run would otherwise count as busy, and before it — a blocked
+// tool call makes lastActivity and idleKillAfter unreachable in lockstep
+// with the hang. Callbacks are guarded by mu; installing a new callback
+// replaces the previous one; nil restores notify-only watchdog behavior.
+// Must be called before Execute/Submit to apply to a run.
+func (o *BaseOrchestrator) SetStallPolicy(cb func(id, cause string)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.stallCb = cb
+}
+
+// stallCause renders the watchdog's stall reason: the blocked-tool age, the
+// idle threshold it had to exceed, and the last transcript entries so the
+// caller can reconstruct where the agent wedged.
+func stallCause(blockedFor, threshold time.Duration, probe []string) string {
+	return fmt.Sprintf(
+		"stalled: no activity for %s (threshold %s); blocked in-flight tool call; last transcript entries: %s",
+		blockedFor.Truncate(time.Second), threshold, strings.Join(probe, " | "),
+	)
+}
+
 // SetRetrievalHook installs h as this orchestrator's retrieval hook: it
 // runs at every turn start, right before that turn's stream request, after
 // the pending messages joined history (so a retrieval scored against the
@@ -286,8 +368,11 @@ func (o *BaseOrchestrator) IdleKillReason() string {
 
 // activityMiddleware is the internal, always-present outermost middleware:
 // every tool execution bumps activity and the in-flight tool counter, and
-// stamps the in-flight start time used by the idle watchdog's busy check. It
-// is inserted OUTERMOST (before user middlewares), so the confirmation
+// stamps the in-flight start time used by the idle watchdog's busy check.
+// The stall path (SetStallPolicy) reads the same stamps: a tool call whose
+// start is older than the idle threshold with no streamed output from it
+// (tool results arrive only at the end) is a wedge, not work. Middleware is
+// inserted OUTERMOST (before user middlewares), so the confirmation
 // middleware runs INSIDE this wrapper — a tool waiting for user approval
 // still counts as in-flight, i.e. awaiting-approval counts as active. That
 // is by design: a paused-for-approval agent is not idle.
@@ -375,14 +460,73 @@ func (o *BaseOrchestrator) startIdleWatchdog(ctx context.Context, cancel context
 			}
 
 			idle := time.Since(time.Unix(0, o.lastActivity.Load()))
+			toolStart := o.oldestToolStartAt.Load()
+			var toolBlockedFor time.Duration
+			if toolStart != 0 {
+				toolBlockedFor = time.Since(time.Unix(0, toolStart))
+			}
+
+			// Stall check (auto-resume hook): a tool call blocked for longer
+			// than the idle threshold is a WEDGE — its result only arrives at
+			// the end, so zero intermediate output plus an old start stamp
+			// means nothing will ever arrive on its own. Fire the stall
+			// callback once (with a cause naming the blockage) and cancel the
+			// run so the wedged agent unwinds. This is deliberately
+			// independent of the idle machinery below: a blocked tool call
+			// here is exactly the state that used to read as "busy forever",
+			// and it must never again be recoverable only by a human
+			// noticing the cycling notification. The stall callback + cancel
+			// also STOP this watchdog (ctx.Done fires on the next select),
+			// so the check cannot re-fire after cancellation.
+			//
+			// Callback and threshold are read under mu (the callback pointer
+			// is also mu-guarded); the invocation itself happens WITHOUT the
+			// lock — a callback that re-enters mu-protected methods must not
+			// deadlock its own firing.
+			o.mu.RLock()
+			stallCb := o.stallCb
+			o.mu.RUnlock()
+			// Delegation exemption: a spawn_subagent "sync" call blocks its
+			// parent's tool slot for the child's WHOLE legitimate runtime
+			// (the parent heartbeats while the child streams its own
+			// progress, and the CHILD's own watchdog handles the child's
+			// wedges). A blocked tool call under a live nested spawn is
+			// therefore healthy delegation, not a stall — the parent must
+			// not be killed mid-delegation. The child's completion (or the
+			// child's own watchdog stall) unblocks the tool call naturally.
+			if stallCb != nil && toolStart != 0 && toolBlockedFor >= idleTimeout &&
+				o.nestedSpawns.Load() == 0 {
+				o.mu.Lock()
+				if o.idleKillReason != "" {
+					// Stage 2 below (or a prior tick) already killed this
+					// run — never double-cancel and never double-report.
+					o.mu.Unlock()
+					return
+				}
+				o.idleKillReason = stallCause(toolBlockedFor, idleTimeout, o.idleProbe())
+				o.mu.Unlock()
+				// Stall visibility (Part 4): the explicit stalled event —
+				// the TUI shows the wedge and the resume directive; the
+				// event stays non-blocking (a stalled agent must not block
+				// on a stalled consumer).
+				o.sendEvent(common.SubagentIdleEvent{
+					ID:      o.id,
+					IdleFor: toolBlockedFor,
+					Probe:   o.idleProbe(),
+					Stalled: true,
+				})
+				stallCb(o.id, o.IdleKillReason())
+				cancel()
+				return
+			}
+
 			// Busy means real progress is still possible: a nested subagent
 			// run, or a tool call in flight for LESS than the idle threshold.
 			// A tool that outlives idleTimeout is considered stalled — it no
 			// longer suppresses idleness, so a hung tool cannot hide from the
 			// watchdog forever.
 			busy := o.nestedSpawns.Load() > 0
-			if start := o.oldestToolStartAt.Load(); start != 0 &&
-				time.Since(time.Unix(0, start)) < idleTimeout {
+			if toolStart != 0 && toolBlockedFor < idleTimeout {
 				busy = true
 			}
 			if idle < idleTimeout || busy {
@@ -687,16 +831,20 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			o.mu.Lock()
 			o.isRunning = false
 			o.mu.Unlock()
-			o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
+			// Unwedge safety: the run never started, so this terminal send
+			// cannot abandon a live consumer state machine — it must never
+			// wedge the caller in a fully-blocked pipeline.
+			o.sendEvent(common.StatusEvent{ID: o.id, Status: "error", Error: err})
 			return "", err
 		}
 	}
 
 	// Transient status: non-blocking with drop counting (see trySendProgress).
 	o.trySendProgress(common.StatusEvent{ID: o.id, Status: "thinking"})
-	// The terminal "idle" status MUST be delivered or the TUI hangs in its
-	// running state ("Stopping..."), so this send stays blocking even if the
-	// consumer is stalled. It fires once, after all work is done.
+	// The terminal "idle" status MUST reach the TUI or it hangs in its
+	// running state ("Stopping..."). UnwedgeSend delivers it even to a
+	// stalled consumer (send-then-unwedge timeout), but never holds the
+	// caller hostage on a fully-wedged pipeline.
 	defer func() {
 		// Report any progress events dropped while the consumer was stalled
 		// during the run: onEndTurn only fires on a turn that committed a
@@ -711,7 +859,7 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 		// silently dropped at completion. A later run's first turn
 		// (onStartTurn) drains them; interrupting before that restores
 		// them to the input via DrainQueuedMessages.
-		o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
+		o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "idle"})
 	}()
 
 	// Build extra body
@@ -753,12 +901,13 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 		usage := o.acc.Usage
 		o.acc.Reset()
 		o.mu.Unlock()
-		// Turn-boundary signal carrying the turn's Usage: kept BLOCKING. It is
-		// low-frequency (once per turn, not per chunk) and is the
-		// authoritative end-of-turn marker the TUI uses to finalize the
-		// message and recompute token counts; dropping it would leave the
-		// rendered transcript incomplete even after the consumer catches up.
-		o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true}
+		// Turn-boundary signal carrying the turn's Usage: bounded unwedge
+		// send. It is low-frequency (once per turn, not per chunk) and is
+		// the authoritative end-of-turn marker the TUI uses to finalize the
+		// message and recompute token counts, so a slow consumer still gets
+		// it — but a fully wedged one may only cost unwedgeTimeout, never
+		// the turn itself.
+		o.unwedgeSend(common.ContentEvent{ID: o.id, Usage: usage, Completed: true})
 		// Report any progress events dropped while the consumer was stalled
 		// earlier in this turn (and reset the counter for the next turn).
 		o.reportDroppedEvents()
@@ -804,10 +953,7 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			// retry backoff loop. The buffered(100) eventCh may be full if the
 			// consumer lags; dropping a retry notice is acceptable, blocking
 			// the agent is not.
-			select {
-			case o.eventCh <- ev:
-			default:
-			}
+			o.sendEvent(ev)
 		},
 		func() {
 			// A retried attempt produced a response: emit the dedicated
@@ -815,17 +961,15 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 			// guessing on the next turn's thinking event. Non-blocking:
 			// a dropped recovery notice is acceptable, blocking the
 			// agent is not.
-			select {
-			case o.eventCh <- common.RecoveryEvent{ID: o.id}:
-			default:
-			}
+			o.sendEvent(common.RecoveryEvent{ID: o.id})
 		},
 		o.withActivityMiddleware(),
 	)
 
-	// Terminal statuses: kept BLOCKING — the TUI hangs in "Stopping..." (or in
-	// the running state) if it never receives the run's final status, so these
-	// must be delivered even to a stalled consumer.
+	// Terminal statuses: unwedge send — the TUI hangs in "Stopping..." (or in
+	// the running state) if it never receives the run's final status, so a
+	// slow consumer still gets it (bounded wait), while a fully wedged one
+	// can only cost unwedgeTimeout, never an agent hang.
 	if err != nil {
 		// Canceled runs follow the stop path, not the error path (no error
 		// box): a stop can surface here as the underlying stream error, e.g.
@@ -834,12 +978,12 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 		// consumes the one-shot stopCh token. Emitting "closed" mirrors how a
 		// mid-stream cancel (nil error) is routed below.
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			o.eventCh <- common.StatusEvent{ID: o.id, Status: "closed"}
+			o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "closed"})
 			return res, err
 		}
-		o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
+		o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "error", Error: err})
 	} else {
-		o.eventCh <- common.StatusEvent{ID: o.id, Status: "closed"}
+		o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "closed"})
 	}
 	return res, err
 }
@@ -874,7 +1018,9 @@ func (o *BaseOrchestrator) run() {
 
 	for {
 		if ctx.Err() != nil {
-			o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
+			// Unwedge send: terminal state-machine event; never an unbounded
+			// block (see unwedgeSend).
+			o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "idle"})
 			break
 		}
 
@@ -910,9 +1056,11 @@ func (o *BaseOrchestrator) run() {
 			usage := o.acc.Usage
 			o.acc.Reset()
 			o.mu.Unlock()
-			// Turn-boundary signal carrying the turn's Usage: kept BLOCKING
-			// (same reasoning as Execute's onEndTurn).
-			o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true}
+			// Turn-boundary signal carrying the turn's Usage: the TUI
+			// recomputes the token cache from it, but a wedged consumer must
+			// never hold the turn boundary hostage — bounded unwedge send
+			// (see unwedgeSend).
+			o.unwedgeSend(common.ContentEvent{ID: o.id, Usage: usage, Completed: true})
 			// Report any progress events dropped while the consumer was
 			// stalled earlier in this turn, then reset the counter.
 			o.reportDroppedEvents()
@@ -957,14 +1105,12 @@ func (o *BaseOrchestrator) run() {
 				o.mu.Unlock()
 
 				ev.ID = o.id // Route to this agent's AppState even if ctx lost the ID
-				// Non-blocking emit: a slow or stalled TUI must never delay the
-				// retry backoff loop. The buffered(100) eventCh may be full if
-				// the consumer lags; dropping a retry notice is acceptable,
-				// blocking the agent is not.
-				select {
-				case o.eventCh <- ev:
-				default:
-				}
+				// Non-blocking emit with drop accounting: a slow or stalled
+				// TUI must never delay the retry backoff loop. The
+				// buffered(100) eventCh may be full if the consumer lags;
+				// dropping a retry notice is acceptable, blocking the agent
+				// is not.
+				o.sendEvent(ev)
 			},
 			func() {
 				// A retried attempt produced a response: emit the dedicated
@@ -972,10 +1118,7 @@ func (o *BaseOrchestrator) run() {
 				// guessing on the next turn's thinking event. Non-blocking:
 				// a dropped recovery notice is acceptable, blocking the
 				// agent is not.
-				select {
-				case o.eventCh <- common.RecoveryEvent{ID: o.id}:
-				default:
-				}
+				o.sendEvent(common.RecoveryEvent{ID: o.id})
 			},
 			o.withActivityMiddleware(),
 		)
@@ -1001,7 +1144,7 @@ func (o *BaseOrchestrator) run() {
 			// the stopCh token landed, the StopRequestedEvent below still
 			// turns it into "Stopped".
 			if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-				o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
+				o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "idle"})
 				break
 			}
 			// If the error is about unsupported image input, roll back the user message
@@ -1022,9 +1165,10 @@ func (o *BaseOrchestrator) run() {
 				if popped, popErr := o.sess.PopLastUserMessage(); popped && popErr != nil {
 					common.LogErrorf("orchestrator", "rolling back unsupported-image user message: %v", popErr)
 				}
-				// Terminal status: kept BLOCKING — the TUI must observe the
-				// run's final status or it stays wedged in its running state.
-				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("image_unsupported")}
+				// Terminal status: unwedge send — the TUI must observe the
+				// run's final status, but a fully-wedged consumer may only
+				// cost the bounded timeout, never an agent hang.
+				o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "error", Error: fmt.Errorf("image_unsupported")})
 			} else if isContextExceededError(err) {
 				// Context exhaustion is NOT a bad request to roll back: the
 				// message is fine, the conversation is simply too large.
@@ -1032,8 +1176,8 @@ func (o *BaseOrchestrator) run() {
 				// user's text. The executor's guard already ran the
 				// auto-compaction rounds; surface the typed guidance
 				// verbatim (it names the compaction outcome and /new).
-				// Terminal status: kept BLOCKING (see above).
-				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
+				// Terminal status: unwedge send (see unwedgeSend).
+				o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "error", Error: err})
 			} else if isBadRequestStatusError(err) {
 				// The API rejected the request body even after the executor's bad-body
 				// retries. Roll the turn back so the session returns to its pre-submit
@@ -1052,19 +1196,20 @@ func (o *BaseOrchestrator) run() {
 					default:
 						msg += "nothing was rolled back (the turn had no unanswered user message); use /rewind if history needs repair"
 					}
-					o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: errors.New(msg)}
+					o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "error", Error: errors.New(msg)})
 				}
 			} else {
-				// Terminal status: kept BLOCKING (see above).
-				o.eventCh <- common.StatusEvent{ID: o.id, Status: "error", Error: err}
+				// Terminal status: unwedge send (see unwedgeSend).
+				o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "error", Error: err})
 			}
 			break
 		}
 
 		if !hasPending {
-			// Terminal status: kept BLOCKING — the TUI must observe the run's
-			// final status or it stays wedged in its running state.
-			o.eventCh <- common.StatusEvent{ID: o.id, Status: "idle"}
+			// Terminal status: unwedge send — the TUI must observe the run's
+			// final status or it stays wedged in its running state; a fully
+			// wedged consumer may only cost the bounded timeout.
+			o.unwedgeSend(common.StatusEvent{ID: o.id, Status: "idle"})
 			break
 		}
 	}
@@ -1086,8 +1231,10 @@ func (o *BaseOrchestrator) run() {
 
 	// Check if stop was requested and send StopRequestedEvent
 	if o.IsStopRequested() {
-		// Terminal, fires once: kept BLOCKING so the TUI reliably observes it.
-		o.eventCh <- common.StopRequestedEvent{ID: o.id}
+		// Terminal, fires once: unwedge send — the TUI reliably observes it
+		// in every healthy pipeline; a fully wedged consumer may only cost
+		// the bounded timeout, never an agent hang.
+		o.unwedgeSend(common.StopRequestedEvent{ID: o.id})
 	}
 }
 
@@ -1243,15 +1390,20 @@ func (o *BaseOrchestrator) AddChild(child common.Orchestrator) {
 	o.children = append(o.children, child)
 	o.mu.Unlock()
 
-	// ChildAddedEvent MUST be sent BLOCKING (no select/default): the TUI's
-	// ForwardOrchestratorEvents only spawns the child's event-forwarding
-	// goroutine when it receives this event, so dropping it would silently
-	// orphan the child's entire event stream. It has a guaranteed consumer by
-	// construction, and AddChild runs on the (single) subagent-runner
-	// goroutine, so a brief block here only backpressures child creation
-	// until the parent's consumer catches up.
-	o.eventCh <- common.ChildAddedEvent{
+	// ChildAddedEvent MUST reach the TUI: ForwardOrchestratorEvents only
+	// spawns the child's event-forwarding goroutine when it receives this
+	// event, so dropping it would silently orphan the child's entire event
+	// stream. But an UNCONDITIONAL blocking send here lets a fully wedged
+	// consumer (a dead TUI, a blocked forwarder) freeze the subagent tool
+	// call — and, for a background scheduler child, the scheduler goroutine
+	// and its queue — forever: the exact "events dropped (consumer stalled)
+	// → wedged producer" death the error log showed. The send is therefore
+	// a BOUNDED unwedge send: a slow consumer still receives the event (its
+	// channel drains in the normal course of TUI frames), while a wedged
+	// one costs at most unwedgeTimeout, after which the drop is counted and
+	// reported like any other stalled-consumer loss.
+	o.unwedgeSend(common.ChildAddedEvent{
 		ParentID: o.id,
 		Child:    child,
-	}
+	})
 }

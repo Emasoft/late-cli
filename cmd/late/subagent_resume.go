@@ -101,7 +101,55 @@ func synthesizeDanglingSpawnResults(sess *session.Session) (*session.SubagentMan
 	if synthesized > 0 {
 		common.LogErrorf("subagent-manifest", "resume synthesized %d tool result(s) for dangling spawn_subagent call(s) in session %s", synthesized, effectiveSessionID)
 	}
+
+	// Freeze the interrupted: every non-terminal record (running OR queued —
+	// queued covers background children that never launched before the
+	// previous exit) is by definition interrupted by that exit, whether or
+	// not its spawn call was dangling above (a background child's spawn call
+	// is answered at launch time with a queue acknowledgement, so its death
+	// leaves no dangling call to synthesize). Making "interrupted" an
+	// explicit persisted status — frozen — replaces the "still running at
+	// read time" idiom and gives the subagent_results tool a status to
+	// report. Persisted so later resumes see frozen, not a stale running.
+	frozen := freezeInterruptedRecords(manifest)
+	if frozen > 0 {
+		if err := manifest.Save(); err != nil {
+			// Non-fatal: the in-memory copy still says frozen for the TUI
+			// restore below; the next resume would simply re-freeze.
+			common.LogErrorf("subagent-manifest", "failed to persist frozen records for %s: %v", effectiveSessionID, err)
+		}
+		common.LogErrorf("subagent-manifest", "resume marked %d interrupted subagent record(s) frozen in session %s", frozen, effectiveSessionID)
+	}
 	return manifest, nil
+}
+
+// freezeInterruptedRecords flips every non-terminal record (running, queued)
+// in the in-memory manifest to frozen and returns how many flipped. Terminal
+// records are untouched.
+func freezeInterruptedRecords(manifest *session.SubagentManifest) int {
+	if manifest == nil {
+		return 0
+	}
+	frozen := 0
+	for i := range manifest.Records {
+		rec := &manifest.Records[i]
+		if rec.Status == session.SubagentStatusRunning || rec.Status == session.SubagentStatusQueued {
+			rec.Status = session.SubagentStatusFrozen
+			frozen++
+		}
+	}
+	return frozen
+}
+
+// isInterruptedSubagentStatus reports whether a manifest status means the
+// child was interrupted by a previous late exit: running and queued are the
+// raw at-exit states (manifests written before the frozen field existed, or
+// writes that never landed), frozen is the explicit post-synthesis status.
+// All three are resumable and all three restore into the TUI.
+func isInterruptedSubagentStatus(status string) bool {
+	return status == session.SubagentStatusRunning ||
+		status == session.SubagentStatusQueued ||
+		status == session.SubagentStatusFrozen
 }
 
 // restoreInterruptedSubagents re-lists every manifest child that was
@@ -111,16 +159,17 @@ func synthesizeDanglingSpawnResults(sess *session.Session) (*session.SubagentMan
 // synthesized tool result above already made the parent MODEL aware; this is
 // the TUI-facing half of the same resume story.
 //
-// The rule mirrors the manifest's crash model: a record still "running" when
-// this process reads it means the previous exit interrupted that child, so
-// EVERY such record is restored — whether or not its spawn call was dangling
-// in this history (the persisted synthesis makes later resumes find no
-// dangling calls, while the manifest keeps saying "running" until a
-// terminal write). Terminal records — completed, failed, cancelled — are
-// skipped: their outcome already lives in the parent transcript via the
-// persisted tool result or the runner's own summary, and the manifest's
-// terminal preview is that same outcome, not a hidden conversation. The
-// restored map deduplicates within one resume pass.
+// The rule mirrors the manifest's crash model: a record still "running"
+// (or "queued") when this process reads it — or already flipped to
+// "frozen" by the synthesis above — means the previous exit interrupted
+// that child, so EVERY such record is restored — whether or not its spawn
+// call was dangling in this history (the persisted synthesis makes later
+// resumes find no dangling calls, while the manifest keeps the interrupted
+// status until a terminal write). Terminal records — completed, failed,
+// cancelled — are skipped: their outcome already lives in the parent
+// transcript via the persisted tool result or the runner's own summary,
+// and the manifest's terminal preview is that same outcome, not a hidden
+// conversation. The restored map deduplicates within one resume pass.
 //
 // Read-only by construction (agent.NewRestoredSubagentOrchestrator): no
 // session, empty registry, Execute refuses. Failures are logged and skipped,
@@ -132,7 +181,7 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 	}
 	for i := range manifest.Records {
 		rec := &manifest.Records[i]
-		if rec.Status != session.SubagentStatusRunning || restored[rec.ID] {
+		if !isInterruptedSubagentStatus(rec.Status) || restored[rec.ID] {
 			continue
 		}
 		restored[rec.ID] = true
@@ -191,7 +240,7 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 		}
 		return nil
 	}
-	running := func(rec *session.SubagentRecord) bool { return rec.Status == session.SubagentStatusRunning }
+	running := func(rec *session.SubagentRecord) bool { return isInterruptedSubagentStatus(rec.Status) }
 	matchesType := func(rec *session.SubagentRecord) bool {
 		return args.AgentType == "" || rec.AgentType == args.AgentType
 	}

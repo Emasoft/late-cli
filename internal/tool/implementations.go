@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json" // used for hash generation
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -474,6 +475,26 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// (context.Canceled) keeps flowing through the normal error path below.
 	if err != nil && execCtx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("command timed out after %s and was killed (partial output):\n%s", effectiveTimeout, string(output))
+	}
+
+	// The kill-after-start race: exec.Cmd.Start hands process-group setup to a
+	// watchCtx goroutine, so cancellation arriving in the Start→Wait window can
+	// abort Start itself (bare context.Canceled) instead of cancelling a live
+	// process (signal: killed ExitError). Either way the caller DID cancel the
+	// shell in flight. A context-aborted Start carries no ProcessState, so
+	// fabricate nothing — surface it as the same failure-shaped, normal (nil
+	// error) result a group SIGKILL produces, keeping downstream
+	// classification (IsShellFailureResult, and therefore the executor's
+	// in-flight-kill and harness-note decisions) deterministic regardless of
+	// where inside Start the cancel landed. An ExitError (the process ran and
+	// was group-killed) falls through to the normal path below, and plain
+	// startup failures (shell not found, relative-dir ErrDot) are not context
+	// errors and keep their shape.
+	if err != nil && execCtx.Err() != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) && !errors.Is(err, exec.ErrNotFound) && !errors.Is(err, exec.ErrDot) {
+			return fmt.Sprintf("Error executing command: killed by cancellation before start (%v)\n%s", err, string(output)), nil
+		}
 	}
 
 	// If sqz is available, compress the output

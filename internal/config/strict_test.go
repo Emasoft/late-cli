@@ -534,7 +534,7 @@ func TestParseConfigContent_ModelsEntryKeyNoSuggestionListsValidKeys(t *testing.
 	}
 	want := `error in /x/config.json at line ` + strconv.Itoa(lineOf(content, `"zzzzzzz"`)) +
 		`, column ` + strconv.Itoa(runeColumn(content, `"zzzzzzz"`)) +
-		`: models[prov] entry "zzzzzzz" is not a valid entry key. Valid entry keys are: context-size-tokens, id, jev-autocompact-percent, key, model, url`
+		`: models[prov] entry "zzzzzzz" is not a valid entry key. Valid entry keys are: allow_parallel_execution, context-size-tokens, id, jev-autocompact-percent, key, model, url`
 	if err.Error() != want {
 		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
 	}

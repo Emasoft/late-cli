@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"image/color"
+
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
@@ -40,27 +42,43 @@ type transcriptState struct {
 	width        int
 	theme        string
 	timestamps   bool
+	// toolOutputsCollapsed folds tool-result blocks to a one-line summary.
+	// Default is expanded (false): tool output is evidence and must be shown
+	// by default; /collapse is an explicit opt-out for noisy runs and
+	// /expand restores. Runtime-only, never persisted: every session starts
+	// expanded.
+	toolOutputsCollapsed bool
 }
 
 type transcriptRenderedMsg struct {
-	activities   map[int]string
-	thinkingLine int
-	thinking     bool
-	partial      bool
-	welcome      bool
-	id           string
-	generation   uint64
-	width        int
-	theme        string
-	timestamps   bool
-	rows         []string
-	blocks       []RenderBlock
-	cache        map[string][]string
+	activities           map[int]string
+	thinkingLine         int
+	thinking             bool
+	partial              bool
+	welcome              bool
+	id                   string
+	generation           uint64
+	width                int
+	theme                string
+	timestamps           bool
+	toolOutputsCollapsed bool
+	rows                 []string
+	blocks               []RenderBlock
+	cache                map[string][]string
 }
 
 type transcriptLabel struct {
 	rendered string
 	activity string
+}
+
+// collapsedToolSummary is the cached one-line replacement shown while
+// toolOutputsCollapsed is set: the tool name plus a byte count (no output
+// content leaks into the summary, so the cache key carries no output text).
+const collapsedToolSummaryPrefix = "tool output"
+
+func collapsedToolKey(id, summary string) string {
+	return "collapsed-tool:" + id + ":" + summary
 }
 
 type transcriptEntry struct {
@@ -71,6 +89,10 @@ type transcriptEntry struct {
 	reasoning string
 	labels    []transcriptLabel
 	timestamp string // RFC3339 receive time from the history message; empty for ephemeral/legacy entries
+	// toolCallID and toolBytes are set on "tool" role entries: the call the
+	// output answers and its size, used for the collapsed summary line.
+	toolCallID string
+	toolBytes  int
 }
 
 const (
@@ -109,6 +131,24 @@ func userPromptStyle(width int) lipgloss.Style {
 // by the presentation clock, never by a wheel or paging event.
 func (m *Model) refreshTranscript() {
 	s := m.GetAgentState(m.Focused.ID())
+	s.Transcript.dirty = true
+	s.LastRenderTime = time.Now().UnixMilli()
+}
+
+// ToggleToolOutputCollapse flips the focused agent's transcript between the
+// default expanded tool-output rendering and the one-line collapsed summary
+// (wired to /collapse and /expand). Toggling only changes how tool blocks
+// render — the transcript is marked dirty and the block cache is discarded so
+// blocks re-derive under their new cache keys; thinking/reasoning blocks are
+// unaffected and stay expanded (the user directive: reasoning is always
+// shown).
+func (m *Model) ToggleToolOutputCollapse(collapsed bool) {
+	s := m.GetAgentState(m.Focused.ID())
+	if s.Transcript.toolOutputsCollapsed == collapsed {
+		return
+	}
+	s.Transcript.toolOutputsCollapsed = collapsed
+	s.Transcript.cache = nil
 	s.Transcript.dirty = true
 	s.LastRenderTime = time.Now().UnixMilli()
 }
@@ -251,6 +291,7 @@ func (m *Model) applyTranscript(result transcriptRenderedMsg) {
 	t.activities = result.activities
 	t.width, t.theme = result.width, result.theme
 	t.timestamps = result.timestamps
+	t.toolOutputsCollapsed = result.toolOutputsCollapsed
 	t.offset = min(t.offset, max(0, len(t.rows)-m.Viewport.Height()))
 	s.RenderBlocks = result.blocks
 	if result.partial {
@@ -289,6 +330,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	}
 	theme := string(styles)
 	showTimestamps := m.ShowTimestamps
+	collapseToolOutputs := t.toolOutputsCollapsed
 	entries := make([]transcriptEntry, 0, len(m.Focused.History())+3)
 	toolWidth := toolCallWidth(width)
 	toolLabels := func(calls []client.ToolCall, active bool) []transcriptLabel {
@@ -354,6 +396,10 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			labels = append(labels, item)
 		}
 		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels, timestamp: msg.Timestamp}
+		if msg.Role == "tool" {
+			entry.toolCallID = msg.ToolCallID
+			entry.toolBytes = len(content)
+		}
 		if len(msg.AttachedFiles) > 0 {
 			names := make([]string, len(msg.AttachedFiles))
 			for j, f := range msg.AttachedFiles {
@@ -413,9 +459,10 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	bg := appBgColor
 	activityHeader := m.renderActivityAt("thinking...", toolWidth, time.Unix(0, 0))
 	answerStyle := assistantReplyStyle(width)
+	toolStyle := attachmentStyle
 	return func() tea.Msg {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
-		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, cache: make(map[string][]string, len(entries))}
+		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, toolOutputsCollapsed: collapseToolOutputs, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if err != nil {
 				return source
@@ -448,7 +495,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			return strings.Join(parts, "\n")
 		}
 		for _, entry := range entries {
-			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.timestamp)
+			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s:%t", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.timestamp, collapseToolOutputs)
 			rows, ok := oldCache[key]
 			if !ok {
 				parts := make([]string, 0, 4)
@@ -520,6 +567,42 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 					parts = append(parts, style.Width(max(1, width-style.GetHorizontalFrameSize())).Render(markdown(entry.content)))
 				case "queued":
 					parts = append(parts, queueStyle.Width(max(1, width-queueStyle.GetHorizontalMargins())).Render(entry.content))
+				case "tool":
+					// Tool results render their FULL output by default
+					// (the user directive: thinking and tool output must be
+					// shown, not hidden). One muted body row per source line
+					// is cached in the block cache like any other role, so
+					// large outputs cost one style pass and a growable slice
+					// copy, not a re-render per frame; the transcript still
+					// paginates via the viewport. /collapse folds these
+					// blocks to a one-line "tool output (N bytes)" summary
+					// carrying the answering call ID; /expand restores. The
+					// collapsed summary is cached under its own key so the
+					// full body never re-renders through the shared key.
+					if collapseToolOutputs {
+						summary := collapsedToolSummaryPrefix
+						if entry.toolCallID != "" {
+							summary += " for " + entry.toolCallID
+						}
+						summary += fmt.Sprintf(" (%d bytes) — /expand to show", entry.toolBytes)
+						ckey := collapsedToolKey(entry.toolCallID, summary)
+						crows, ok := oldCache[ckey]
+						if !ok {
+							crows = []string{toolStyle.Render("↳ " + summary)}
+						}
+						result.cache[ckey] = crows
+						parts = append(parts, crows...)
+						break
+					}
+					header := "↳ tool output"
+					if entry.toolCallID != "" {
+						header += " for " + entry.toolCallID
+					}
+					parts = append(parts, toolStyle.Render(header))
+					for _, line := range strings.Split(entry.content, "\n") {
+						parts = append(parts, toolStyle.Render("│ "+line))
+					}
+					parts = append(parts, "")
 				case "raw":
 					parts = append(parts, entry.content)
 				case "thinking":
@@ -530,16 +613,8 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 					continue
 				}
 				rows = strings.Split(strings.Join(parts, "\n"), "\n")
-				padding := lipgloss.NewStyle().Background(bg)
 				for i, row := range rows {
-					if ansi.StringWidth(row) > width {
-						row = ansi.Truncate(row, width, "")
-					}
-					missing := width - ansi.StringWidth(row)
-					if missing > 0 {
-						row += padding.Render(strings.Repeat(" ", missing))
-					}
-					rows[i] = row
+					rows[i] = padRow(row, width, bg)
 				}
 			}
 			result.cache[key] = rows
@@ -579,6 +654,18 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		return result
 	}
+}
+
+// padRow clamps a rendered row to the transcript width and pads it to the
+// full width with the app background so the canvas never shows through.
+func padRow(row string, width int, bg color.Color) string {
+	if ansi.StringWidth(row) > width {
+		row = ansi.Truncate(row, width, "")
+	}
+	if missing := width - ansi.StringWidth(row); missing > 0 {
+		row += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", missing))
+	}
+	return row
 }
 
 // splitStreamingMarkdown returns stable blocks ending at blank lines outside

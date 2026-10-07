@@ -415,3 +415,64 @@ func TestSubagentStatusConstants(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkSubagentExecutionStampsRecord pins the per-model parallel gate's
+// manifest surface: MarkSubagentExecution stamps the EFFECTIVE execution
+// mode and the agent_models model reference onto an existing record, the
+// stamp survives a reload (persisted), the fields stay omitted for sync
+// children (omitempty), and an unknown ID is a no-op — a stamp may refine an
+// existing spawn record but never invent one.
+func TestMarkSubagentExecutionStampsRecord(t *testing.T) {
+	tmp := t.TempDir()
+	stubSessionDir(t, tmp)
+
+	sess := manifestTestSession(t, tmp, "session-x")
+	if err := sess.SaveSubagentRecord(SubagentRecord{ID: "coder-subagent-0", AgentType: "coder", Goal: "g", Status: SubagentStatusRunning, SpawnedAt: time.Now()}); err != nil {
+		t.Fatalf("SaveSubagentRecord: %v", err)
+	}
+
+	if err := sess.MarkSubagentExecution("coder-subagent-0", "serial", "local-llama"); err != nil {
+		t.Fatalf("MarkSubagentExecution: %v", err)
+	}
+
+	manifest, err := LoadSubagentManifest("session-x")
+	if err != nil {
+		t.Fatalf("LoadSubagentManifest: %v", err)
+	}
+	rec, ok := manifest.Get("coder-subagent-0")
+	if !ok {
+		t.Fatal("record vanished")
+	}
+	if rec.Execution != "serial" || rec.Model != "local-llama" {
+		t.Fatalf("stamped record = execution:%q model:%q, want serial/local-llama", rec.Execution, rec.Model)
+	}
+
+	// Reload from disk: the stamp persisted.
+	data, err := os.ReadFile(filepath.Join(tmp, "session-x", "subagents", "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"execution": "serial"`) || !strings.Contains(string(data), `"model": "local-llama"`) {
+		t.Fatalf("stamp not persisted:\n%s", data)
+	}
+
+	// An unknown ID is a silent no-op.
+	if err := manifestTestSession(t, tmp, "session-x").MarkSubagentExecution("ghost", "parallel", "m"); err != nil {
+		t.Fatalf("MarkSubagentExecution(ghost) = %v, want a nil no-op", err)
+	}
+}
+
+// TestSubagentRecordExecutionOmittedForSyncChildren pins that the Execution
+// and Model fields stay out of the JSON for records that never reached the
+// scheduler (sync spawns) — empty means sync, no model routing.
+func TestSubagentRecordExecutionOmittedForSyncChildren(t *testing.T) {
+	data, err := json.Marshal(SubagentRecord{ID: "r", AgentType: "coder", Goal: "g", Status: SubagentStatusCompleted, SpawnedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"execution", "model"} {
+		if strings.Contains(string(data), key) {
+			t.Fatalf("sync record must omit %q, got %s", key, data)
+		}
+	}
+}

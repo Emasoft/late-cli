@@ -57,6 +57,30 @@ func SubagentManifestPath(sessionID string) (string, error) {
 	return filepath.Join(dir, manifestFileName), nil
 }
 
+// subagentResultFileSuffix marks a background child's full-result artifact
+// inside the subagents folder: <childID>.result.txt sits next to the child's
+// <childID>.json history and the manifest, distinguishable from any future
+// sibling file kinds by the suffix.
+const subagentResultFileSuffix = ".result.txt"
+
+// SubagentResultPath returns the full path of a background subagent's
+// stored final result: <sessionsDir>/<parentSessionID>/subagents/<childID>.result.txt.
+// The runner writes the file before recording the path in the manifest
+// (SubagentRecord.ResultPath), so the manifest pointer is always durable.
+func SubagentResultPath(parentSessionID, childID string) (string, error) {
+	if !isValidPathElement(parentSessionID) {
+		return "", fmt.Errorf("invalid session ID: %q", parentSessionID)
+	}
+	if !isValidPathElement(childID) {
+		return "", fmt.Errorf("invalid child ID: %q", childID)
+	}
+	dir, err := SubagentHistoryDir(parentSessionID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, childID+subagentResultFileSuffix), nil
+}
+
 // RemoveSessionFolder deletes a session's folder (containing its subagent
 // histories) if it exists. Flat files <sessionID>.json / .meta.json are
 // distinct names and are never touched. Returns nil when the folder does

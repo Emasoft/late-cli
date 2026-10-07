@@ -447,12 +447,13 @@ func validateEnumValues(path string, content []byte, entries []configEntry) erro
 // mirrored from ModelSetting's json tags (kept in sync by docs_test.go's
 // reflection guard on the documented schema).
 var knownModelEntryKeys = map[string]bool{
-	"id":                      true,
-	"url":                     true,
-	"key":                     true,
-	"model":                   true,
-	"jev-autocompact-percent": true,
-	"context-size-tokens":     true,
+	"id":                       true,
+	"url":                      true,
+	"key":                      true,
+	"model":                    true,
+	"jev-autocompact-percent":  true,
+	"context-size-tokens":      true,
+	"allow_parallel_execution": true,
 }
 
 // lastEntryByKey returns the last recorded top-level entry with the given

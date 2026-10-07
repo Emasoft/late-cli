@@ -1272,6 +1272,29 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.updateViewport()
 				return m, clearCmd
 			}
+			if cmd == "/collapse" || cmd == "/expand" {
+				m.Input.Reset()
+				m.Input.SetValue("")
+				// Default is expanded: /collapse folds tool-result blocks to
+				// one-line summaries, /expand restores the full bodies.
+				// Thinking/reasoning blocks are unaffected — reasoning stays
+				// expanded in both modes. Runtime-only: never persisted, so
+				// every session starts expanded.
+				collapsed := cmd == "/collapse"
+				m.ToggleToolOutputCollapse(collapsed)
+				feedback := "tool output expanded"
+				if collapsed {
+					feedback = "tool output collapsed — /expand to show"
+				}
+				m.ToastMessage = feedback
+				m.ToastWarning = false
+				m.ToastExpireTime = time.Now().UnixMilli() + 3000
+				clearCmd := tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+					return clearToastMsg{}
+				})
+				m.updateViewport()
+				return m, clearCmd
+			}
 			if cmd == "/jev-compact-context" {
 				m.Input.Reset()
 				m.Input.SetValue("")
@@ -2048,6 +2071,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				first = string(r[:77]) + "..."
 			}
 			s.StatusText = fmt.Sprintf("subagent idle for %s — last: %s", event.IdleFor.Truncate(time.Second), first)
+			// Worker S (stall auto-resume), one-line status wiring: a
+			// Stalled idle event overrides the generic wording with the
+			// wedge + resume directive. Pure addition; nothing above moved.
+			if event.Stalled {
+				s.StatusText = fmt.Sprintf("subagent STALLED (no activity for %s) — cancelled, state preserved; resumable via spawn {\"resume\": %q}", event.IdleFor.Truncate(time.Second), event.ID)
+			}
 			if event.ID == m.Focused.ID() {
 				m.updateViewport()
 			}
@@ -2216,21 +2245,54 @@ func (m *Model) maybePayloadRecoveryCompaction(s *AppState) tea.Cmd {
 func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 	focusedState := m.GetAgentState(m.Focused.ID())
 
-	// Preflight context check
-	maxTokens := m.Focused.MaxTokens()
-	if focusedState.State == StateIdle && maxTokens > 0 && !focusedState.ContextWarningShown {
+	// Submission target. A restored (read-only) subagent tab must never
+	// receive a Submit: its orchestrator is the preserved transcript of an
+	// interrupted run and refuses with "restored and read-only" — which the
+	// user reads as the restored session being unable to continue. It can,
+	// so the message is transparently routed to the PARENT (restore only
+	// ever mounts restored children on the root): the parent model receives
+	// the message and can continue the child through the sanctioned
+	// spawn_subagent {"resume": "<id>"} flow, exactly as the resume
+	// synthesis instructs it. Detection is structural — the tui package
+	// cannot import internal/agent, and RestoredSubagentOrchestrator is the
+	// only production orchestrator exposing StatusText() string (the same
+	// anonymous-interface probe the tab handler uses to seed the restored
+	// status line).
+	target := m.Focused
+	if _, isRestored := m.Focused.(interface{ StatusText() string }); isRestored {
+		if parent := m.Focused.Parent(); parent != nil {
+			target = parent
+		} else if m.Root != nil && m.Root.ID() != m.Focused.ID() {
+			target = m.Root
+		}
+	}
+
+	// Preflight context check — against the TARGET: the message goes to the
+	// target's context, and for a routed restored-tab submission the parent's
+	// window is what can overflow. For a plain focused submission target ==
+	// the focused agent, so this is unchanged behavior.
+	maxTokens := target.MaxTokens()
+	targetState := m.GetAgentState(target.ID())
+	if targetState.State == StateIdle && maxTokens > 0 && !targetState.ContextWarningShown {
 		// Use 10% safety margin (90% threshold)
 		threshold := 0.9
-		if float64(focusedState.CumulativeTokenCount) >= float64(maxTokens)*threshold {
-			focusedState.State = StateContextWarning
-			focusedState.ContextWarningShown = true
+		if float64(targetState.CumulativeTokenCount) >= float64(maxTokens)*threshold {
+			targetState.State = StateContextWarning
+			targetState.ContextWarningShown = true
+			if targetState != focusedState {
+				// Rerouted submission: the warning state lives on the
+				// target (the parent), which the user is not looking at —
+				// surface the reason on the focused tab too, or the
+				// submission would appear silently swallowed.
+				focusedState.StatusText = "context nearly full on " + formatAgentBreadcrumb(target.ID()) + " — press Enter again to proceed"
+			}
 			m.updateViewport()
 			return m, nil
 		}
 	}
 
 	// Re-validate attachments in case the model changed since file selection
-	if len(m.AttachedFiles) > 0 && !m.Focused.SupportsVision() {
+	if len(m.AttachedFiles) > 0 && !target.SupportsVision() {
 		var filtered []string
 		for _, f := range m.AttachedFiles {
 			data, err := os.ReadFile(f)
@@ -2257,11 +2319,11 @@ func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 	if m.MessageHook == nil {
 		// No plugin onMessageSend hooks registered — submit synchronously,
 		// unchanged from before hooks existed.
-		if err := m.Focused.Submit(expandedInput, m.AttachedFiles); err != nil {
+		if err := target.Submit(expandedInput, m.AttachedFiles); err != nil {
 			m.Err = err
 			return m, nil
 		}
-		return m.finishSubmit(m.Focused, expandedInput), nil
+		return m.finishSubmit(target, expandedInput), nil
 	}
 
 	// A plugin registered onMessageSend hooks: each one runs an external
@@ -2272,7 +2334,9 @@ func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 	// clear the editor immediately, then lock it. The running indicator is
 	// delayed so fast hooks do not flash it. If the eventual Submit fails, the
 	// result handler restores this exact draft and its files.
-	target := m.Focused
+	// target is the (possibly rerouted) submission target resolved at the top
+	// of submitMessage: hooks run against the message, Submit lands on the
+	// target, and finishSubmit books the input history on the target's state.
 	attachedFiles := append([]string(nil), m.AttachedFiles...)
 	hook := m.MessageHook
 	m.Input.Reset()
