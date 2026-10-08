@@ -396,8 +396,39 @@ func (m *Model) GetAgentState(id string) *AppState {
 		PendingStop: false,
 		CreatedAt:   time.Now(),
 	}
+	// Status-hint seeding: a child that carries a hint (a live-restored
+	// subagent, via BaseOrchestrator.SetStatusHint) starts with that line
+	// instead of the default "Ready" — the same one-fact-first rule the
+	// read-only restored stub's StatusText() seeding applies on tab focus.
+	// Only the default seeding is overridden; the child's own run status
+	// replaces the hint from its first report.
+	if m.Root != nil {
+		for _, child := range m.Root.Children() {
+			if child.ID() == id {
+				if h, ok := child.(interface{ StatusHint() string }); ok {
+					if hint := h.StatusHint(); hint != "" {
+						s.StatusText = hint
+					}
+				}
+				break
+			}
+		}
+	}
 	m.AgentStates[id] = s
 	return s
+}
+
+// findChildByID locates a direct child of the root by ID; nil when absent.
+func (m *Model) findChildByID(id string) common.Orchestrator {
+	if m.Root == nil {
+		return nil
+	}
+	for _, child := range m.Root.Children() {
+		if child.ID() == id {
+			return child
+		}
+	}
+	return nil
 }
 
 // infoBarHeight returns the number of extra footer rows the info bar

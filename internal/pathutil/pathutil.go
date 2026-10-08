@@ -30,6 +30,14 @@ func LateDataDir() (string, error) {
 }
 
 func LateSessionDir() (string, error) {
+	// Test-only injection (cmd/late's subprocess crash test): the env var
+	// redirects the sessions dir so a spawned late process writes its
+	// session artifacts into the test's sandbox instead of the user's real
+	// data dir. Unset in every normal environment — production behavior is
+	// byte-identical.
+	if dir := os.Getenv("LATE_TEST_SESSIONS_DIR"); dir != "" {
+		return dir, nil
+	}
 	lateDataDir, err := LateDataDir()
 	if err != nil {
 		return "", err

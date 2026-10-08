@@ -10,22 +10,29 @@ import (
 )
 
 // RestoredSubagentStatus is the status text the TUI shows for a restored
-// subagent (Phase 3b of subagent persistence).
+// subagent restored as the read-only fallback projection (Phase 3b of
+// subagent persistence).
 const RestoredSubagentStatus = "restored — was interrupted"
 
+// RestoredResumedStatus is the status text the TUI shows for a subagent
+// restored LIVE after an interruption: it continues its task where the
+// interruption stopped. The seed is replaced by the run's own status as soon
+// as the resumed first turn reports.
+const RestoredResumedStatus = "resumed from interruption"
+
 // NewRestoredSubagentOrchestrator builds a READ-ONLY orchestrator stub for a
-// subagent that was interrupted by a previous late exit (Phase 3b of
-// subagent persistence). At resume, the manifest names every such child and
-// where its work was persisted; the synthesized tool result (subagent_resume)
-// already made the parent MODEL aware of it — this stub is what lets the TUI
-// list it like any other historical child (tab switching, transcript view)
-// instead of silently dropping it from the UI.
+// subagent that was interrupted by a previous late exit. It is the DEGRADED
+// restore path: the normal restore live-resumes the child (the {"resume":
+// "<id>"} machinery), so this stub is built only when the live relaunch is
+// impossible — no scheduler or model routing, or a history file that cannot
+// be reloaded — and exists so the interrupted work stays visible in the TUI
+// (tab switching, transcript view) instead of silently dropping from the UI.
 //
 // Read-only by construction: the registry is empty (no tool can be called),
 // and every mutating surface refuses — Execute always errors, Submit/Cancel
 // are no-ops, Reset/Rewind report an error — because the restored history is
-// the record of what happened before the exit, not a resumable conversation:
-// the parent re-spawns if the work must continue.
+// the record of what happened before the exit, and this projection cannot
+// continue it.
 //
 // statusText is surfaced through the interface-exposed state text (empty →
 // RestoredSubagentStatus), so the resume layer can carry the record's cause
@@ -81,16 +88,19 @@ func (o *RestoredSubagentOrchestrator) StatusText() string { return o.statusText
 
 func (o *RestoredSubagentOrchestrator) ID() string { return o.id }
 
-// Execute always fails: a restored subagent is a record of a past run, not a
-// resumable one — the parent re-spawns to continue the work.
+// Execute always fails: this projection cannot continue the interrupted
+// work — a live restore (the normal path) constructs the child through
+// NewResumedSubagentOrchestrator instead. The wording stays factual about
+// what this projection is, without pretending a re-spawn is the remedy (the
+// spawn_subagent {"resume": "<id>"} flow is).
 func (o *RestoredSubagentOrchestrator) Execute(string) (string, error) {
-	return "", fmt.Errorf("subagent %s is restored and read-only; re-spawn it to continue its work", o.id)
+	return "", fmt.Errorf("subagent %s could not be live-restored and is read-only; continue it with spawn_subagent {\"resume\": %q} (or spawn a fresh agent)", o.id, o.id)
 }
 
 // Submit always fails, mirroring Execute: nothing can be queued onto a
 // restored record.
 func (o *RestoredSubagentOrchestrator) Submit(string, []string) error {
-	return fmt.Errorf("subagent %s is restored and read-only; re-spawn it to continue its work", o.id)
+	return fmt.Errorf("subagent %s could not be live-restored and is read-only; continue it with spawn_subagent {\"resume\": %q} (or spawn a fresh agent)", o.id, o.id)
 }
 
 // Reset always fails: resetting would discard the loaded history — the

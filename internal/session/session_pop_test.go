@@ -14,9 +14,8 @@ import (
 func TestPopLastUserMessage(t *testing.T) {
 	t.Run("pops trailing user message and persists the removal", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		t.Cleanup(func() { SessionDir = oldSessionDir })
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 		historyPath := filepath.Join(tmpDir, "session-pop.json")
 		s := New(nil, historyPath, nil, "sp", true)
@@ -61,9 +60,8 @@ func TestPopLastUserMessage(t *testing.T) {
 
 	t.Run("no-op when history ends with assistant", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		t.Cleanup(func() { SessionDir = oldSessionDir })
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 		historyPath := filepath.Join(tmpDir, "session-pop-assistant.json")
 		s := New(nil, historyPath, nil, "sp", true)
@@ -101,9 +99,8 @@ func TestPopLastUserMessage(t *testing.T) {
 
 	t.Run("no-op on empty history", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		t.Cleanup(func() { SessionDir = oldSessionDir })
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 		historyPath := filepath.Join(tmpDir, "session-pop-empty.json")
 		s := New(nil, historyPath, nil, "sp", true)
@@ -130,9 +127,8 @@ func TestPopLastUserMessage(t *testing.T) {
 	// otherwise --continue would resurrect the rejected turn.
 	t.Run("pop to empty with existing file removes stale history and keeps sidecar", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		t.Cleanup(func() { SessionDir = oldSessionDir })
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 		historyPath := filepath.Join(tmpDir, "session-pop-empty-file.json")
 		s := New(nil, historyPath, nil, "sp", true)

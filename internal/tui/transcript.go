@@ -24,6 +24,14 @@ const FrameRate = 60
 
 const transcriptFrameInterval = time.Second / FrameRate
 
+// maxTranscriptCachedRows bounds the transcript's styled-row cache (memory
+// hardening): the cache is content-addressed and previously unbounded, so a
+// session with large tool outputs accumulated one styled row per output line
+// for the life of the process. 40k rows (~50 lines × ~800 blocks, several MiB
+// with ANSI escapes) preserves the streaming tail's re-render-free behavior
+// while capping the worst case; a dropped key costs one re-render.
+const maxTranscriptCachedRows = 40000
+
 type transcriptFrameMsg struct{}
 
 type transcriptState struct {
@@ -463,6 +471,24 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	return func() tea.Msg {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
 		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, toolOutputsCollapsed: collapseToolOutputs, cache: make(map[string][]string, len(entries))}
+		// Styled-row budget (memory hardening): the content-addressed cache
+		// keeps every block it has ever rendered — a session with large tool
+		// outputs (one styled row per output line, per render) grows it
+		// without bound and the rows survive for the whole process. The
+		// budget bounds the map at maxTranscriptCachedRows rows: on overflow
+		// the rows cached so far in THIS render are dropped and caching
+		// resumes, so the map always holds the newest window under the cap —
+		// exactly the blocks the streaming tail re-renders. Correctness is
+		// unaffected: a dropped key just re-renders once on its next use.
+		cacheBudget := maxTranscriptCachedRows
+		storeCache := func(key string, rows []string) {
+			if cacheBudget < len(rows) {
+				result.cache = make(map[string][]string, 1)
+				cacheBudget = maxTranscriptCachedRows
+			}
+			result.cache[key] = rows
+			cacheBudget -= len(rows)
+		}
 		markdown := func(source string) string {
 			if err != nil {
 				return source
@@ -486,7 +512,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 				if !ok {
 					cached = []string{answerStyle.Render(strings.Trim(markdown(block), "\r\n"))}
 				}
-				result.cache[key] = cached
+				storeCache(key, cached)
 				parts = append(parts, cached[0])
 			}
 			if text := strings.TrimLeft(tail, "\r\n"); text != "" {
@@ -590,7 +616,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						if !ok {
 							crows = []string{toolStyle.Render("↳ " + summary)}
 						}
-						result.cache[ckey] = crows
+						storeCache(ckey, crows)
 						parts = append(parts, crows...)
 						break
 					}
@@ -617,7 +643,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 					rows[i] = padRow(row, width, bg)
 				}
 			}
-			result.cache[key] = rows
+			storeCache(key, rows)
 			start := len(result.rows)
 			if entry.role == "thinking" {
 				result.thinking = true

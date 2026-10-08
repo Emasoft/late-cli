@@ -19,11 +19,10 @@ func TestSessionMeta(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	historyPath := filepath.Join(tmpDir, "session-test.json")
 	history := []client.ChatMessage{{Role: "user", Content: client.TextContent("Hello")}}
@@ -70,9 +69,8 @@ func TestSessionMeta(t *testing.T) {
 
 func TestSessionMetadataRetainsSubagentState(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	saveHistories := false
 	s := New(nil, filepath.Join(tmpDir, "session-test.json"), nil, "", false)
@@ -95,9 +93,8 @@ func TestSessionMetadataRetainsSubagentState(t *testing.T) {
 
 func TestLoadSessionMetaLegacySubagentState(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	metaPath := filepath.Join(tmpDir, "session-legacy.meta.json")
 	if err := os.WriteFile(metaPath, []byte(`{"id":"session-legacy"}`), 0600); err != nil {
@@ -117,9 +114,8 @@ func TestLoadSessionMetaLegacySubagentState(t *testing.T) {
 }
 
 func TestUpdateSubagentSeqRestoresPreviousValueAfterMetadataFailure(t *testing.T) {
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return "", errors.New("session directory unavailable") }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return "", errors.New("session directory unavailable") })
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	s := New(nil, "session-test.json", nil, "", false)
 	s.SetSubagentMetadata(4, nil)
@@ -139,11 +135,10 @@ func TestGetLatestSession(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// 1. Test when no sessions exist
 	latest, err := GetLatestSession()
@@ -204,11 +199,10 @@ func setupSubagentFolderFixture(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// Legacy session: flat history file + matching meta
 	const legacyID = "session-20250101-123456"
@@ -331,11 +325,10 @@ func TestGetLatestSessionForDir_ReturnsNewestForDirectory(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// Three sessions across two project folders; /proj/a has two candidates.
 	for _, meta := range []SessionMeta{
@@ -382,11 +375,10 @@ func TestGetLatestSessionForDir_NoMatchReturnsNil(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-100000", "/proj/a")); err != nil {
 		t.Fatalf("Failed to save meta: %v", err)
@@ -409,11 +401,10 @@ func TestGetLatestSessionForDir_IgnoresSessionsWithoutWorkingDir(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// Legacy meta with no working_dir key, hand-crafted like a
 	// pre-working-dir session sidecar.
@@ -457,9 +448,8 @@ func TestSessionMeta_WorkingDirRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
 
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// Constructed like TestSessionMetadataRetainsSubagentState: New captures
 	// the current working directory as the session's project folder.
@@ -500,9 +490,8 @@ func TestSessionMeta_WorkingDirRoundTrip(t *testing.T) {
 // such a sidecar without panicking and still find the healthy session.
 func TestGetLatestSessionForDir_SkipsVanishedSidecar(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	// Vanished sidecar: lstat succeeds, read fails.
 	vanishedPath := filepath.Join(tmpDir, "session-20250101-vanished.meta.json")
@@ -529,9 +518,8 @@ func TestGetLatestSessionForDir_SkipsVanishedSidecar(t *testing.T) {
 // depth beyond loadMetaFile's (meta, error) contract.
 func TestGetLatestSessionForDir_NilMetaNeverDereferenced(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-100000", "/proj/a")); err != nil {
 		t.Fatalf("Failed to save meta: %v", err)
@@ -561,9 +549,8 @@ func TestGetLatestSessionForDir_NilMetaNeverDereferenced(t *testing.T) {
 // newest session. The loader must also see the enumerated paths verbatim.
 func TestGetLatestSessionForDir_LoadsExactEnumeratedFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-abcdef", "/proj/a")); err != nil {
 		t.Fatalf("Failed to save meta: %v", err)
@@ -618,9 +605,8 @@ func TestGetLatestSessionForDir_LoadsExactEnumeratedFiles(t *testing.T) {
 // re-resolved through the ID-prefix fallback to a different session.
 func TestGetLatestSession_SkipsVanishedSidecar(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	if err := SaveSessionMeta(newWorkingDirMeta(tmpDir, "session-20250101-abcdef", "/proj/a")); err != nil {
 		t.Fatalf("Failed to save meta: %v", err)
@@ -659,9 +645,8 @@ func TestGetLatestSession_SkipsVanishedSidecar(t *testing.T) {
 // deleted must still match through the lexical fast path.
 func TestGetLatestSessionForDir_MatchesViaSymlinkIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	realDir := filepath.Join(tmpDir, "real-project")
 	if err := os.MkdirAll(realDir, 0700); err != nil {

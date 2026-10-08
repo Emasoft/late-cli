@@ -1079,16 +1079,20 @@ func main() {
 	rootAgent.SetIdlePolicy(resolvedSubagentIdleTimeout, resolvedSubagentIdleKillAfter)
 
 	// TUI rehydration (Phase 3b): the interrupted children the resume
-	// synthesis reported re-enter the TUI as read-only orchestrators on the
-	// root, so the preserved transcripts are browsable like any other
-	// historical child (tab switching, transcript view). This runs before
-	// the TUI program exists and before any live spawn can register a
-	// child — AddChild is synchronous on the root's mutex, so there is no
-	// ordering race with the runner below.
-	if resumedManifest != nil {
-		restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents)
+	// synthesis reported re-enter the TUI on the root, so the preserved
+	// transcripts are browsable like any other historical child (tab
+	// switching, transcript view). With subagents enabled the LIVE restore
+	// runs below, inside the enabled block, where the scheduler and client
+	// routing already exist — interrupted children are relaunched through
+	// the same {"resume": "<id>"} machinery instead of mounting read-only.
+	// Here (subagents disabled — no live machinery) the read-only
+	// projections take over. This runs before the TUI program exists and
+	// before any live spawn can register a child — AddChild is synchronous
+	// on the root's mutex, so there is no ordering race with the runner
+	// below.
+	if resumedManifest != nil && !resolvedEnableSubagents {
+		restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents, nil)
 	}
-
 	model := tui.NewModel(rootAgent, renderer, appConfig)
 	model.SetActiveThemeStyles(themeBytes)
 	if themeID != "" {
@@ -1460,6 +1464,86 @@ func main() {
 			return sess.MarkSubagentStatus(id, status, "", "", "")
 		})
 
+		// clientForAgentType resolves an agent type's routed client (the
+		// agent_models entry, falling back to the default subagent client):
+		// one closure shared by the unfreeze relaunch and the startup
+		// live-restore, so both build children exactly like the fresh-spawn
+		// path does.
+		clientForAgentType := func(agentType string) *client.Client {
+			if appConfig == nil {
+				return nil
+			}
+			setting, ok := appConfig.GetModelForAgent(agentType)
+			if !ok {
+				return nil
+			}
+			var biasForSubagent map[string]int
+			if setting.Model == resolvedSubagentConfig.Model {
+				biasForSubagent = subagentClient.LogitBias()
+			}
+			routed := client.NewClient(client.Config{
+				BaseURL:      setting.URL,
+				APIKey:       setting.Key,
+				Model:        setting.Model,
+				EnableImages: resolvedEnableImages,
+				LogitBias:    biasForSubagent,
+				AppVersion:   common.Version,
+			})
+			routed.DiscoverBackend(context.Background())
+			return routed
+		}
+
+		// unfreezeDeps bundles everything the unfreeze relaunch needs that
+		// the runner resolved at startup — the model routing and the prompt
+		// switches mirror the fresh-spawn path exactly.
+		unfreeze := unfreezeDeps{
+			clientFor:        clientForAgentType,
+			defaultClient:    subagentClient,
+			enabledTools:     enabledTools,
+			injectCWD:        resolvedInjectCWD,
+			gemmaThinking:    resolvedGemmaThinking,
+			subagentMaxTurns: resolvedSubagentMaxTurns,
+			messenger:        p,
+			globalBudget:     resolvedSubagentTimeout,
+		}
+
+		// liveRestore re-lists the children the previous exit interrupted —
+		// now LIVE: the same resume machinery the {"resume": "<id>"} path
+		// uses relaunches them in the background through the scheduler, so a
+		// message addressed to a restored child continues it instead of
+		// refusing read-only. It runs after the scheduler exists and before
+		// the TUI program starts (the restore runs inside the startup
+		// goroutine, whose ordering with respect to the TUI run loop is
+		// benign: AddChild is synchronous, and the run's events reach the
+		// TUI whenever the forwarder attaches). A nil liveRestore (subagents
+		// disabled) keeps the read-only stub fallback.
+		liveRestore := &liveRestoreDeps{
+			root:          rootAgent,
+			sessionID:     effectiveSessionID,
+			sess:          sess,
+			scheduler:     scheduler,
+			clientFor:     clientForAgentType,
+			defaultClient: subagentClient,
+			enabledTools:  enabledTools,
+			injectCWD:     resolvedInjectCWD,
+			gemmaThinking: resolvedGemmaThinking,
+			maxTurns:      resolvedSubagentMaxTurns,
+			messenger:     p,
+			runEnv:        runEnv,
+			globalBudget:  resolvedSubagentTimeout,
+		}
+
+		// The live restore runs here, inside the goroutine, after the
+		// forwarder below has started: relaunching a child sends its
+		// events through the root's channel, and a forwarder attached
+		// first can never drop them. Ordering with the TUI program is
+		// benign — p.Send parks messages in Bubble Tea's queue until the
+		// run loop starts. When subagents are disabled the read-only
+		// fallback above already handled the manifest.
+		if resumedManifest != nil {
+			restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents, liveRestore)
+		}
+
 		// resumeSubagent implements spawn_subagent's "resume" argument
 		// (Phase C): the parent asks for a dead/crashed subagent by ID and
 		// gets the SAME child back — same ID, full persisted history,
@@ -1564,6 +1648,22 @@ func main() {
 				return resumeSubagent(ctx, request, timeoutOverride)
 			}
 
+			// Lifecycle actions (Phase 3): freeze pauses a live background
+			// child, unfreeze relaunches a frozen one. Both are id-based
+			// and ignore the spawn arguments entirely.
+			switch request.Action {
+			case tool.SubagentActionFreeze:
+				return freezeRunningSubagent(scheduler, sess, effectiveSessionID, getSubagentActionID(request))
+			case tool.SubagentActionUnfreeze:
+				unfreeze.timeoutOverride = timeoutOverride
+				return unfreezeFrozenSubagent(scheduler, runEnv, unfreeze, sess, effectiveSessionID, getSubagentActionID(request), ctx)
+			case "":
+				// Not an action: a normal spawn or resume below.
+			default:
+				return fmt.Sprintf("Error: unknown action %q — valid actions: %q, %q (or omit \"action\" to spawn/resume)",
+					request.Action, tool.SubagentActionFreeze, tool.SubagentActionUnfreeze), nil
+			}
+
 			goal := request.Goal
 			ctxFiles := request.CtxFiles
 			agentType := request.AgentType
@@ -1584,19 +1684,7 @@ func main() {
 				if setting, ok := appConfig.GetModelForAgent(agentType); ok {
 					modelAllowsParallel = setting.AllowsParallelExecution()
 					modelRef = setting.Reference()
-					var biasForSubagent map[string]int
-					if setting.Model == resolvedSubagentConfig.Model {
-						biasForSubagent = subagentClient.LogitBias()
-					}
-					currentSubagentClient = client.NewClient(client.Config{
-						BaseURL:      setting.URL,
-						APIKey:       setting.Key,
-						Model:        setting.Model,
-						EnableImages: resolvedEnableImages,
-						LogitBias:    biasForSubagent,
-						AppVersion:   common.Version,
-					})
-					currentSubagentClient.DiscoverBackend(ctx)
+					currentSubagentClient = clientForAgentType(agentType)
 				}
 			}
 			if currentSubagentClient == nil {
@@ -1850,6 +1938,13 @@ func classifyAndReportSubagentOutcome(sess *session.Session, child common.Orches
 // self-referential but safe: cancel() is stored before the watchdog can
 // ever fire (the watchdog starts inside child.Execute, after SetContext).
 type stallCancelKey struct{}
+
+// getSubagentActionID extracts the "id" argument of a freeze/unfreeze
+// action call. The spawn request struct does not carry it (actions have no
+// goal), so it re-reads the raw arguments the same way CallString does.
+func getSubagentActionID(request tool.SubagentSpawnRequest) string {
+	return request.ActionID
+}
 
 // withStallCancel returns ctx carrying its own cancel func under
 // stallCancelKey. Call it at run-context construction in both spawn paths

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -67,6 +69,17 @@ func childSessionFor(child interface{ ID() string }) *session.Session {
 // constant (5s, not configurable this phase) while the loop itself stays
 // testable in milliseconds. The child parameter is the minimal surface the
 // error lines need (the ID); the runner passes the full orchestrator.
+//
+// Memory hardening (the SIGKILL defense):
+//   - A tick whose history generation has not moved since the last snapshot
+//     skips the marshal+write entirely (a 5s no-op instead of an O(history)
+//     copy+marshal of unchanged bytes — multi-MB per running child at large
+//     histories). The final flush is unconditional, so the unchanged-skip
+//     can never lose data: stop() always writes the last state.
+//   - Every tick reads runtime.MemStats and logs a warning to the errorlog
+//     when HeapInuse crosses subagentHeapWarnBytes — memory-pressure OOM
+//     SIGKILLs are invisible (no handler runs), so the only defense is
+//     observing growth before it kills the process.
 func startSubagentSnapshotTicker(child interface{ ID() string }, childSession *session.Session, interval time.Duration) (stop func()) {
 	if childSession == nil || childSession.HistoryPath == "" {
 		return nil
@@ -74,6 +87,10 @@ func startSubagentSnapshotTicker(child interface{ ID() string }, childSession *s
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	ticker := time.NewTicker(interval)
+	// lastGen is the history generation the last successful tick observed:
+	// the cheap unchanged-skip key. atomic avoids a dedicated mutex in the
+	// single-ticker-per-child loop.
+	var lastGen atomic.Uint64
 	go func() {
 		defer ticker.Stop()
 		defer close(finished)
@@ -82,9 +99,7 @@ func startSubagentSnapshotTicker(child interface{ ID() string }, childSession *s
 			case <-done:
 				return
 			case <-ticker.C:
-				if err := childSession.SnapshotHistory(); err != nil {
-					common.LogErrorf("subagent-snapshot", "periodic history snapshot failed for %s: %v", child.ID(), err)
-				}
+				snapshotTickOnce(child, childSession, &lastGen)
 			}
 		}
 	}()
@@ -96,9 +111,51 @@ func startSubagentSnapshotTicker(child interface{ ID() string }, childSession *s
 		// Final flush after the ticker stops: the last snapshot lands
 		// before the outcome is recorded, so the window closes at outcome
 		// time even when no tick fired after the child's last commit.
+		// Unconditional — the unchanged-skip above never gates this write.
 		if err := childSession.SnapshotHistory(); err != nil {
 			common.LogErrorf("subagent-snapshot", "final history snapshot failed for %s: %v", child.ID(), err)
 		}
+	}
+}
+
+// subagentHeapWarnBytes is the HeapInuse threshold the snapshot ticker's
+// self-observation warns at (the memory-pressure SIGKILL defense). The
+// observed crashes were the OS OOM-killer SIGKILLing late mid-work: nothing
+// runs at kill time, so the only warning is the tick BEFORE the kill.
+// 1.5 GiB leaves headroom below typical laptop OOM limits while staying far
+// above a healthy run's footprint. A var (not const) so tests can lower it.
+var subagentHeapWarnBytes uint64 = 1536 * 1024 * 1024
+
+// snapshotTickOnce runs ONE tick's body — the heap self-observation, the
+// unchanged-history skip, and (when the history moved) the snapshot write
+// that re-arms the skip. Split from the loop so tests drive a tick
+// deterministically (no sleep/race against the ticker channel).
+func snapshotTickOnce(child interface{ ID() string }, childSession *session.Session, lastGen *atomic.Uint64) {
+	logHeapUsageIfElevated()
+	gen := childSession.HistoryGeneration()
+	if gen != 0 && gen == lastGen.Load() {
+		// History unchanged since the last snapshot: skip the copy +
+		// marshal + write (the crash window only needs a NEW write when
+		// NEW commits exist).
+		return
+	}
+	if err := childSession.SnapshotHistory(); err != nil {
+		common.LogErrorf("subagent-snapshot", "periodic history snapshot failed for %s: %v", child.ID(), err)
+		return
+	}
+	lastGen.Store(childSession.HistoryGeneration())
+}
+
+// logHeapUsageIfElevated reads runtime.MemStats and logs a warning line to
+// the errorlog when HeapInuse crosses subagentHeapWarnBytes. ReadMemStats
+// stops the world briefly (~tens of µs); at the 5s tick cadence this is
+// noise. Best-effort by contract: the errorlog may be nil (disabled).
+func logHeapUsageIfElevated() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	if ms.HeapInuse >= subagentHeapWarnBytes {
+		common.LogErrorf("memory", "heap in use %.1f MiB exceeds the %.1f MiB warning threshold — memory pressure may trigger an OOM SIGKILL (check /compact, subagent transcripts and the styled-row cache)",
+			float64(ms.HeapInuse)/(1024*1024), float64(subagentHeapWarnBytes)/(1024*1024))
 	}
 }
 

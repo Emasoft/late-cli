@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"late/internal/agent"
 	"late/internal/client"
 	"late/internal/common"
 	"late/internal/orchestrator"
 	"late/internal/session"
+	"late/internal/tool"
+	"late/internal/tui"
 )
 
 // spawnSubagentToolName is the registry name of the spawn tool whose calls
@@ -141,6 +145,44 @@ func freezeInterruptedRecords(manifest *session.SubagentManifest) int {
 	return frozen
 }
 
+// liveRestoreDeps carries the startup-scope collaborators a live restore
+// needs — the same machinery the spawn_subagent {"resume": "<id>"} path uses
+// (client routing, tool surface, TUI messenger, the scheduler that runs
+// background children). It is built in main() once every collaborator is
+// resolved, right after the scheduler is created, and passed to
+// restoreInterruptedSubagents. nil (or a nil field) degrades the restore to
+// read-only stubs — exactly the pre-live-restore behavior.
+type liveRestoreDeps struct {
+	// root is the orchestrator the restored children mount on.
+	root *orchestrator.BaseOrchestrator
+	// sessionID is the effective session ID (manifest namespace).
+	sessionID string
+	// sess is the parent session (manifest writes, notifications).
+	sess *session.Session
+	// scheduler runs the restored children in the background with the same
+	// parallel/serial machinery, outcome classification, and terminal
+	// manifest writes a fresh background spawn gets.
+	scheduler *SubagentScheduler
+	// clientFor resolves the child's client by agent type (the agent_models
+	// routing the fresh-spawn path applies). nil falls back to defaultClient.
+	clientFor func(agentType string) *client.Client
+	// defaultClient is the subagent client (no agent_models routing).
+	defaultClient *client.Client
+	// enabledTools, injectCWD, gemmaThinking, maxTurns mirror the fresh-spawn
+	// and resume path's prompt/tool switches.
+	enabledTools  map[string]bool
+	injectCWD     bool
+	gemmaThinking bool
+	maxTurns      int
+	// messenger is the TUI messenger (event delivery, confirmations).
+	messenger tui.Messenger
+	// runEnv bundles the child executor's startup-scope collaborators (see
+	// subagentRunEnv) — launchBackgroundSubagent's run closure reads it.
+	runEnv *subagentRunEnv
+	// globalBudget is the resolved global subagent budget (0 = unlimited).
+	globalBudget time.Duration
+}
+
 // isInterruptedSubagentStatus reports whether a manifest status means the
 // child was interrupted by a previous late exit: running and queued are the
 // raw at-exit states (manifests written before the frozen field existed, or
@@ -152,12 +194,17 @@ func isInterruptedSubagentStatus(status string) bool {
 		status == session.SubagentStatusFrozen
 }
 
-// restoreInterruptedSubagents re-lists every manifest child that was
-// interrupted by the previous exit (Phase 3b of subagent persistence) as a
-// read-only orchestrator on the root, so the TUI can browse it — tab
-// switching, transcript view — like any other historical child. The
-// synthesized tool result above already made the parent MODEL aware; this is
-// the TUI-facing half of the same resume story.
+// restoreInterruptedSubagents brings every manifest child that was
+// interrupted by the previous exit back into the TUI — LIVE, not read-only.
+// The synthesized tool result above already made the parent MODEL aware of
+// the interruption; this is the TUI-facing half of the same resume story,
+// and since the live-resume machinery (agent.NewResumedSubagentOrchestrator,
+// the same constructor the spawn_subagent {"resume": "<id>"} path uses) is
+// fully available at startup — the client routing, tool surface, messenger,
+// and scheduler are all resolved before this runs — the restore no longer
+// stops at a read-only projection: a message to the restored child continues
+// its task, and the read-only "restored and read-only; re-spawn it" refusal
+// is gone for interrupted (non-terminal) records.
 //
 // The rule mirrors the manifest's crash model: a record still "running"
 // (or "queued") when this process reads it — or already flipped to
@@ -171,11 +218,13 @@ func isInterruptedSubagentStatus(status string) bool {
 // and the manifest's terminal preview is that same outcome, not a hidden
 // conversation. The restored map deduplicates within one resume pass.
 //
-// Read-only by construction (agent.NewRestoredSubagentOrchestrator): no
-// session, empty registry, Execute refuses. Failures are logged and skipped,
-// never fatal — a broken history file degrades the TUI listing only, and
-// resume must always proceed.
-func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *session.SubagentManifest, restored map[string]bool) {
+// Degradation: without the live machinery (a nil deps — only possible in
+// tests, since main always builds it when subagents are enabled) or when an
+// individual record's history cannot be reloaded, the pre-live-restore
+// read-only stub takes over, preserving the Phase 3b visibility guarantee.
+// Failures are logged and skipped, never fatal — resume must always
+// proceed.
+func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *session.SubagentManifest, restored map[string]bool, deps *liveRestoreDeps) {
 	if root == nil || manifest == nil {
 		return
 	}
@@ -189,14 +238,79 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 			common.LogErrorf("subagent-restore", "subagent %s was interrupted without a persisted history; not listed in the TUI", rec.ID)
 			continue
 		}
+		if deps != nil && deps.root != nil && deps.scheduler != nil && deps.defaultClient != nil && deps.runEnv != nil {
+			if restoreInterruptedSubagentLive(deps, rec) {
+				continue
+			}
+			// Live restore failed for this record: fall through to the
+			// read-only projection so the interrupted work stays browsable.
+		}
 		child, err := agent.NewRestoredSubagentOrchestrator(rec.ID, rec.AgentType, rec.Goal, rec.HistoryPath, RestoredSubagentStatusText(rec.Cause))
 		if err != nil {
 			common.LogErrorf("subagent-restore", "failed to restore subagent %s: %v", rec.ID, err)
 			continue
 		}
 		root.AddChild(child)
-		common.LogErrorf("subagent-restore", "restored subagent %s (%s) into the TUI with %d preserved message(s)", rec.ID, rec.AgentType, len(child.History()))
+		common.LogErrorf("subagent-restore", "restored subagent %s (%s) into the TUI read-only with %d preserved message(s) (live restore unavailable)", rec.ID, rec.AgentType, len(child.History()))
 	}
+}
+
+// restoreInterruptedSubagentLive relaunches ONE interrupted child in the
+// background through the exact {"resume": "<id>"} machinery: the resume
+// constructor (same ID, full persisted history, complete tool surface, no
+// goal re-append — the loaded history already opens with the original goal),
+// then the scheduler-backed launch (stall watchdog, outcome classification,
+// terminal manifest write, parent notification, result artifact). The child
+// appears in the TUI via the constructor's own AddChild and continues its
+// task from where the interruption stopped; the synthesized tool result the
+// parent already received points at the same {"resume": "<id>"} flow, which
+// now finds the record terminal-or-running and degrades to the friendly
+// no-op / live-status wording.
+//
+// The record's status flips back to "running" through the constructor's
+// MarkResumed write — the same crash-safe semantics as an explicit resume:
+// a crash mid-relaunch reads as interrupted again. Returns false when the
+// live relaunch is impossible for this record (validation failure, empty
+// history, constructor error) and the read-only fallback should take over.
+func restoreInterruptedSubagentLive(deps *liveRestoreDeps, rec *session.SubagentRecord) bool {
+	if rec.ID == "" {
+		return false
+	}
+	if err := validateResumeRecord(rec); err != nil {
+		common.LogErrorf("subagent-restore", "subagent %s cannot be live-restored: %v", rec.ID, err)
+		return false
+	}
+
+	childClient := deps.defaultClient
+	if deps.clientFor != nil {
+		if routed := deps.clientFor(rec.AgentType); routed != nil {
+			childClient = routed
+		}
+	}
+
+	child, _, err := agent.NewResumedSubagentOrchestrator(
+		childClient, *rec, rec.AgentType, deps.enabledTools, deps.injectCWD,
+		deps.gemmaThinking, deps.maxTurns, deps.root, deps.messenger)
+	if err != nil {
+		common.LogErrorf("subagent-restore", "live restore of subagent %s failed: %v", rec.ID, err)
+		return false
+	}
+
+	// Status surface: the resumed child's TUI tab seeds with "resumed from
+	// interruption" (agent.RestoredResumedStatus) when first focused, and
+	// the run's own status takes over from the first turn.
+	scheduling := subagentScheduling{
+		Requested: tool.SubagentExecutionParallel,
+		Effective: tool.SubagentExecutionParallel,
+		ModelRef:  "",
+	}
+	if _, err := launchBackgroundSubagent(deps.scheduler, deps.runEnv, deps.sess, deps.sessionID, child,
+		rec.AgentType, rec.Goal, "", context.Background(), nil, deps.globalBudget, scheduling); err != nil {
+		common.LogErrorf("subagent-restore", "background relaunch of restored subagent %s failed: %v", rec.ID, err)
+		return false
+	}
+	common.LogErrorf("subagent-restore", "live-restored subagent %s (%s) — resumed in the background with %d preserved message(s)", rec.ID, rec.AgentType, len(child.History()))
+	return true
 }
 
 // RestoredSubagentStatusText renders the status line for a restored record:

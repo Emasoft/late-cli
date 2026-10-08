@@ -1663,14 +1663,16 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			m.Focused = all[next]
 			// Initialize state if missing
 			state := m.GetAgentState(m.Focused.ID())
-			// A restored subagent (agent.RestoredSubagentOrchestrator)
-			// carries its status line — "restored — was interrupted" with
-			// the recorded cause — through an interface method. Without
-			// this seed the freshly created state says "Ready", hiding the
-			// one fact the user needs when tabbing to a historical child:
-			// that its transcript is the record of an interrupted run, not
-			// a live agent. Only the default seeding is overridden, so a
-			// state that already carries real status text keeps it.
+			// A restored subagent's status line — "restored — was
+			// interrupted" with the recorded cause — arrives through an
+			// interface method. Without this seed the freshly created state
+			// says "Ready", hiding the one fact the user needs when tabbing
+			// to a historical child: that its transcript is the record of an
+			// interrupted run, not a live agent. Only the default seeding is
+			// overridden, so a state that already carries real status text
+			// keeps it. (A LIVE restored child instead seeds through its
+			// StatusHint via GetAgentState/ChildAddedEvent — it has no
+			// StatusText() method, by design, so its tab stays submittable.)
 			if state.StatusText == "Ready" {
 				if texter, ok := m.Focused.(interface{ StatusText() string }); ok {
 					if text := texter.StatusText(); text != "" {
@@ -2040,6 +2042,18 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			}
 		case common.ChildAddedEvent:
 			s.StatusText = "Subagent spawned"
+			// A live-restored child carries a status hint ("resumed from
+			// interruption") instead of the generic spawn line — the one
+			// fact the user needs about this tab is that it continues an
+			// interrupted task. Cleared after use so a fresh child of the
+			// same agent gets the generic line.
+			if child := m.findChildByID(event.Child.ID()); child != nil {
+				if h, ok := child.(interface{ StatusHint() string }); ok {
+					if hint := h.StatusHint(); hint != "" {
+						s.StatusText = hint
+					}
+				}
+			}
 			m.updateViewport()
 		case common.StopRequestedEvent:
 			s.Transcript.generation++
@@ -2245,19 +2259,20 @@ func (m *Model) maybePayloadRecoveryCompaction(s *AppState) tea.Cmd {
 func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 	focusedState := m.GetAgentState(m.Focused.ID())
 
-	// Submission target. A restored (read-only) subagent tab must never
-	// receive a Submit: its orchestrator is the preserved transcript of an
-	// interrupted run and refuses with "restored and read-only" — which the
-	// user reads as the restored session being unable to continue. It can,
-	// so the message is transparently routed to the PARENT (restore only
-	// ever mounts restored children on the root): the parent model receives
-	// the message and can continue the child through the sanctioned
-	// spawn_subagent {"resume": "<id>"} flow, exactly as the resume
-	// synthesis instructs it. Detection is structural — the tui package
-	// cannot import internal/agent, and RestoredSubagentOrchestrator is the
-	// only production orchestrator exposing StatusText() string (the same
+	// Submission target. A restored read-only stub (the degraded restore
+	// path — a record whose live relaunch was impossible) must never receive
+	// a Submit: its orchestrator is the preserved transcript of an
+	// interrupted run and refuses with "could not be live-restored and is
+	// read-only". It can still be continued, so the message is transparently
+	// routed to the PARENT (restore only ever mounts restored children on
+	// the root): the parent model receives the message and can continue the
+	// child through the sanctioned spawn_subagent {"resume": "<id>"} flow,
+	// exactly as the resume synthesis instructs it. Detection is structural —
+	// the tui package cannot import internal/agent, and the read-only stub is
+	// the only production orchestrator exposing StatusText() string (the same
 	// anonymous-interface probe the tab handler uses to seed the restored
-	// status line).
+	// status line). The normal restore produces a LIVE child with no
+	// StatusText() method, so its tab receives submissions directly.
 	target := m.Focused
 	if _, isRestored := m.Focused.(interface{ StatusText() string }); isRestored {
 		if parent := m.Focused.Parent(); parent != nil {

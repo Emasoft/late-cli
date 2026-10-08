@@ -275,7 +275,7 @@ func newSubagentOrchestrator(
 		WorktreePath: worktreeDir,
 	})
 
-	child := finishSubagentOrchestrator(baseParent, id, childSession, messenger, maxTurns)
+	child := finishSubagentOrchestrator(baseParent, id, childSession, messenger, maxTurns, "")
 	return child, nil
 }
 
@@ -376,14 +376,17 @@ func NewResumedSubagentOrchestrator(
 		fmt.Fprintf(os.Stderr, "Warning: failed to mark subagent %s as resumed: %v\n", record.ID, markErr)
 	}
 
-	child := finishSubagentOrchestrator(baseParent, id, childSession, messenger, maxTurns)
+	child := finishSubagentOrchestrator(baseParent, id, childSession, messenger, maxTurns, RestoredResumedStatus)
 	return child, id, nil
 }
 
 // finishSubagentOrchestrator is the shared tail of both constructors: wire
 // the child into the parent (context inheritance + AddChild) and return it
-// as the common.Orchestrator the runner knows.
-func finishSubagentOrchestrator(parent *orchestrator.BaseOrchestrator, id string, childSession *session.Session, messenger tui.Messenger, maxTurns int) common.Orchestrator {
+// as the common.Orchestrator the runner knows. statusHint, when non-empty,
+// seeds the child's first TUI status line (SetStatusHint) — used by the
+// resume constructor so a live-restored child reads "resumed from
+// interruption" instead of a generic fresh-spawn status.
+func finishSubagentOrchestrator(parent *orchestrator.BaseOrchestrator, id string, childSession *session.Session, messenger tui.Messenger, maxTurns int, statusHint string) common.Orchestrator {
 	mws := parent.Middlewares()
 
 	if messenger != nil {
@@ -393,6 +396,9 @@ func finishSubagentOrchestrator(parent *orchestrator.BaseOrchestrator, id string
 	}
 
 	child := orchestrator.NewBaseOrchestrator(id, childSession, mws, maxTurns)
+	if statusHint != "" {
+		child.SetStatusHint(statusHint)
+	}
 	child.SetContext(parent.Context())
 	parent.AddChild(child)
 	return child

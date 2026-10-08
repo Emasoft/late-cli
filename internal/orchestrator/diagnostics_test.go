@@ -111,9 +111,8 @@ func TestExecute_DroppedEventsReportedThroughSink(t *testing.T) {
 	// Execute completes a full turn, whose commit persists the .meta.json
 	// sidecar into the global sessions dir — redirect it to the temp dir.
 	tmpDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 
 	const chunkCount = 150
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

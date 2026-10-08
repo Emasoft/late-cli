@@ -53,6 +53,13 @@ type SubagentScheduler struct {
 	mu      sync.Mutex
 	running map[string]string // child ID → EFFECTIVE execution mode, live children only
 
+	// liveChildren maps the child ID to its live orchestrator for the
+	// running entries (nil for queued entries). It is the ID→orchestrator
+	// bridge the freeze policy needs (Cancel on demand); entries are
+	// registered in startLocked and deleted in finished, exactly like
+	// running.
+	liveChildren map[string]common.Orchestrator
+
 	// serialRunning is the ID of the live serial child, "" when none. The
 	// map alone cannot answer "is a serial child live" without a scan; the
 	// dedicated field keeps the scheduling predicates O(1).
@@ -82,6 +89,14 @@ type SubagentScheduler struct {
 	// the run closure's outcome processing (terminal record, notification
 	// with the resume directive) flows through finished() unchanged — so a
 	// stalled child drains the queue exactly like any finished child.
+
+	// freezeRequested holds the child IDs whose freeze was requested while
+	// their run closure was still executing. A freeze flips the record to
+	// frozen and cancels the child's context; the run closure's completion
+	// then MUST NOT overwrite frozen with a terminal status — the
+	// freeze-aware branch in finished() consults this set, records the
+	// frozen outcome, and the entry leaves the set with the slot release.
+	freezeRequested map[string]bool
 }
 
 // schedulerEntry is one accepted background child: the identity the
@@ -97,6 +112,11 @@ type schedulerEntry struct {
 	agentType string
 	mode      string // tool.SubagentExecutionParallel or SubagentExecutionSerial
 	run       func() subagentCompletion
+	// childSource exposes the entry's live orchestrator once its run closure
+	// has it (nil-func tolerated: the bridge stays empty and freeze policy
+	// degrades to not-finding the child). The closure captures the child
+	// per-spawn, so the accessor is closure-local by construction.
+	childSource func() (common.Orchestrator, bool)
 }
 
 // subagentCompletion is what a background child reports when its run
@@ -114,9 +134,11 @@ type subagentCompletion struct {
 // manifest status writer. Both are per-session-lived, like the scheduler.
 func newSubagentScheduler(sess *session.Session, statusWriter func(id, status string) error) *SubagentScheduler {
 	return &SubagentScheduler{
-		running:      make(map[string]string),
-		sess:         sess,
-		statusWriter: statusWriter,
+		running:         make(map[string]string),
+		liveChildren:    make(map[string]common.Orchestrator),
+		freezeRequested: make(map[string]bool),
+		sess:            sess,
+		statusWriter:    statusWriter,
 	}
 }
 
@@ -128,23 +150,27 @@ func newSubagentScheduler(sess *session.Session, statusWriter func(id, status st
 // entries. The run closure is invoked exactly once — now or when a drain
 // reaches the entry.
 func (s *SubagentScheduler) Launch(id, agentType, mode string, run func() subagentCompletion) (launched bool, position int) {
-	entry := schedulerEntry{id: id, agentType: agentType, mode: mode, run: run}
+	return s.LaunchEntry(schedulerEntry{id: id, agentType: agentType, mode: mode, run: run})
+}
 
+// LaunchEntry is Launch with the full entry surface (the childSource bridge
+// included). See Launch for the contract.
+func (s *SubagentScheduler) LaunchEntry(entry schedulerEntry) (launched bool, position int) {
 	s.mu.Lock()
-	if s.canStartLocked(mode) {
+	if s.canStartLocked(entry.mode) {
 		s.startLocked(entry)
 		s.mu.Unlock()
 		return true, 0
 	}
 	queue := &s.parallelQueue
-	if mode == tool.SubagentExecutionSerial {
+	if entry.mode == tool.SubagentExecutionSerial {
 		queue = &s.serialQueue
 	}
 	*queue = append(*queue, entry)
 	position = len(*queue)
 	s.mu.Unlock()
 
-	s.writeStatus(id, session.SubagentStatusQueued)
+	s.writeStatus(entry.id, session.SubagentStatusQueued)
 	return false, position
 }
 
@@ -172,6 +198,13 @@ func (s *SubagentScheduler) startLocked(entry schedulerEntry) {
 	} else {
 		s.parallelRunning++
 	}
+	if entry.childSource != nil {
+		if child, ok := entry.childSource(); ok {
+			s.liveChildren[entry.id] = child
+		} else {
+			delete(s.liveChildren, entry.id)
+		}
+	}
 	go s.execute(entry)
 }
 
@@ -193,11 +226,34 @@ func (s *SubagentScheduler) execute(entry schedulerEntry) {
 // notification is already in the history — an observer that sees the
 // scheduler drained sees every notification too.
 func (s *SubagentScheduler) finished(entry schedulerEntry, completion subagentCompletion) {
+	// Freeze-aware outcome: a freeze-cancelled run must be reported as
+	// frozen (the resumable state the freeze write landed), never as
+	// "cancelled by the user". The marker is consumed exactly once here —
+	// the entry is leaving the running set, so no later completion can
+	// double-consume.
+	if s.FreezeRequested(entry.id) {
+		completion.Status = session.SubagentStatusFrozen
+		completion.Cause = ""
+		completion.Preview = previewText("Subagent paused (freeze) — its conversation is preserved and it can be resumed with spawn_subagent {\"resume\": \""+entry.id+"\"} or unfrozen with spawn_subagent {\"action\": \"unfreeze\", \"id\": \""+entry.id+"\"}.", manifestResultPreviewLimit)
+		// Re-assert the frozen status on the manifest: the freeze write and
+		// the run's own terminal write race, and MarkSubagentStatus's freeze
+		// guard only covers the order where the freeze landed FIRST. Here the
+		// freeze marker was still set at completion time — the freeze write
+		// may not have landed yet (or lost the race), so the status goes
+		// through the preserving write, which can never clobber the identity
+		// fields and wins by running last.
+		if s.sess != nil {
+			if err := s.sess.MarkSubagentStatusPreserving(entry.id, session.SubagentStatusFrozen, "", ""); err != nil {
+				common.LogErrorf("subagent-scheduler", "failed to persist frozen status for %s: %v", entry.id, err)
+			}
+		}
+	}
 	s.notifyParent(completion)
 
 	var drained []schedulerEntry
 	s.mu.Lock()
 	delete(s.running, entry.id)
+	delete(s.liveChildren, entry.id)
 	if entry.mode == tool.SubagentExecutionSerial {
 		if s.serialRunning == entry.id {
 			s.serialRunning = ""
@@ -259,6 +315,12 @@ func (s *SubagentScheduler) notifyParent(c subagentCompletion) {
 	}
 	note := fmt.Sprintf("[late harness] subagent %s (%s) %s. Result preview: %s. Full result: call subagent_results with {\"id\": %q}.",
 		c.ID, c.AgentType, outcome, c.Preview, c.ID)
+	if c.Status == session.SubagentStatusFrozen {
+		// Freeze (Phase 3): the notification must carry the resume and
+		// unfreeze directives — the child is not dead, it is parked, and
+		// the parent decides when its work continues.
+		note += fmt.Sprintf(" The agent was FROZEN at its own request boundary; its conversation is fully preserved — resume it to continue exactly where it stopped: call spawn_subagent with {\"resume\": %q}, or relaunch it in the background with {\"action\": \"unfreeze\", \"id\": %q}.", c.ID, c.ID)
+	}
 	if strings.HasPrefix(c.Cause, "stalled:") {
 		// Stall auto-resume: the directive must reach the parent IN the
 		// notification — the preview above can clip the one inside the
@@ -282,6 +344,56 @@ func (s *SubagentScheduler) writeStatus(id, status string) {
 	if err := s.statusWriter(id, status); err != nil {
 		common.LogErrorf("subagent-scheduler", "failed to record %s status for %s: %v", status, id, err)
 	}
+}
+
+// RequestFreeze marks one LIVE child freeze-requested and cancels its run
+// context so the run loop unwinds at the next boundary. It reports whether
+// the child was found among the live running entries — queued children are
+// NOT freezable (they have no context to cancel and have written no
+// history; a future launch would immediately fight the freeze marker).
+//
+// The freeze marker is read by the completion path (FreezeRequested) so a
+// freeze-cancelled run is reported as frozen — never as "cancelled by the
+// user" — and the manifest record keeps the resumable status the freeze
+// write landed.
+func (s *SubagentScheduler) RequestFreeze(id string) bool {
+	s.mu.Lock()
+	mode, ok := s.running[id]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	s.freezeRequested[id] = true
+	s.mu.Unlock()
+
+	if child, live := s.LookupRunning(id); live {
+		common.LogErrorf("subagent-freeze", "freeze requested for %s (%s) — cancelling its run context", id, mode)
+		child.Cancel()
+	}
+	return true
+}
+
+// LookupRunning returns the live child orchestrator for id, whether it is
+// currently running (not queued). The scheduler owns the run closures, so
+// it is the only component that can map a child ID back to its
+// common.Orchestrator (for Cancel and freeze policy).
+func (s *SubagentScheduler) LookupRunning(id string) (common.Orchestrator, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	child, ok := s.liveChildren[id]
+	return child, ok
+}
+
+// FreezeRequested reports — and consumes — the freeze marker for id. The
+// run closure's completion path calls it exactly once per entry: consuming
+// keeps the map from growing with every freeze for the lifetime of the
+// process.
+func (s *SubagentScheduler) FreezeRequested(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req := s.freezeRequested[id]
+	delete(s.freezeRequested, id)
+	return req
 }
 
 // State reports where the scheduler holds a child right now:
@@ -523,7 +635,15 @@ func launchBackgroundSubagent(
 		common.LogErrorf("subagent-scheduler", "subagent %s execution/model not recorded: %v", childID, err)
 	}
 
-	launched, position := scheduler.Launch(childID, agentType, scheduling.Effective, run)
+	launched, position := scheduler.LaunchEntry(schedulerEntry{
+		id:        childID,
+		agentType: agentType,
+		mode:      scheduling.Effective,
+		run:       run,
+		childSource: func() (common.Orchestrator, bool) {
+			return child, child != nil
+		},
+	})
 	// downgradedNote explains a per-model parallel downgrade inline so the
 	// parent model never wonders why a requested parallel runs serially.
 	downgradedNote := ""
@@ -573,7 +693,7 @@ func subagentResultsLookup(sess *session.Session, scheduler *SubagentScheduler, 
 		case session.SubagentStatusRunning:
 			return fmt.Sprintf("Subagent %s (%s) is still running. You will be notified when it finishes.", id, rec.AgentType), nil
 		case session.SubagentStatusFrozen:
-			text := fmt.Sprintf("Subagent %s (%s) was FROZEN by a previous late exit (it was queued or running when that process died and never finished).", id, rec.AgentType)
+			text := fmt.Sprintf("Subagent %s (%s) is FROZEN (it was paused by a freeze request or by a previous late exit and never finished).", id, rec.AgentType)
 			if rec.HistoryPath != "" {
 				text += fmt.Sprintf(" Its work state is preserved at %s", rec.HistoryPath)
 			}

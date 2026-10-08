@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,9 +33,38 @@ type SessionMeta struct {
 	CompactionHighWater int `json:"compaction_high_water,omitempty"`
 }
 
+// sessionDirOverride carries the test injection point for the sessions
+// directory. It is mutex-guarded rather than a plain var: background
+// goroutines (a subagent run closure finishing after its test ended, a
+// manifest write racing t.TempDir cleanup) resolve the sessions dir on
+// their own goroutine, and a cleanup writing the plain var raced those
+// reads under -race. SetSessionDirOverrideForTest swaps the override;
+// SessionDir applies it or falls through to the real directory.
+var sessionDirOverride struct {
+	mu sync.Mutex
+	fn func() (string, error)
+}
+
 // SessionDir returns the directory where session metadata and histories are stored
-var SessionDir = func() (string, error) {
+func SessionDir() (string, error) {
+	sessionDirOverride.mu.Lock()
+	fn := sessionDirOverride.fn
+	sessionDirOverride.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
 	return common.LateSessionDir()
+}
+
+// SetSessionDirOverrideForTest installs (or, with nil, removes) the test
+// override of SessionDir. The previous override is returned for the
+// caller's capture-restore cleanup.
+func SetSessionDirOverrideForTest(fn func() (string, error)) (previous func() (string, error)) {
+	sessionDirOverride.mu.Lock()
+	defer sessionDirOverride.mu.Unlock()
+	prev := sessionDirOverride.fn
+	sessionDirOverride.fn = fn
+	return prev
 }
 
 // SaveSessionMeta saves session metadata to the sessions directory

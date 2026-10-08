@@ -118,6 +118,10 @@ type BaseOrchestrator struct {
 	// idleKillReason records why the idle watchdog cancelled this run; guarded
 	// by mu. Empty unless the watchdog killed the run.
 	idleKillReason string
+
+	// statusHint is the optional one-line status seed the TUI applies when
+	// this child's state is first created (see SetStatusHint). Guarded by mu.
+	statusHint string
 }
 
 // Idle-watchdog tuning. defaultIdleTickInterval is how often the watchdog
@@ -149,6 +153,29 @@ func NewBaseOrchestrator(id string, sess *session.Session, middlewares []common.
 	// fresh idle episode.
 	o.lastActivity.Store(time.Now().UnixNano())
 	return o
+}
+
+// SetStatusHint sets a one-line status seed the TUI applies when the child's
+// state is first created (its ChildAddedEvent). It exists for resumed
+// children: a live restore mounts a child whose first status should say
+// "resumed from interruption" rather than a generic "spawned"/"Ready" —
+// without this the one fact the user needs (this tab continues an
+// interrupted task) is invisible until its first turn reports. The hint is
+// best-effort UI sugar: the child's own run status replaces it as soon as
+// the run reports. Deliberately NOT named StatusText — that method is the
+// TUI's structural marker for read-only restored stubs, and a live child
+// must never match it (submissions to a live child land on the child).
+func (o *BaseOrchestrator) SetStatusHint(hint string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.statusHint = hint
+}
+
+// StatusHint returns the seeded status line, or "" when none was set.
+func (o *BaseOrchestrator) StatusHint() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.statusHint
 }
 
 func (o *BaseOrchestrator) SetMiddlewares(middlewares []common.ToolMiddleware) {

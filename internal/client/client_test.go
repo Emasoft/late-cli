@@ -684,7 +684,7 @@ func TestChatCompletionStream_IdleWatchdog(t *testing.T) {
 		<-held
 	}))
 
-	old := defaultStreamIdleTimeout
+	old := DefaultStreamIdleTimeout()
 	SetStreamIdleTimeout(300 * time.Millisecond)
 	t.Cleanup(func() { SetStreamIdleTimeout(old) })
 
@@ -760,7 +760,7 @@ func TestChatCompletionStream_NormalStreamNotKilled(t *testing.T) {
 		flusher.Flush()
 	}))
 
-	old := defaultStreamIdleTimeout
+	old := DefaultStreamIdleTimeout()
 	SetStreamIdleTimeout(1 * time.Second)
 	t.Cleanup(func() { SetStreamIdleTimeout(old) })
 

@@ -16,9 +16,8 @@ import (
 func restoredTestHistory(t *testing.T, sessionID, childID string, msgs ...client.ChatMessage) string {
 	t.Helper()
 	tmp := t.TempDir()
-	original := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = original })
+	original := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(original) })
 	path, err := session.SubagentHistoryPath(sessionID, childID)
 	if err != nil {
 		t.Fatalf("SubagentHistoryPath: %v", err)
@@ -138,9 +137,8 @@ func TestRestoredSubagentEventsChannelClosed(t *testing.T) {
 // history — rather than failing.
 func TestRestoredSubagentMissingHistoryIsEmptyListed(t *testing.T) {
 	tmp := t.TempDir()
-	original := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = original })
+	original := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(original) })
 	path, err := session.SubagentHistoryPath("session-restore-3", "coder-subagent-9")
 	if err != nil {
 		t.Fatalf("SubagentHistoryPath: %v", err)
@@ -160,9 +158,8 @@ func TestRestoredSubagentMissingHistoryIsEmptyListed(t *testing.T) {
 // an error, never a silently empty listing.
 func TestRestoredSubagentCorruptHistoryIsReported(t *testing.T) {
 	tmp := t.TempDir()
-	original := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = original })
+	original := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(original) })
 	path, err := session.SubagentHistoryPath("session-restore-4", "coder-subagent-2")
 	if err != nil {
 		t.Fatalf("SubagentHistoryPath: %v", err)

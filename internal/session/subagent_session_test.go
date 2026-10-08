@@ -12,11 +12,10 @@ func TestSubagentSession_SavesHistoryWithoutMeta(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	historyPath := filepath.Join(tmpDir, "session-test", "subagents", "coder-subagent-0.json")
 	s := NewSubagentSession(nil, historyPath, nil, "sp")
@@ -49,11 +48,10 @@ func TestRegularSession_StillWritesMeta(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	t.Cleanup(func() { SessionDir = oldSessionDir })
+	})
+	t.Cleanup(func() { SetSessionDirOverrideForTest(oldSessionDir) })
 
 	historyPath := filepath.Join(tmpDir, "session-test.json")
 	s := New(nil, historyPath, nil, "sp", true)

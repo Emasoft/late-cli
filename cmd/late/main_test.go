@@ -195,14 +195,14 @@ func writeTestSession(t *testing.T, sessionsDir, id string, workingDir ...string
 	return filepath.Join(sessionsDir, id+".meta.json"), historyPath
 }
 
-// injectSessionDir points session.SessionDir at a temp dir for the test's duration.
+// injectSessionDir points the session layer's sessions dir at a temp dir for
+// the test's duration.
 func injectSessionDir(t *testing.T) string {
 	t.Helper()
 
 	tmp := t.TempDir()
-	oldDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = oldDir })
+	oldDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(oldDir) })
 
 	return tmp
 }

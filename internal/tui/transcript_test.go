@@ -100,6 +100,50 @@ func cacheKeyForTest(s *AppState) string {
 	return ""
 }
 
+// TestTranscriptStyledCacheCapped pins the memory-hardening budget: the
+// styled-row cache is content-addressed, so without a cap a session with
+// many large messages accumulates one styled row per rendered line for the
+// life of the process. The render must keep the map at or under
+// maxTranscriptCachedRows rows (overflow drops the rows cached so far and
+// recaches the newest window) while the rendered content stays complete —
+// a dropped key only re-renders, it never changes the output.
+func TestTranscriptStyledCacheCapped(t *testing.T) {
+	// 5000 large messages produce well over maxTranscriptCachedRows styled
+	// rows in one render.
+	m, s := newViewportBenchmarkModel(benchmarkHistory(5000))
+	renderTestTranscript(m)
+
+	total := 0
+	for _, rows := range s.Transcript.cache {
+		total += len(rows)
+	}
+	if total > maxTranscriptCachedRows {
+		t.Fatalf("styled cache holds %d rows, want <= %d (cache unbounded)", total, maxTranscriptCachedRows)
+	}
+	if total == 0 {
+		t.Fatal("styled cache empty after render (budget broken)")
+	}
+	// The overflow path must keep the NEWEST window cached, not empty the
+	// map for the remainder of the render: the last rendered block's key
+	// must be present.
+	if len(s.Transcript.cache) == 0 {
+		t.Fatal("cache map empty after overflow (newest window not kept)")
+	}
+	// Rendering again (no history change) must be stable: rows complete,
+	// budget respected, no growth past the cap.
+	content := testTranscriptContent(m)
+	if !strings.Contains(content, "Question 2499") {
+		t.Fatal("capped render lost history content")
+	}
+	total = 0
+	for _, rows := range s.Transcript.cache {
+		total += len(rows)
+	}
+	if total > maxTranscriptCachedRows {
+		t.Fatalf("second render cache holds %d rows, want <= %d", total, maxTranscriptCachedRows)
+	}
+}
+
 func TestTranscriptFocusSwitch(t *testing.T) {
 	root := &focusTestOrchestrator{id: "root", history: benchmarkHistory(100)}
 	child := &focusTestOrchestrator{id: "child", parent: root, history: []client.ChatMessage{{Role: "assistant", Content: client.TextContent("CHILDHISTORYMARKER")}}}

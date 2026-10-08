@@ -14,11 +14,10 @@ func TestSubagentHistoryPath(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	const sessionID = "session-20250101-123456"
 	const childID = "researcher-subagent-0"
@@ -55,11 +54,10 @@ func TestRemoveSessionFolder_RemovesFolderKeepsFlatFiles(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	const sessionID = "session-X"
 	subagentsDir := filepath.Join(tmpDir, sessionID, "subagents")
@@ -106,11 +104,10 @@ func TestRemoveSessionFolder_NoopForMissingAndUnsafeIDs(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	// Never-created ID: no error, nothing deleted.
 	if err := RemoveSessionFolder("session-does-not-exist"); err != nil {
@@ -145,11 +142,10 @@ func TestSubagentHistoryPathRejectsUnsafeIDs(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	for _, unsafeID := range []string{"", ".", "..", "../x", "a/b"} {
 		if _, err := SubagentHistoryDir(unsafeID); err == nil {
@@ -182,11 +178,10 @@ func TestSubagentHistoryPathValidInputs(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Mock SessionDir
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) {
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) {
 		return tmpDir, nil
-	}
-	defer func() { SessionDir = oldSessionDir }()
+	})
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	gotPath, err := SubagentHistoryPath("session-x", "coder-subagent-0")
 	if err != nil {

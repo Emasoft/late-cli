@@ -52,9 +52,8 @@ func newStallTestServer(t *testing.T, firstChunks int) (chan struct{}, chan stru
 // sessions dir.
 func isolateSessionDir(t *testing.T) {
 	t.Helper()
-	oldDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return t.TempDir(), nil }
-	t.Cleanup(func() { session.SessionDir = oldDir })
+	oldDir := session.SetSessionDirOverrideForTest(func() (string, error) { return t.TempDir(), nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(oldDir) })
 }
 
 // drainEvents consumes o.eventCh until stop is closed, mirroring a live TUI

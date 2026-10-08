@@ -42,9 +42,8 @@ func TestBaseOrchestrator_Rewind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 
 	historyPath := filepath.Join(tmpDir, "history.json")
 	history := []client.ChatMessage{
@@ -104,9 +103,8 @@ func TestBaseOrchestrator_Rewind(t *testing.T) {
 
 func TestBaseOrchestrator_ResetStartsNewConversation(t *testing.T) {
 	tmpDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 	originalPath := filepath.Join(tmpDir, "session-original.json")
 	history := []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("keep me")},
@@ -257,9 +255,8 @@ func TestNextChildID_Concurrent(t *testing.T) {
 
 func TestNextChildIDPersistsSequenceForResume(t *testing.T) {
 	tmpDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 
 	historyPath := filepath.Join(tmpDir, "session-test.json")
 	sess := session.New(nil, historyPath, nil, "", false)
@@ -300,9 +297,8 @@ func TestBaseOrchestrator_Execute_EmptyTextDoesNotAddMessage(t *testing.T) {
 	// sidecar into the global sessions dir. Redirect it so nothing leaves
 	// the temp dir.
 	tmpDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -401,9 +397,8 @@ func TestBaseOrchestrator_CancelDuringRunDoesNotCommitQueuedMessages(t *testing.
 	// UpdateSessionMetadata, writing the .meta.json sidecar into the global
 	// sessions dir. Redirect it so nothing leaves the temp dir.
 	tmpDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmpDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 
 	// Setup a server that holds the connection until cancelled
 	holdCh := make(chan struct{})

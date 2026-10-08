@@ -21,9 +21,8 @@ func manifestTestSession(t *testing.T, sessionsDir, sessionID string) *Session {
 // persistence tests.
 func stubSessionDir(t *testing.T, dir string) {
 	t.Helper()
-	original := SessionDir
-	SessionDir = func() (string, error) { return dir, nil }
-	t.Cleanup(func() { SessionDir = original })
+	original := SetSessionDirOverrideForTest(func() (string, error) { return dir, nil })
+	t.Cleanup(func() { SetSessionDirOverrideForTest(original) })
 }
 
 func TestSubagentManifestSaveLoadRoundTrip(t *testing.T) {

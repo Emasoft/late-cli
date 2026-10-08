@@ -134,9 +134,8 @@ func TestStreamAccumulator_NameUpdate(t *testing.T) {
 // inside t.TempDir().
 func isolateSessionDir(t *testing.T) {
 	t.Helper()
-	oldDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return t.TempDir(), nil }
-	t.Cleanup(func() { session.SessionDir = oldDir })
+	oldDir := session.SetSessionDirOverrideForTest(func() (string, error) { return t.TempDir(), nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(oldDir) })
 }
 
 // TestExecuteToolCalls_NotFound verifies that missing tools produce an error message

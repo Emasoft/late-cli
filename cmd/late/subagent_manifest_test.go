@@ -37,9 +37,8 @@ func (s *stubRunnerChild) Session() *session.Session     { return s.sess }
 func runnerTestSession(t *testing.T, sessionID string) *session.Session {
 	t.Helper()
 	tmp := t.TempDir()
-	original := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = original })
+	original := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(original) })
 	return session.New(nil, filepath.Join(tmp, sessionID+".json"), []client.ChatMessage{}, "prompt", false)
 }
 

@@ -25,6 +25,16 @@ const (
 	SubagentExecutionSerial   = "serial"   // queue; runs alone when no other subagent is running
 )
 
+// Subagent lifecycle actions (the spawn_subagent "action" argument). They
+// are orthogonal to the execution modes: freeze/unfreeze address an
+// EXISTING child (by id), while execution selects how a NEW child is
+// scheduled. Unfreeze relaunches in the background — the default for the
+// resumed life of a previously frozen child.
+const (
+	SubagentActionFreeze   = "freeze"   // pause a running child, preserving its history (resumable)
+	SubagentActionUnfreeze = "unfreeze" // resume a frozen child in the background
+)
+
 // NormalizeSubagentExecution maps an absent/empty "execution" argument to
 // the sync default and passes known modes through. The bool result reports
 // whether raw is an acceptable value at all.
@@ -61,6 +71,14 @@ type SubagentSpawnRequest struct {
 	// this ID from the session manifest instead of spawning fresh. All
 	// other fields are ignored in that mode.
 	ResumeID string `json:"resume"`
+	// Action, when non-empty, asks the runner for a lifecycle operation
+	// instead of a spawn or resume: "freeze" pauses a running child at its
+	// next turn boundary (marking the manifest record frozen, resumable),
+	// "unfreeze" resumes a frozen child in the background. Empty = absent.
+	Action string `json:"action"`
+	// ActionID is the subagent ID the action addresses ("freeze"/"unfreeze"
+	// with spawn_subagent's "id" argument). Empty for spawns and resumes.
+	ActionID string `json:"id"`
 	// Worktree, when non-empty on a fresh spawn, is either a path to an
 	// already-registered worktree of the current repo or a branch name to
 	// create + check out in a new worktree. ValidateWorktree runs before
@@ -127,6 +145,15 @@ func (t SpawnSubagentTool) Parameters() json.RawMessage {
 				"type": "string",
 				"description": "The ID of a previously interrupted subagent to resume exactly where it stopped (e.g. \"coder-subagent-0\"). All other parameters are ignored; the agent restores with its complete history and continues its task."
 			},
+			"action": {
+				"type": "string",
+				"enum": ["freeze", "unfreeze"],
+				"description": "Lifecycle action instead of a spawn or resume. \"freeze\": pause a RUNNING subagent at its next turn boundary, marking it frozen (its history is preserved; resume later with spawn_subagent {\"resume\": id}). \"unfreeze\": resume a previously frozen subagent in the background (a running/queued child unfreezes nothing and reports its live state). All other parameters are ignored."
+			},
+			"id": {
+				"type": "string",
+				"description": "With \"action\": the subagent ID to freeze or unfreeze, exactly as a launch acknowledgement or [late harness] notification reported it (e.g. \"coder-subagent-2\"). Ignored without \"action\"."
+			},
 			"worktree": {
 				"type": "string",
 				"description": "Optional git worktree for this subagent to work in: either the path of an existing worktree of the current repository, or a branch name — a worktree for that branch is created first. The subagent's working directory becomes the worktree."
@@ -151,6 +178,14 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 	var params SubagentSpawnRequest
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %v", err)
+	}
+
+	// Lifecycle actions short-circuit before every spawn/resume surface:
+	// they carry no goal and must never touch the worktree or timeout
+	// validation. Unknown actions fall through and are rejected by the
+	// runner (the tool stays schema-tolerant the same way it is for goal).
+	if params.Action == SubagentActionFreeze || params.Action == SubagentActionUnfreeze {
+		return t.Runner(ctx, params, nil)
 	}
 
 	timeoutOverride, err := parseSubagentTimeout(params.Timeout)
@@ -276,6 +311,17 @@ func configuredAgentTypes() string {
 	return strings.Join(names, ", ")
 }
 
+// capitalize upper-cases the first rune of s. It backs CallString's
+// action labels ("freeze" → "Freeze") without pulling strings.Title
+// (deprecated) or a unicode package for an ASCII-first two-word set.
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	return strings.ToUpper(string(r[0])) + string(r[1:])
+}
+
 // parseSubagentTimeout parses the optional per-spawn "timeout" argument.
 // Empty (absent) → nil override: the global budget applies.
 // "0" or a negative duration → pointer to 0 (explicit unlimited).
@@ -302,6 +348,13 @@ func (t SpawnSubagentTool) CallString(args json.RawMessage) string {
 	var params SubagentSpawnRequest
 	if err := json.Unmarshal(args, &params); err == nil && params.ResumeID != "" {
 		return fmt.Sprintf("Resuming subagent: %s", truncate(params.ResumeID, 50))
+	}
+	if err := json.Unmarshal(args, &params); err == nil && params.Action != "" {
+		id := getToolParam(args, "id")
+		if id == "" {
+			id = "unknown id"
+		}
+		return fmt.Sprintf("%s subagent: %s", capitalize(params.Action), truncate(id, 50))
 	}
 	goal := getToolParam(args, "goal")
 	if goal == "" {

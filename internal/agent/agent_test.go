@@ -276,13 +276,12 @@ func TestNewSubagentOrchestrator_ConcurrentSpawn(t *testing.T) {
 	}
 }
 
-// setSessionDirForTest points session.SessionDir at dir for the duration of
-// the test, restoring the previous value on cleanup.
+// setSessionDirForTest points the session layer's sessions dir at dir for
+// the duration of the test, restoring the previous override on cleanup.
 func setSessionDirForTest(t *testing.T, dir string) {
 	t.Helper()
-	oldDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return dir, nil }
-	t.Cleanup(func() { session.SessionDir = oldDir })
+	oldDir := session.SetSessionDirOverrideForTest(func() (string, error) { return dir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(oldDir) })
 }
 
 // walkRegularFiles returns the paths of all regular files under root.

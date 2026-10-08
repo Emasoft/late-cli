@@ -38,6 +38,13 @@ const (
 	SubagentStatusCancelled = "cancelled"
 )
 
+// SubagentFrozenStatus is the model-facing status text a frozen child
+// reports: frozen is terminal-ish for the scheduler (the child is no longer
+// live) but resumable for the parent, exactly like the exit-interruption
+// freeze — the same status, reached while late is still alive instead of at
+// process death.
+const SubagentFrozenStatus = "frozen — was paused (freeze); work preserved, resumable"
+
 // IsTerminalSubagentStatus reports whether status is a terminal manifest
 // status (the run has definitively ended and its outcome is recorded).
 func IsTerminalSubagentStatus(status string) bool {
@@ -297,6 +304,64 @@ func (s *Session) SaveSubagentRecord(rec SubagentRecord) error {
 	return manifest.Save()
 }
 
+// SaveSubagentRecordPreserving is the freeze variant of SaveSubagentRecord:
+// it merges rec's identity (id, agent_type, goal, history_path) into the
+// manifest WITHOUT clobbering the runtime fields the live run may have
+// written since (status, resume_count, result_path). Upsert would replace
+// the whole record and silently erase a terminal write that raced the
+// freeze — the lost-cancelled-notification shape. Unknown IDs are a no-op
+// (a freeze may only refine a record the spawn already wrote); in-memory
+// sessions have no manifest. Nil "preserve" fields are kept from disk.
+func (s *Session) SaveSubagentRecordPreserving(rec SubagentRecord) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" {
+		return nil
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	existing, ok := manifest.Get(rec.ID)
+	if !ok {
+		return nil
+	}
+	if rec.AgentType != "" {
+		existing.AgentType = rec.AgentType
+	}
+	if rec.Goal != "" {
+		existing.Goal = rec.Goal
+	}
+	if rec.HistoryPath != "" {
+		existing.HistoryPath = rec.HistoryPath
+	}
+	if rec.Status != "" {
+		existing.Status = rec.Status
+	}
+	return manifest.Save()
+}
+
+// MarkSubagentStatusPreserving flips one record's status like MarkStatus,
+// but NEVER clears the other terminal stamps: a freeze must not erase the
+// ResultPath the runner recorded when the child's original life completed a
+// background launch bookkeeping step, and the preserve rule keeps any field
+// not explicitly written. EndedAt stays zero (a frozen record has not
+// ended). Unknown IDs are a no-op; it operates on the in-memory copy.
+func (m *SubagentManifest) MarkSubagentStatusPreserving(id, status, cause, transcriptPath string) {
+	rec, ok := m.Get(id)
+	if !ok {
+		return
+	}
+	rec.Status = status
+	rec.Cause = cause
+	if transcriptPath != "" {
+		rec.TranscriptPath = transcriptPath
+	}
+}
+
 // sessionSubagentRecordID returns the session folder the manifest belongs
 // to. Two layouts reach this method:
 //
@@ -348,6 +413,19 @@ func (s *Session) MarkSubagentStatus(id, status, cause, resultPreview, transcrip
 		return err
 	}
 	manifest.SessionID = sessionID
+	// Freeze guard (Phase 3): a record that was already frozen must never be
+	// regressed to a terminal status by the run's own completion path. The
+	// freeze and the run's unwind race by design — RequestFreeze cancels the
+	// child context and the freeze write lands while (or after) the run
+	// closure classifies its outcome — and frozen is the one non-terminal
+	// status the parent can still act on (resume/unfreeze). A terminal write
+	// landing on a frozen record would erase the parked state the freeze
+	// promised; the freeze-aware branch in the scheduler's finished() re-
+	// asserts the status afterwards for the window where the terminal write
+	// won the race and the freeze write had not landed yet.
+	if rec, ok := manifest.Get(id); ok && rec.Status == SubagentStatusFrozen {
+		return nil
+	}
 	manifest.MarkStatus(id, status, cause, resultPreview, transcriptPath)
 	return manifest.Save()
 }
@@ -403,6 +481,27 @@ func (s *Session) MarkSubagentExecution(id, execution, model string) error {
 	}
 	rec.Execution = execution
 	rec.Model = model
+	return manifest.Save()
+}
+
+// MarkSubagentStatusPreserving is the session-level passthrough to
+// SubagentManifest.MarkSubagentStatusPreserving: the freeze path flips one
+// record's status WITHOUT clearing the other fields, through the same
+// load-modify-save cycle as MarkSubagentStatus.
+func (s *Session) MarkSubagentStatusPreserving(id, status, cause, transcriptPath string) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" {
+		return nil // in-memory session: no session folder, no manifest
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	manifest.MarkSubagentStatusPreserving(id, status, cause, transcriptPath)
 	return manifest.Save()
 }
 

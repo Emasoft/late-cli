@@ -19,14 +19,25 @@ import (
 	"unicode/utf8"
 )
 
-// defaultStreamIdleTimeout bounds how long a streaming response may stay
-// completely silent before it is considered stalled and aborted. The abort
-// surfaces as a regular stream error, which the executor's retry tier
-// handles. 0 disables the watchdog.
-var defaultStreamIdleTimeout = 120 * time.Second
+// streamIdleTimeout bounds how long a streaming response may stay silent
+// before it is considered stalled and aborted. The abort surfaces as a
+// regular stream error, which the executor's retry tier handles. 0 disables
+// the watchdog. Atomic: tests override and restore it while in-flight
+// background streams from OTHER tests may still be ticking their watchdogs —
+// a plain var write races those reads (a -race failure that survived every
+// per-request join).
+var streamIdleTimeout atomic.Int64
 
-// SetStreamIdleTimeout overrides defaultStreamIdleTimeout (test use).
-func SetStreamIdleTimeout(d time.Duration) { defaultStreamIdleTimeout = d }
+func init() { streamIdleTimeout.Store(int64(120 * time.Second)) }
+
+// SetStreamIdleTimeout overrides streamIdleTimeout (test use).
+func SetStreamIdleTimeout(d time.Duration) { streamIdleTimeout.Store(int64(d)) }
+
+// DefaultStreamIdleTimeout reports the current stream idle watchdog bound
+// (test use: capture-restore around a SetStreamIdleTimeout override).
+func DefaultStreamIdleTimeout() time.Duration {
+	return time.Duration(streamIdleTimeout.Load())
+}
 
 // defaultRequestTimeout bounds a single non-streaming chat completion request
 // (connect plus full response). A server that accepts the connection and never
@@ -92,7 +103,7 @@ func NewClient(cfg Config) *Client {
 			},
 			// No client-level timeout: streaming responses are legitimately
 			// long-lived, so stalls are bounded by the stream idle watchdog
-			// (defaultStreamIdleTimeout) and non-streaming requests by
+			// (streamIdleTimeout) and non-streaming requests by
 			// defaultRequestTimeout instead.
 			Timeout: 0,
 		},
@@ -303,12 +314,14 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 		// then streams nothing (half-open connection, stalled backend) blocks
 		// scanner.Scan() for the OS TCP lifetime, and to the caller that is
 		// indistinguishable from the model "thinking". If no line arrives
-		// within defaultStreamIdleTimeout, cancel streamCtx so the in-flight
+		// within streamIdleTimeout, cancel streamCtx so the in-flight
 		// body read fails; the resulting error flows through the normal
 		// scanner.Err() path below as a regular stream error, which the
-		// executor's retry tier handles. A non-positive
-		// defaultStreamIdleTimeout disables the watchdog.
-		if defaultStreamIdleTimeout > 0 {
+		// executor's retry tier handles. A non-positive bound disables the
+		// watchdog. Read once per request: an override landing mid-stream
+		// applies to the NEXT request.
+		idleBound := time.Duration(streamIdleTimeout.Load())
+		if idleBound > 0 {
 			watchdogDone := make(chan struct{})
 			go func() {
 				defer close(watchdogDone)
@@ -320,7 +333,7 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 						return
 					case <-ticker.C:
 						last := time.Unix(0, atomic.LoadInt64(&lastRead))
-						if time.Since(last) > defaultStreamIdleTimeout {
+						if time.Since(last) > idleBound {
 							// Deliberate cancellation, not a client bug: the
 							// idle watchdog fired because the provider stopped
 							// streaming. The in-flight body read fails below

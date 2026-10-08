@@ -599,7 +599,7 @@ func TestSynthesizeFreezesNonTerminalRecords(t *testing.T) {
 	// The TUI restore accepts the frozen records.
 	root := restoredRootForTest(t)
 	restored := make(map[string]bool)
-	restoreInterruptedSubagents(root, manifest, restored)
+	restoreInterruptedSubagents(root, manifest, restored, readOnlyRestoreDeps())
 	if !restored["coder-subagent-20"] || !restored["coder-subagent-21"] {
 		t.Errorf("frozen records not restored: %v", restored)
 	}

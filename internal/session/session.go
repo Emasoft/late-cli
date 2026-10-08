@@ -291,6 +291,15 @@ func (s *Session) SnapshotHistory() error {
 	return s.persistHistorySnapshot(snapshot, gen)
 }
 
+// HistoryGeneration reports the current history mutation generation — the
+// same counter the generation-checked persistence compares. Callers use it
+// to skip work when the history is unchanged since their last observation
+// (the snapshot ticker's unchanged-skip): capture the generation, do the
+// work only when it differs.
+func (s *Session) HistoryGeneration() uint64 {
+	return s.historyGen.Load()
+}
+
 // persistHistorySnapshot marshals snapshot and writes it to the history path
 // through writeAtomic — the shared persistence tail of every history writer
 // (commit saves, mid-turn snapshots, out-of-package PersistHistory). The

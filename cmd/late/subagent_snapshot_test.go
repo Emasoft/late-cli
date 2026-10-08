@@ -3,11 +3,14 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"late/internal/client"
+	"late/internal/common"
 	"late/internal/session"
 )
 
@@ -26,9 +29,8 @@ func (c *snapshotTestChild) Session() *session.Session { return c.sess }
 func snapshotTestChildSession(t *testing.T, sessionID, childID string) *session.Session {
 	t.Helper()
 	tmp := t.TempDir()
-	original := session.SessionDir
-	session.SessionDir = func() (string, error) { return tmp, nil }
-	t.Cleanup(func() { session.SessionDir = original })
+	original := session.SetSessionDirOverrideForTest(func() (string, error) { return tmp, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(original) })
 	path, err := session.SubagentHistoryPath(sessionID, childID)
 	if err != nil {
 		t.Fatalf("SubagentHistoryPath: %v", err)
@@ -49,6 +51,141 @@ func waitForSnapshotFile(t *testing.T, path string, want int) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("history file %s never reached %d messages", path, want)
+}
+
+// TestSubagentSnapshotTickerSkipsUnchangedHistory pins the memory-hardening
+// skip: a tick whose history generation has not moved since the last
+// snapshot must not rewrite the file. The observation channel is the file's
+// mtime: after the first snapshot lands, an advance of the clock (the file
+// system's coarsest timestamp the test can rely on) plus many ticks must
+// leave the mtime untouched, while a later REAL change still reaches disk —
+// proving the skip is keyed to change, not a broken ticker.
+func TestSubagentSnapshotTickerSkipsUnchangedHistory(t *testing.T) {
+	const sessionID = "session-20250101-130000"
+	childSession := snapshotTestChildSession(t, sessionID, "coder-subagent-0")
+
+	if err := childSession.AddUserMessage("the goal"); err != nil {
+		t.Fatalf("AddUserMessage: %v", err)
+	}
+
+	stop := startSubagentSnapshotTicker(&snapshotTestChild{id: "coder-subagent-0", sess: childSession}, childSession, time.Millisecond)
+	waitForSnapshotFile(t, childSession.HistoryPath, 1)
+
+	// Freeze the history and give the ticker many ticks. Snapshots of
+	// unchanged history are skipped, so the file's bytes stop changing.
+	// (mtime alone can lag; the ticker's OWN skip path is what the byte
+	// stability asserts — any write would rewrite with fresh bytes.)
+	first, err := os.ReadFile(childSession.HistoryPath)
+	if err != nil {
+		t.Fatalf("read first snapshot: %v", err)
+	}
+	for i := 0; i < 200; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	second, err := os.ReadFile(childSession.HistoryPath)
+	if err != nil {
+		t.Fatalf("read second snapshot: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("unchanged history was re-snapshotted: the skip is not keying on the history generation (the O(history) marshal ran anyway)")
+	}
+
+	// A REAL change must still land (the skip must not become a freeze).
+	if err := childSession.AddAssistantMessage("new work", ""); err != nil {
+		t.Fatalf("AddAssistantMessage: %v", err)
+	}
+	waitForSnapshotFile(t, childSession.HistoryPath, 2)
+	stop()
+}
+
+// TestSnapshotTickerWarnsOnHighHeap pins the memory-pressure observation:
+// one tick with the threshold lowered under the current heap logs the heap
+// warning to the errorlog. The tick helper is driven directly (no ticker
+// channel), so the log line is deterministic. The threshold is restored by
+// cleanup so the lowered value never leaks into another test.
+func TestSnapshotTickerWarnsOnHighHeap(t *testing.T) {
+	orig := subagentHeapWarnBytes
+	subagentHeapWarnBytes = 1 // guaranteed below any live HeapInuse
+	t.Cleanup(func() { subagentHeapWarnBytes = orig })
+
+	// A temp errorlog captures the warning line (installed over the default;
+	// cleanup re-installs the default path's log — SetErrorLog disables the
+	// lazy open, so the restore must be explicit).
+	logPath := filepath.Join(t.TempDir(), "errors.log")
+	l, err := common.OpenErrorLogAt(logPath)
+	if err != nil {
+		t.Fatalf("OpenErrorLogAt: %v", err)
+	}
+	common.SetErrorLog(l)
+	t.Cleanup(func() {
+		def, err := common.OpenErrorLog()
+		if err == nil {
+			common.SetErrorLog(def)
+		} else {
+			common.SetErrorLog(nil)
+		}
+	})
+
+	const sessionID = "session-20250101-130000"
+	childSession := snapshotTestChildSession(t, sessionID, "coder-subagent-1")
+	if err := childSession.AddUserMessage("the goal"); err != nil {
+		t.Fatalf("AddUserMessage: %v", err)
+	}
+
+	var lastGen atomic.Uint64
+	snapshotTickOnce(&snapshotTestChild{id: "coder-subagent-1", sess: childSession}, childSession, &lastGen)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read errorlog: %v", err)
+	}
+	if !strings.Contains(string(data), "heap in use") || !strings.Contains(string(data), "OOM SIGKILL") {
+		t.Fatalf("errorlog missing the heap warning line:\n%s", data)
+	}
+}
+
+// TestSnapshotTickOnceSkipsThenSnapshots pins the tick's change-keyed skip:
+// the first tick writes the history file; a second tick with NO new commits
+// must leave the file's mtime untouched (the O(history) work skipped); a
+// commit between ticks must be carried to disk by the next tick.
+func TestSnapshotTickOnceSkipsThenSnapshots(t *testing.T) {
+	const sessionID = "session-20250101-130000"
+	childSession := snapshotTestChildSession(t, sessionID, "coder-subagent-2")
+	if err := childSession.AddUserMessage("the goal"); err != nil {
+		t.Fatalf("AddUserMessage: %v", err)
+	}
+
+	var lastGen atomic.Uint64
+	child := &snapshotTestChild{id: "coder-subagent-2", sess: childSession}
+
+	snapshotTickOnce(child, childSession, &lastGen)
+	firstStat, err := os.Stat(childSession.HistoryPath)
+	if err != nil {
+		t.Fatalf("first tick never wrote the history file: %v", err)
+	}
+
+	// Unchanged: the skip must leave the file untouched.
+	snapshotTickOnce(child, childSession, &lastGen)
+	secondStat, err := os.Stat(childSession.HistoryPath)
+	if err != nil {
+		t.Fatalf("history file vanished: %v", err)
+	}
+	if !secondStat.ModTime().Equal(firstStat.ModTime()) {
+		t.Fatal("unchanged history was re-written by the skip tick (the O(history) snapshot ran anyway)")
+	}
+
+	// A real commit: the next tick carries it to disk.
+	if err := childSession.AddAssistantMessage("mid-turn work", ""); err != nil {
+		t.Fatalf("AddAssistantMessage: %v", err)
+	}
+	snapshotTickOnce(child, childSession, &lastGen)
+	loaded, err := session.LoadHistory(childSession.HistoryPath)
+	if err != nil {
+		t.Fatalf("LoadHistory: %v", err)
+	}
+	if len(loaded) != 2 || loaded[1].Content.String() != "mid-turn work" {
+		t.Fatalf("post-commit tick did not snapshot: %d messages", len(loaded))
+	}
 }
 
 // TestSubagentSnapshotTickerTickPersistsHistory pins the periodic snapshot:

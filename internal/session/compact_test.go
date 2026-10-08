@@ -1227,9 +1227,8 @@ func TestCompactContextHighWaterFreezesAcrossRuns(t *testing.T) {
 // at the persisted mark, and its own advance persists again.
 func TestCompactContextHighWaterPersistsAcrossSaveReload(t *testing.T) {
 	tmpDir := t.TempDir()
-	oldSessionDir := SessionDir
-	SessionDir = func() (string, error) { return tmpDir, nil }
-	defer func() { SessionDir = oldSessionDir }()
+	oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+	defer SetSessionDirOverrideForTest(oldSessionDir)
 
 	historyPath := filepath.Join(tmpDir, "session-hw.json")
 	fixture := defaultFixture()
@@ -1452,9 +1451,8 @@ func TestCompactContextMidWalkAbortKeepsHighWater(t *testing.T) {
 func TestCompactionHighWaterResetPaths(t *testing.T) {
 	t.Run("/new resets the mark to zero", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		defer func() { SessionDir = oldSessionDir }()
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		defer SetSessionDirOverrideForTest(oldSessionDir)
 
 		s := New(nil, filepath.Join(tmpDir, "session-hw-new.json"), defaultFixture(), "", false)
 		s.SetCompactionHighWater(12)
@@ -1472,9 +1470,8 @@ func TestCompactionHighWaterResetPaths(t *testing.T) {
 
 	t.Run("PopLastUserMessage clamps and persists the mark", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		oldSessionDir := SessionDir
-		SessionDir = func() (string, error) { return tmpDir, nil }
-		defer func() { SessionDir = oldSessionDir }()
+		oldSessionDir := SetSessionDirOverrideForTest(func() (string, error) { return tmpDir, nil })
+		defer SetSessionDirOverrideForTest(oldSessionDir)
 
 		historyPath := filepath.Join(tmpDir, "session-hw-pop.json")
 		fixture := []client.ChatMessage{

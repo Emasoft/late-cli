@@ -33,6 +33,12 @@ func childByID(children []common.Orchestrator, id string) common.Orchestrator {
 	return nil
 }
 
+// readOnlyRestoreDeps is the nil-equivalent deps the read-only restore tests
+// use: the restore falls back to the agent.RestoredSubagentOrchestrator
+// projection when the live machinery is unavailable (subagents disabled, or
+// a degraded record), so these tests pin that projection's behavior.
+func readOnlyRestoreDeps() *liveRestoreDeps { return nil }
+
 // TestRestoreInterruptedSubagentsListsOnlyInterrupted pins the Phase 3b
 // resume contract: interrupted (running-at-exit) manifest records re-enter
 // the TUI as read-only children of the root with their loaded histories;
@@ -77,7 +83,7 @@ func TestRestoreInterruptedSubagentsListsOnlyInterrupted(t *testing.T) {
 
 	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
 	restored := make(map[string]bool)
-	restoreInterruptedSubagents(root, manifest, restored)
+	restoreInterruptedSubagents(root, manifest, restored, readOnlyRestoreDeps())
 
 	children := root.Children()
 	if len(children) != 2 {
@@ -136,7 +142,7 @@ func TestRestoreInterruptedSubagentsStatusAndReadOnly(t *testing.T) {
 	}
 
 	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
-	restoreInterruptedSubagents(root, manifest, make(map[string]bool))
+	restoreInterruptedSubagents(root, manifest, make(map[string]bool), readOnlyRestoreDeps())
 
 	children := root.Children()
 	if len(children) != 1 {
@@ -186,7 +192,7 @@ func TestRestoreInterruptedSubagentsIdempotentAndTolerant(t *testing.T) {
 	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
 
 	restored := make(map[string]bool)
-	restoreInterruptedSubagents(root, manifest, restored)
+	restoreInterruptedSubagents(root, manifest, restored, readOnlyRestoreDeps())
 	if got := len(root.Children()); got != 0 {
 		t.Fatalf("record without a history path must not be listed, got %d children", got)
 	}
@@ -210,14 +216,14 @@ func TestRestoreInterruptedSubagentsIdempotentAndTolerant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSubagentManifest: %v", err)
 	}
-	restoreInterruptedSubagents(root, manifest, restored)
+	restoreInterruptedSubagents(root, manifest, restored, readOnlyRestoreDeps())
 	if got := len(root.Children()); got != 0 {
 		t.Fatalf("corrupt-history record must not be listed, got %d children", got)
 	}
 
 	// nil manifest / nil root are silent no-ops.
-	restoreInterruptedSubagents(root, nil, restored)
-	restoreInterruptedSubagents(nil, manifest, restored)
+	restoreInterruptedSubagents(root, nil, restored, nil)
+	restoreInterruptedSubagents(nil, manifest, restored, nil)
 }
 
 // TestRestoredSubagentStatusText pins the status-line rendering: the
@@ -229,5 +235,329 @@ func TestRestoredSubagentStatusText(t *testing.T) {
 	got := RestoredSubagentStatusText("crashed: boom")
 	if !strings.Contains(got, "restored") || !strings.Contains(got, "crashed: boom") {
 		t.Errorf("RestoredSubagentStatusText(cause) = %q, want wording + cause", got)
+	}
+}
+
+// a real scheduler against the sandboxed session, a client factory that
+// always routes to the given client, and the runEnv the launch machinery
+// reads. The messenger stays nil (no TUI in tests — the same convention the
+// in-process resume tests use).
+func liveRestoreTestDeps(root *orchestrator.BaseOrchestrator, sess *session.Session, sessionID string, scheduler *SubagentScheduler, c *client.Client) *liveRestoreDeps {
+	return &liveRestoreDeps{
+		root:          root,
+		sessionID:     sessionID,
+		sess:          sess,
+		scheduler:     scheduler,
+		clientFor:     func(string) *client.Client { return nil }, // nil routing → defaultClient
+		defaultClient: c,
+		enabledTools:  map[string]bool{"read_file": true},
+		injectCWD:     false,
+		gemmaThinking: false,
+		maxTurns:      10,
+		messenger:     nil,
+		runEnv: &subagentRunEnv{
+			pluginManager: nil,
+			messenger:     nil,
+			root:          root,
+			sess:          sess,
+			toolArchive:   "",
+		},
+		globalBudget: 0,
+	}
+}
+
+// TestRestoreInterruptedSubagentsLive pins the core fix: with the live
+// machinery available, an interrupted record restores as a LIVE child (the
+// concrete *orchestrator.BaseOrchestrator the resume constructor builds —
+// registry non-nil, Execute capable) mounted on the root, its loaded history
+// equal to the persisted one, its manifest record flipped back to running
+// through MarkResumed, and its background run actually executing against the
+// scripted LLM.
+func TestRestoreInterruptedSubagentsLive(t *testing.T) {
+	const sessionID = "session-restore-live-1"
+	const childID = "coder-subagent-0"
+	sess := runnerTestSession(t, sessionID)
+
+	historyPath, err := session.SubagentHistoryPath(sessionID, childID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := []client.ChatMessage{
+		{Role: "user", Content: client.TextContent("Goal: live restore me")},
+		{Role: "assistant", Content: client.TextContent("half done before the crash")},
+	}
+	if err := session.SaveHistory(historyPath, committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.SaveSubagentRecord(session.SubagentRecord{
+		ID: childID, AgentType: "coder", Goal: "live restore me",
+		Status:      session.SubagentStatusFrozen, // the synthesis's interrupted status
+		SpawnedAt:   nowMinus(t, time.Hour),
+		HistoryPath: historyPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The scripted LLM: the resumed child's first turn completes with
+	// content, so the run reaches a terminal outcome on its own.
+	fake := newFakeStreamServer(t, fakeScriptTurn("live-restored continuation"))
+	c := client.NewClient(client.Config{BaseURL: fake.srv.URL, Model: "test-model"})
+
+	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+	scheduler := newSubagentScheduler(sess, nil) // nil status writer: silent
+	deps := liveRestoreTestDeps(root, sess, sessionID, scheduler, c)
+
+	restored := make(map[string]bool)
+	restoreInterruptedSubagents(root, manifest, restored, deps)
+
+	if !restored[childID] {
+		t.Fatal("interrupted record not restored")
+	}
+	children := root.Children()
+	child := childByID(children, childID)
+	if child == nil {
+		t.Fatalf("restored child %s not mounted on the root; children = %v", childID, ids(children))
+	}
+	// LIVE, not a stub: a BaseOrchestrator with a working registry.
+	if _, isStub := child.(*agent.RestoredSubagentOrchestrator); isStub {
+		t.Fatal("restored child is the read-only stub — the live restore did not take over")
+	}
+	if _, ok := child.(*orchestrator.BaseOrchestrator); !ok {
+		t.Fatalf("restored child type = %T, want *orchestrator.BaseOrchestrator", child)
+	}
+	if child.Registry() == nil {
+		t.Error("live-restored child Registry() = nil, want the registered tool surface")
+	}
+	loaded := child.History()
+	if len(loaded) != len(committed) {
+		t.Fatalf("live-restored child loaded %d messages, want the %d persisted (no goal re-append)", len(loaded), len(committed))
+	}
+	for i := range committed {
+		if loaded[i].Content.String() != committed[i].Content.String() || loaded[i].Role != committed[i].Role {
+			t.Errorf("loaded history[%d] = %s/%q, want %s/%q",
+				i, loaded[i].Role, loaded[i].Content.String(), committed[i].Role, committed[i].Content.String())
+		}
+	}
+	// The resume constructor's tab hint: "resumed from interruption".
+	if h, ok := child.(interface{ StatusHint() string }); !ok || h.StatusHint() != agent.RestoredResumedStatus {
+		got := ""
+		if h, ok := child.(interface{ StatusHint() string }); ok {
+			got = h.StatusHint()
+		}
+		t.Errorf("StatusHint() = %q, want %q", got, agent.RestoredResumedStatus)
+	}
+
+	// The manifest record flipped back to running (MarkResumed ran through
+	// the constructor) with the resume counted.
+	reloaded, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, ok := reloaded.Get(childID)
+	if !ok {
+		t.Fatal("record vanished after the live restore")
+	}
+	if rec.Status != session.SubagentStatusRunning {
+		t.Errorf("post-restore status = %q, want running (the relaunched run is live)", rec.Status)
+	}
+	if rec.ResumeCount != 1 {
+		t.Errorf("ResumeCount = %d, want 1", rec.ResumeCount)
+	}
+
+	// The background run executes: wait for the terminal manifest write the
+	// run closure performs (completed), then confirm new work appended to
+	// the SAME history file.
+	eventually(t, 10*time.Second, "restored child completes in the background", func() bool {
+		m, err := session.LoadSubagentManifest(sessionID)
+		if err != nil {
+			return false
+		}
+		r, ok := m.Get(childID)
+		return ok && r.Status == session.SubagentStatusCompleted
+	})
+	after, err := session.LoadHistory(historyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) <= len(committed) {
+		t.Fatalf("live-restored child appended nothing: %d messages, want > %d", len(after), len(committed))
+	}
+	for i := range committed {
+		if after[i].Content.String() != committed[i].Content.String() || after[i].Role != committed[i].Role {
+			t.Errorf("post-restore history[%d] drifted: %s/%q, want %s/%q",
+				i, after[i].Role, after[i].Content.String(), committed[i].Role, committed[i].Content.String())
+		}
+	}
+}
+
+// TestRestoreInterruptedSubagentsLiveRunningRecord covers the legacy-status
+// path: a record still "running" (a manifest written before the frozen field
+// existed, or a synthesis write that never landed) restores live too.
+func TestRestoreInterruptedSubagentsLiveRunningRecord(t *testing.T) {
+	const sessionID = "session-restore-live-2"
+	const childID = "coder-subagent-1"
+	sess := runnerTestSession(t, sessionID)
+
+	historyPath, err := session.SubagentHistoryPath(sessionID, childID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SaveHistory(historyPath, []client.ChatMessage{
+		{Role: "user", Content: client.TextContent("Goal: running-status restore")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.SaveSubagentRecord(session.SubagentRecord{
+		ID: childID, AgentType: "coder", Goal: "running-status restore",
+		Status:      session.SubagentStatusRunning, // raw at-exit state
+		SpawnedAt:   nowMinus(t, time.Hour),
+		HistoryPath: historyPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeStreamServer(t, fakeScriptTurn("continuation two"))
+	c := client.NewClient(client.Config{BaseURL: fake.srv.URL, Model: "test-model"})
+	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+	deps := liveRestoreTestDeps(root, sess, sessionID, newSubagentScheduler(sess, nil), c)
+
+	restored := make(map[string]bool)
+	restoreInterruptedSubagents(root, manifest, restored, deps)
+
+	if !restored[childID] {
+		t.Fatal("running-status record not restored")
+	}
+	child := childByID(root.Children(), childID)
+	if child == nil {
+		t.Fatal("live-restored child not mounted on the root")
+	}
+	if _, isStub := child.(*agent.RestoredSubagentOrchestrator); isStub {
+		t.Fatal("running-status record restored as the read-only stub")
+	}
+
+	// Submit continues the live child: no read-only refusal, the message
+	// lands in the child's session (queued or executed — either way it is
+	// accepted, which is the user-visible contract).
+	if err := child.Submit("continue the task", nil); err != nil {
+		t.Fatalf("Submit to the live-restored child failed: %v", err)
+	}
+
+	// The background run the restore launched must finish cleanly too.
+	eventually(t, 10*time.Second, "restored child completes in the background", func() bool {
+		m, err := session.LoadSubagentManifest(sessionID)
+		if err != nil {
+			return false
+		}
+		r, ok := m.Get(childID)
+		return ok && (r.Status == session.SubagentStatusCompleted || r.Status == session.SubagentStatusRunning)
+	})
+}
+
+// TestRestoreInterruptedSubagentsTerminalStaySkippedLive pins the status
+// filter: with the LIVE machinery present, terminal records are still
+// skipped — only interrupted records go live, and a completed record never
+// relaunches.
+func TestRestoreInterruptedSubagentsTerminalStaySkippedLive(t *testing.T) {
+	const sessionID = "session-restore-live-3"
+	sess := runnerTestSession(t, sessionID)
+	if err := sess.SaveSubagentRecord(session.SubagentRecord{
+		ID: "coder-subagent-2", AgentType: "coder", Goal: "done task",
+		Status: session.SubagentStatusCompleted, SpawnedAt: nowMinus(t, time.Hour),
+		ResultPreview: "finished",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeStreamServer(t, fakeScriptTurn("never asked for"))
+	c := client.NewClient(client.Config{BaseURL: fake.srv.URL, Model: "test-model"})
+	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+	deps := liveRestoreTestDeps(root, sess, sessionID, newSubagentScheduler(sess, nil), c)
+
+	restored := make(map[string]bool)
+	restoreInterruptedSubagents(root, manifest, restored, deps)
+
+	if restored["coder-subagent-2"] {
+		t.Error("terminal record must not be restored (live or otherwise)")
+	}
+	if got := len(root.Children()); got != 0 {
+		t.Errorf("root.Children() holds %d children, want 0", got)
+	}
+}
+
+// TestRestoreInterruptedSubagentsLiveFallsBackToStub pins the degradation:
+// when the live restore cannot proceed for a record (an empty history file —
+// nothing to restore), the read-only projection takes over so the child
+// stays visible in the TUI, and the record is not left half-relaunched.
+func TestRestoreInterruptedSubagentsLiveFallsBackToStub(t *testing.T) {
+	const sessionID = "session-restore-live-4"
+	const childID = "coder-subagent-4"
+	sess := runnerTestSession(t, sessionID)
+
+	historyPath, err := session.SubagentHistoryPath(sessionID, childID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SaveHistory(historyPath, nil); err != nil { // empty: nothing to restore
+		t.Fatal(err)
+	}
+	if err := sess.SaveSubagentRecord(session.SubagentRecord{
+		ID: childID, AgentType: "coder", Goal: "g",
+		Status:      session.SubagentStatusFrozen,
+		SpawnedAt:   nowMinus(t, time.Hour),
+		HistoryPath: historyPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeStreamServer(t, fakeScriptTurn("unused"))
+	c := client.NewClient(client.Config{BaseURL: fake.srv.URL, Model: "test-model"})
+	root := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
+	deps := liveRestoreTestDeps(root, sess, sessionID, newSubagentScheduler(sess, nil), c)
+
+	restored := make(map[string]bool)
+	restoreInterruptedSubagents(root, manifest, restored, deps)
+
+	if !restored[childID] {
+		t.Fatal("record not marked restored")
+	}
+	children := root.Children()
+	if len(children) != 1 {
+		t.Fatalf("root.Children() holds %d children, want the read-only fallback stub", len(children))
+	}
+	ro, ok := children[0].(*agent.RestoredSubagentOrchestrator)
+	if !ok {
+		t.Fatalf("restored child type = %T, want the read-only stub fallback", children[0])
+	}
+	if _, err := ro.Execute(""); err == nil {
+		t.Error("fallback stub Execute() must fail (read-only)")
+	}
+	// The record was not relaunched: no ResumeCount bump, still frozen.
+	reloaded, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, ok := reloaded.Get(childID)
+	if !ok {
+		t.Fatal("record vanished")
+	}
+	if rec.Status != session.SubagentStatusFrozen || rec.ResumeCount != 0 {
+		t.Errorf("record = status %q resumeCount %d, want untouched frozen/0 (no half-relaunch)",
+			rec.Status, rec.ResumeCount)
 	}
 }

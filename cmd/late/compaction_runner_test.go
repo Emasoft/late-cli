@@ -35,9 +35,8 @@ func compactionTestSession(t *testing.T, path string) *session.Session {
 	// never write into the real user sessions directory (t.TempDir paths
 	// keep everything inside the test sandbox).
 	sessionDir := t.TempDir()
-	originalSessionDir := session.SessionDir
-	session.SessionDir = func() (string, error) { return sessionDir, nil }
-	t.Cleanup(func() { session.SessionDir = originalSessionDir })
+	originalSessionDir := session.SetSessionDirOverrideForTest(func() (string, error) { return sessionDir, nil })
+	t.Cleanup(func() { session.SetSessionDirOverrideForTest(originalSessionDir) })
 	return session.New(nil, path, []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("Please analyze this build log.")},
 		// The compaction candidate: assistant content annotating a tool
