@@ -2,6 +2,8 @@
 
 Scope: the working tree at `a543383` (branch `local/full`) carrying two terminated agents' uncommitted work: the Phase-3 delta (live-resume of restored agents, freeze/unfreeze, crash-injection harness) plus possibly partial memory hardening. This pass verified, completed, gated, and committed it. Committed as one feat commit; report written before the push.
 
+Commit: `9302727` on `local/full`, pushed to origin. Report written before the push; see "Race fixes under the full `-race` gate" below for what the gate itself flushed out.
+
 Gates (all green at commit time):
 - `gofmt` — all touched files clean (three of the second agent's files needed formatting: `cmd/late/subagent_restore_test.go`, plus this pass's `cmd/late/subagent_crash_test.go` / `cmd/late/subagent_snapshot_test.go`).
 - `go build ./...` — OK. `go vet ./...` — OK (clean at `a543383`+delta; verified before and after this pass's edits).
@@ -40,6 +42,14 @@ Found already written and structurally complete; this pass ran it, hardened the 
 - **(c) RSS/heap self-observation**: every snapshot tick calls `logHeapUsageIfElevated` — `runtime.ReadMemStats` (fine at 5s cadence), and when `HeapInuse >= subagentHeapWarnBytes` (1.5 GiB, var so tests can lower it) logs a warning line to the critical errorlog naming the value, the threshold, and likely mitigations. Because OOM SIGKILLs run no handler, the tick before the kill is the only warning surface — this is the observable footprint of the memory-pressure death.
 - **(d) Tests:** `TestSnapshotTickOnceSkipsThenSnapshots` (first tick writes; unchanged tick leaves mtime byte-stable; a real commit is carried by the next tick — the skip is change-keyed, not a freeze); `TestSnapshotTickerWarnsOnHighHeap` (threshold lowered, temp errorlog installed via `SetErrorLog` with explicit restore, one tick → warning line present); `TestTranscriptStyledCacheCapped` (5000-message render: cache total ≤ cap, newest window retained, second render still content-complete and ≤ cap).
 - **Doc:** this report documents all four hardening areas; the ticker's doc comment explains the skip + heap-observation rationale; the cache cap's comment explains the budget and overflow semantics.
+
+## Race fixes under the full `-race` gate (discovered by the gate itself)
+
+The first full `-race` run failed in `cmd/late`, and fixing it properly flushed three real defects:
+
+1. **Scheduler nil-func panic (production code, would segfault a fresh spawn):** `startLocked` called `entry.childSource()` unguarded, but `Launch()` (used by the unit tests and any caller not passing an orchestrator accessor) builds entries with a nil `childSource` — nil-func call = panic. Now guarded; the "nil-func tolerated" doc is finally true.
+2. **Stream idle-timeout knob race (production code):** `defaultStreamIdleTimeout` was a plain `time.Duration` var; a test's `SetStreamIdleTimeout` restore raced the atomic watchdog read of an in-flight stream from ANOTHER test (per-request joins cannot order cross-request readers). Converted to `atomic.Int64` (`streamIdleTimeout`), read once per request. Setters/getters unchanged.
+3. **`session.SessionDir` override race:** the package-var function was swapped by test cleanups while background children resolved it on their own goroutines. Replaced by `SessionDir()` + mutex-guarded `SetSessionDirOverrideForTest(fn) (previous)`; all ~30 override sites across `cmd/late`, `internal/{agent,executor,orchestrator,session,tui}` converted, restoring via `t.Cleanup` (helper-return `defer` was the second bug this conversion briefly introduced and the session-package failures caught).
 
 ## Caveats / notes for the record
 
