@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"late/internal/agent"
@@ -296,6 +299,14 @@ func restoreInterruptedSubagentLive(deps *liveRestoreDeps, rec *session.Subagent
 		return false
 	}
 
+	// Perfect resume (tool-call spool): surface the shell-call transcripts
+	// the previous exit left in the shared tool-outputs dir as harness notes
+	// in the child's LOADED history, so its first resumed turn reads the
+	// partial output of its interrupted calls instead of blindly retrying.
+	// Runs before the background relaunch, i.e. before the child's next
+	// request is ever rendered.
+	synthesizeSpoolTranscriptNotes(child, spoolDirForHistoryPath(rec.HistoryPath))
+
 	// Status surface: the resumed child's TUI tab seeds with "resumed from
 	// interruption" (agent.RestoredResumedStatus) when first focused, and
 	// the run's own status takes over from the first turn.
@@ -474,4 +485,92 @@ func danglingSubagentInterruptedText(id, agentType, historyPath, transcriptPath 
 	}
 	text += fmt.Sprintf(". To resume it exactly where it stopped, call the spawn_subagent tool with {\"resume\": \"%s\"} (all other parameters are ignored; the agent restores with its complete history and continues its task). Do NOT re-state the goal or spawn a new agent for this work unless resume fails.", id)
 	return text
+}
+
+// spoolResumeNote is the model-facing wording injected into a restored
+// child's history for every shell-call transcript the previous exit left
+// behind. It reuses the live failure wording (the same sentence a still-
+// running session sees from ShellTool.Execute) anchored to this process's
+// exit: the call was interrupted, its partial output survived on disk, and
+// reading it is how the child decides between continuing and retrying.
+const spoolResumeNote = "tool call failed: interrupted by a previous late exit. " +
+	"The transcript of its execution was preserved here — read it to decide whether to retry the tool call: %s"
+
+// orphanedSpoolTranscripts lists the shell-call transcripts the previous
+// exit left in dir: partial-*.txt files, ordered by name (call IDs embed
+// Unix-nano start times, so name order is chronological). A missing or
+// unreadable dir yields nil — spooling is fail-open end to end.
+func orphanedSpoolTranscripts(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "partial-*.txt"))
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	sort.Strings(matches)
+	return matches
+}
+
+// consumeSpoolTranscript marks one transcript consumed by renaming it to
+// <name>.consumed — same-directory, same filesystem, atomic. A benign
+// no-op on failure: a consumed marker that failed to stick only means the
+// next resume would re-surface the same transcript.
+func consumeSpoolTranscript(path string) {
+	_ = os.Rename(path, path+".consumed")
+}
+
+// synthesizeSpoolTranscriptNotes injects one note per orphaned shell-call
+// transcript into the child's LOADED history, before its first turn runs:
+// the restored model reads what its interrupted call actually printed and
+// decides whether to retry it. Files are consumed by renaming to
+// .consumed, so exactly one resume ever surfaces a given transcript.
+//
+// Message shape: a plain USER message carrying the [late harness] prefix —
+// the same attribution every other harness-injected history note uses (see
+// the executor's coder failure note). NOT a role-"tool" message: without a
+// ToolCallID matching an assistant tool_call in the loaded history,
+// SanitizeForRequest would drop it as a dangling tool result before the
+// request ever left the process.
+func synthesizeSpoolTranscriptNotes(child common.Orchestrator, spoolDir string) int {
+	if child == nil || spoolDir == "" {
+		return 0
+	}
+	base, ok := child.(*orchestrator.BaseOrchestrator)
+	if !ok || base == nil {
+		return 0
+	}
+	sess := base.Session()
+	if sess == nil {
+		return 0
+	}
+	orphans := orphanedSpoolTranscripts(spoolDir)
+	if len(orphans) == 0 {
+		return 0
+	}
+	noted := 0
+	for _, path := range orphans {
+		note := "[late harness] " + fmt.Sprintf(spoolResumeNote, path)
+		if err := sess.AddMessage(client.ChatMessage{Role: "user", Content: client.TextContent(note)}); err != nil {
+			common.LogErrorf("subagent-restore", "failed to append spool note for %s to child %s history: %v", path, child.ID(), err)
+			continue
+		}
+		consumeSpoolTranscript(path)
+		noted++
+	}
+	if noted > 0 {
+		common.LogErrorf("subagent-restore", "resume injected %d preserved shell-call transcript(s) into subagent %s history", noted, child.ID())
+	}
+	return noted
+}
+
+// spoolDirForHistoryPath maps a child's persisted history path to the
+// shared spool directory: every artifact of one session lives in one
+// tool-outputs folder — <dir-of-history>/../tool-outputs. Empty (in-memory
+// sessions, disabled persistence) disables the synthesis.
+func spoolDirForHistoryPath(historyPath string) string {
+	if strings.TrimSpace(historyPath) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(historyPath), "..", "tool-outputs")
 }

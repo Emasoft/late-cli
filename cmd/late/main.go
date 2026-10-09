@@ -1031,6 +1031,12 @@ func main() {
 			// archive for every spawn so children archive their outputs
 			// even if the root install is ever made conditional.
 			executor.SetToolResultArchiver(arch)
+			// Shell-call spooling shares this directory: failed calls leave
+			// their partial transcript here as partial-<id>.txt for the
+			// resume synthesis to reference, and successful ones promote to
+			// the same content-addressed archive naming. Shared by the root
+			// agent and every subagent, like the archiver above.
+			tool.SetShellSpoolDir(toolArchive)
 		}
 	} else {
 		toolArchive = ""
@@ -2016,6 +2022,10 @@ func buildAndWireChild(env *subagentRunEnv, child common.Orchestrator, cfg wireC
 		if arch, archErr := session.NewOutputArchive(env.toolArchive); archErr == nil {
 			executor.SetToolResultArchiver(arch)
 		}
+		// The child's shell calls spool into the same shared directory (the
+		// root install already pointed it here; re-installing keeps children
+		// independent of install ordering, mirroring the archive above).
+		tool.SetShellSpoolDir(env.toolArchive)
 	}
 
 	// Retrieval read side (Step 17): children get the same per-turn

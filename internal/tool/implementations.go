@@ -409,6 +409,13 @@ func ResolveShellExecCwd(ctx context.Context, cwdParam string) (string, error) {
 	return filepath.Clean(cwd), nil
 }
 
+// Execute runs one shell command. On success it returns the (possibly
+// truncated) combined output; on failure a failure-shaped result string.
+// Failures additionally carry — when shell spooling is wired
+// (SetShellSpoolDir at startup, the session's tool-outputs dir) — a retry
+// pointer to the on-disk transcript of what the command actually printed
+// before it was killed, so a resumed session can read the partial work
+// instead of blindly retrying (perfect resume).
 func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Command string `json:"command"`
@@ -468,13 +475,20 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	cmd := newShellCommand(execCtx, params.Command)
 	cmd.Dir = execCwd
 
-	output, err := cmd.CombinedOutput()
+	// Spool the captured output while it streams (perfect resume): every
+	// chunk teed here reaches disk before the command can be killed, so a
+	// cancelled/timeout/killed call leaves a readable partial transcript.
+	spool := startShellSpool(shellSpoolDir)
+	output, err := runShellCapturing(cmd, spool)
 
 	// The deadline fired and the process group was killed: report the timeout
 	// plus whatever output made it out before the kill. Explicit cancellation
 	// (context.Canceled) keeps flowing through the normal error path below.
+	// The spool retry pointer rides in the error's message: ExecuteToolCalls
+	// surfaces it as "Error executing tool bash: <message>".
 	if err != nil && execCtx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out after %s and was killed (partial output):\n%s", effectiveTimeout, string(output))
+		timeoutMsg := fmt.Sprintf("command timed out after %s and was killed (partial output):\n%s", effectiveTimeout, string(output))
+		return "", errors.New(timeoutMsg + spoolFailureNote(spool, fmt.Sprintf("command timed out after %s and was killed", effectiveTimeout)))
 	}
 
 	// The kill-after-start race: exec.Cmd.Start hands process-group setup to a
@@ -493,7 +507,7 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err != nil && execCtx.Err() != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) && !errors.Is(err, exec.ErrNotFound) && !errors.Is(err, exec.ErrDot) {
-			return fmt.Sprintf("Error executing command: killed by cancellation before start (%v)\n%s", err, string(output)), nil
+			return fmt.Sprintf("Error executing command: killed by cancellation before start (%v)\n%s", err, string(output)) + spoolFailureNote(spool, fmt.Sprintf("killed by cancellation before start (%v)", err)), nil
 		}
 	}
 
@@ -508,6 +522,7 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	// Check for binary output
 	if IsBinary(output) {
+		finishSpoolSuccess(spool)
 		return "(binary output detected)", nil
 	}
 
@@ -534,11 +549,12 @@ func (t ShellTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("Command failed with exit code %d\n%s", exitErr.ExitCode(), finalOutput), nil
+			return fmt.Sprintf("Command failed with exit code %d\n%s", exitErr.ExitCode(), finalOutput) + spoolFailureNote(spool, fmt.Sprintf("command exited with code %d", exitErr.ExitCode())), nil
 		}
-		return fmt.Sprintf("Error executing command: %v\n%s", err, finalOutput), nil
+		return fmt.Sprintf("Error executing command: %v\n%s", err, finalOutput) + spoolFailureNote(spool, err.Error()), nil
 	}
 
+	finishSpoolSuccess(spool)
 	return finalOutput, nil
 }
 
