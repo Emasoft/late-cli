@@ -196,6 +196,7 @@ type Model struct {
 	ToastMessage    string
 	ToastExpireTime int64
 	ToastWarning    bool
+	QuitArmedUntil  int64
 	BootstrapStatus string
 
 	// Model and config info (set from main.go after creation)

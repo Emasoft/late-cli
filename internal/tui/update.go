@@ -189,8 +189,28 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 
 	// Global Key Handling (Ctrl+C, Ctrl+D)
 	if msg, ok := msg.(tea.KeyMsg); ok {
-		if msg.String() == "ctrl+c" || msg.String() == "ctrl+d" {
+		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if msg.String() == "ctrl+d" {
+			if m.Mode == ViewChat && m.Input.Value() != "" {
+				m.QuitArmedUntil = 0
+			} else {
+				now := time.Now().UnixMilli()
+				if now < m.QuitArmedUntil {
+					return m, tea.Quit
+				}
+				m.QuitArmedUntil = now + 2000
+				m.ToastMessage = "Press Ctrl+D again to exit"
+				m.ToastWarning = false
+				m.ToastExpireTime = now + 2000
+				m.updateViewport()
+				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+					return clearToastMsg{}
+				})
+			}
+		} else {
+			m.QuitArmedUntil = 0
 		}
 		if msg.String() == "ctrl+o" {
 			if m.RunningPluginAction != "" {
