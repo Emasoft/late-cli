@@ -246,6 +246,22 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			m.TodoPaneFocused = !m.TodoPaneFocused
 			return m, nil
 		}
+		if msg.String() == "ctrl+r" && m.Mode == ViewChat && !m.EscConfirmPending && !m.ShowFilePicker {
+			m.ShowToolOutput = !m.ShowToolOutput
+			for _, s := range m.AgentStates {
+				s.ToggledTools = nil
+			}
+			m.ToastMessage = "tool output collapsed"
+			if m.ShowToolOutput {
+				m.ToastMessage = "tool output expanded"
+			}
+			m.ToastWarning = false
+			m.ToastExpireTime = time.Now().UnixMilli() + 2000
+			m.updateViewport()
+			return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+				return clearToastMsg{}
+			})
+		}
 	}
 	if _, ok := msg.(tea.PasteMsg); ok && m.RunningPluginAction != "" {
 		return m, nil
@@ -600,6 +616,14 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 			mouseMsg := clickMsg.Mouse()
 			if mouseMsg.Button == tea.MouseLeft {
 				if mouseMsg.Y >= 0 && mouseMsg.Y < m.Viewport.Height() {
+					// A click on a finished tool call's row expands or collapses it.
+					if m.Mode == ViewChat && !m.EscConfirmPending && !m.ShowFilePicker && !m.overTodoPane(mouseMsg.X) {
+						s := m.GetAgentState(m.Focused.ID())
+						if id, ok := s.Transcript.toolRows[s.Transcript.offset+mouseMsg.Y]; ok {
+							m.toggleToolDetail(s, id)
+							return m, nil
+						}
+					}
 					now := time.Now().UnixMilli()
 					if now-m.LastClickTime < 500 && m.LastClickX == mouseMsg.X && m.LastClickY == mouseMsg.Y {
 						m.LastClickTime = 0 // prevent triple click from double-triggering

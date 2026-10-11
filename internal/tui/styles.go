@@ -24,6 +24,10 @@ var (
 	borderColor  = lipgloss.Color("#1C1F26") // Hairline Divider
 	activeBorder = lipgloss.Color("#2D323E") // Focused / Active Border
 
+	// Diff row tints (tool approval previews)
+	diffAddBgColor = lipgloss.Color("#10241C") // Added line: emerald-tinted obsidian
+	diffDelBgColor = lipgloss.Color("#2A1519") // Removed line: coral-tinted obsidian
+
 	todoTitleColor = lipgloss.Color("#7D56F4") // Violet title of the todo pane
 
 	// Accents that are derived from the palette instead of being free-standing

@@ -31,6 +31,7 @@ type transcriptState struct {
 	welcome      bool
 	rows         []string
 	blocks       []RenderBlock
+	toolRows     map[int]string // first row of an expandable tool call -> its call id
 	cache        map[string][]string
 	fragments    map[string][]string
 	offset       int
@@ -54,13 +55,65 @@ type transcriptRenderedMsg struct {
 	theme        string
 	rows         []string
 	blocks       []RenderBlock
+	toolRows     map[int]string
 	cache        map[string][]string
 	fragments    map[string][]string
 }
 
 type transcriptLabel struct {
+	// rendered is the label's rows joined by newlines: one badge row, plus the
+	// detail rows when the call is expanded.
 	rendered string
 	activity string
+	// id is the tool call this label belongs to when a click on its first row
+	// should expand or collapse it; empty for labels that cannot expand.
+	id string
+}
+
+// height is the number of rows the label occupies.
+func (l transcriptLabel) height() int { return strings.Count(l.rendered, "\n") + 1 }
+
+// toolExpanded reports whether the detail of a finished tool call is shown:
+// the global setting, flipped for calls the user toggled individually.
+func (m *Model) toolExpanded(s *AppState, id string) bool {
+	return m.ShowToolOutput != s.ToggledTools[id]
+}
+
+// toolResultsAfter collects the results of the tool calls made by history[i]:
+// tool messages follow their assistant message directly.
+func toolResultsAfter(history []client.ChatMessage, i int) map[string]string {
+	var results map[string]string
+	for _, h := range history[i+1:] {
+		if h.Role != "tool" {
+			break
+		}
+		if results == nil {
+			results = make(map[string]string)
+		}
+		results[h.ToolCallID] = h.Content.String()
+	}
+	return results
+}
+
+// toolDetail returns the rows shown under an expanded tool call.
+func (m *Model) toolDetail(tc client.ToolCall, result string, width int) []string {
+	if tc.Function.Name != "spawn_subagent" {
+		return toolDetailRows(tc.Function.Name, tc.Function.Arguments, result, width)
+	}
+	// A subagent's report is Markdown; render it once per theme and width.
+	inner := max(10, width-toolDetailLead)
+	key := fmt.Sprintf("%s|%d|%s", m.SelectedTheme, inner, tc.ID)
+	rendered, ok := m.reportCache[key]
+	if !ok {
+		rendered = m.renderMarkdownBlock(result, inner)
+		if len(m.reportCache) >= 64 {
+			clear(m.reportCache)
+		}
+		if m.reportCache != nil {
+			m.reportCache[key] = rendered
+		}
+	}
+	return reportDetailRows(rendered, width)
 }
 
 type transcriptEntry struct {
@@ -249,6 +302,7 @@ func (m *Model) applyTranscript(result transcriptRenderedMsg) {
 	t.fragments = result.fragments
 	t.thinking, t.thinkingLine = result.thinking, result.thinkingLine
 	t.activities = result.activities
+	t.toolRows = result.toolRows
 	t.width, t.theme = result.width, result.theme
 	t.offset = min(t.offset, max(0, len(t.rows)-m.Viewport.Height()))
 	s.RenderBlocks = result.blocks
@@ -321,6 +375,10 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		isLatestAssistant := (i == len(history)-1) || (i == len(history)-2 && history[len(history)-1].Role == "tool")
 		calls := msg.ToolCalls
 		labels := make([]transcriptLabel, 0, len(calls))
+		var results map[string]string
+		if len(calls) > 0 {
+			results = toolResultsAfter(history, i)
+		}
 		for _, tc := range calls {
 			label := tc.Function.Name
 			if registry := m.Focused.Registry(); registry != nil {
@@ -328,24 +386,25 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 					label = tool.CallString([]byte(tc.Function.Arguments))
 				}
 			}
+			result, hasResult := results[tc.ID]
 			isActive := false
-			if isLatestAssistant && (s.State == StateThinking || s.State == StateStreaming) {
-				hasResult := false
-				for _, h := range history[i+1:] {
-					if h.Role == "tool" && h.ToolCallID == tc.ID {
-						hasResult = true
-						break
-					}
-				}
-				if !hasResult {
-					isActive = true
-					hasActiveTool = true
-				}
+			if isLatestAssistant && (s.State == StateThinking || s.State == StateStreaming) && !hasResult {
+				isActive = true
+				hasActiveTool = true
 			}
 			item := transcriptLabel{rendered: m.renderToolBadge(tc.Function.Name, label, false, toolWidth)}
-			if isActive {
+			switch {
+			case isActive:
 				item.activity = toolBadgeText(tc.Function.Name, label) + " · running"
 				item.rendered = m.renderActivityAt(item.activity, toolWidth, time.Unix(0, 0))
+			case hasResult:
+				outcome := summarizeToolOutcome(tc.Function.Name, tc.Function.Arguments, result)
+				expanded := m.toolExpanded(s, tc.ID)
+				item.id = tc.ID
+				item.rendered = toolBadgeWithOutcome(label, outcome, expanded, toolWidth)
+				if expanded {
+					item.rendered += "\n" + strings.Join(m.toolDetail(tc, result, toolWidth), "\n")
+				}
 			}
 			labels = append(labels, item)
 		}
@@ -415,7 +474,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		var renderer *glamour.TermRenderer
 		var rendererErr error
 		initialized := false
-		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
+		result := transcriptRenderedMsg{activities: make(map[int]string), toolRows: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if !initialized {
 				renderer, rendererErr = glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
@@ -526,9 +585,18 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 				result.activities[start] = "thinking..."
 			}
 			if len(entry.labels) > 0 {
-				for j, label := range entry.labels {
-					if label.activity != "" {
-						result.activities[start+len(rows)-1-len(entry.labels)+j] = label.activity
+				// The labels are the last rows of the entry, followed by one
+				// spacer row. Walk back from there: expanded labels span several
+				// rows, so each label's first row is found by subtracting the
+				// heights of the labels after it.
+				row := start + len(rows) - 1
+				for j := len(entry.labels) - 1; j >= 0; j-- {
+					row -= entry.labels[j].height()
+					if entry.labels[j].activity != "" {
+						result.activities[row] = entry.labels[j].activity
+					}
+					if entry.labels[j].id != "" {
+						result.toolRows[row] = entry.labels[j].id
 					}
 				}
 			}

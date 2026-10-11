@@ -152,6 +152,10 @@ type AppState struct {
 	// status as a silent safety net; recovery is announced separately by
 	// the dedicated RecoveryEvent. Empty means the agent is not retrying.
 	RetryVerb string
+
+	// ToggledTools holds the tool calls whose expansion differs from the
+	// global ShowToolOutput setting; a click on a call's row flips its entry.
+	ToggledTools map[string]bool
 }
 
 type Model struct {
@@ -207,6 +211,12 @@ type Model struct {
 	CWD          string // Current working directory, shown in status bar
 	ShowCWD      bool   // Whether to show current working directory in status bar
 	GitBranch    string // Current git branch name, if in a git repo
+
+	// ShowToolOutput expands the detail of every finished tool call (ctrl+r).
+	ShowToolOutput bool
+	// reportCache holds Markdown-rendered subagent reports, which are costly to
+	// rebuild on every transcript frame. It is keyed by theme, width and call.
+	reportCache map[string]string
 
 	// Configuration
 	AppConfig              *config.Config

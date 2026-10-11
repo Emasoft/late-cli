@@ -834,6 +834,8 @@ func (m *Model) updateViewport() {
 ### Attachments & Tools
   **ctrl+o**          Toggle file / image attachment picker
   **ctrl+x**          Clear attached files
+  **ctrl+r**          Expand / collapse all tool output
+  **click**           Click a tool call to expand or collapse it
   **ctrl+g** / **esc** Interrupt / stop active agent
 
 ### Slash Commands

@@ -148,6 +148,7 @@ The essentials:
 | ------------------- | ---------------------------------------------------- |
 | `Tab`               | Switch between the orchestrator and active subagents |
 | `Ctrl+O`            | Attach a file                                        |
+| `Ctrl+R` / click    | Expand or collapse tool output (all / one call)      |
 | `Esc` / `Ctrl+G`    | Stop the currently running agent                     |
 | `/model`            | Change orchestrator or worker models                 |
 | `/rewind`           | Rewind to an earlier point in the conversation       |
@@ -158,6 +159,8 @@ The essentials:
 Type `/` at any time to open the command picker, and `@` anywhere in your prompt to pick a project file by name (fuzzy, `Tab`/`Enter` to insert; files ignored by `.gitignore`/`.llmignore` are not offered).
 
 When Late creates subagents, each appears in its own tab while it works and disappears after completing its task.
+
+Every finished tool call shows its outcome on the same row: `✓ +3 -1` for an edit, `✗ exit 1 · FAIL` for a failing command, `⊘ denied` for a call you refused. Click a row (or press `Ctrl+R` for all of them) to see the detail behind it: the diff of an edit, the output of a command, or a subagent's full report. Subagent tabs close when the subagent finishes, but its report stays reachable this way in the orchestrator's transcript.
 
 ---
 

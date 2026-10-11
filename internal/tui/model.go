@@ -97,6 +97,7 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		GitBranch:           git.CurrentBranch(cwd),
 		cachedRendererWidth: -1, // Force first creation
 		Pastes:              make(map[string]string),
+		reportCache:         make(map[string]string),
 		AppConfig:           cfg,
 		SelectedTheme:       "default",
 		activeThemeStyles:   LateTheme,
