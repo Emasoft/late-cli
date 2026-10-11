@@ -698,6 +698,7 @@ func (m *Model) statusBarView() string {
 	}
 
 	rightSection := strings.Join(rightItems, "  ")
+	rightSection = m.withWorkerTokens(rightSection, lipgloss.Width(leftSection), max(w-2, 1))
 
 	// Layout spacing
 	usableW := w - 2
