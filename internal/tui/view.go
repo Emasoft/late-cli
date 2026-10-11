@@ -600,7 +600,7 @@ func (m *Model) statusBarView() string {
 		statePart = m.renderMinimalEqualizer()
 	case StateConfirmTool:
 		statePart = m.renderIdleEqualizer()
-		statusText = "authorize execution (y/s/p/g/n)"
+		statusText = "authorize execution (y/s/p/g/n) · or type a reply to deny"
 	default:
 		if m.BootstrapStatus != "" {
 			statePart = m.renderScannerTrack("✦", primaryColor)

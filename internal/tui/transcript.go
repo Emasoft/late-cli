@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"late/internal/client"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -123,6 +122,10 @@ type transcriptEntry struct {
 	content   string
 	reasoning string
 	labels    []transcriptLabel
+	// raw is a block that is already styled and wrapped for the box it is
+	// drawn in. It follows the Markdown rendering of content in "approval"
+	// entries.
+	raw string
 }
 
 const (
@@ -139,6 +142,25 @@ func assistantReplyStyle(width int) lipgloss.Style {
 
 func assistantReplyContentWidth(width int) int {
 	return max(1, width-assistantReplyPadding*2)
+}
+
+// noticeBoxStyle is the bordered box notices and approval prompts are drawn in.
+func noticeBoxStyle() lipgloss.Style {
+	return aiMsgStyle.MarginLeft(1).Border(boxBorderStyle).BorderForeground(warningColor)
+}
+
+// approvalBoxStyle is the notice box with a one-column inset, so a diff or a
+// command does not sit hard against the border.
+func approvalBoxStyle() lipgloss.Style {
+	return noticeBoxStyle().Padding(0, 1)
+}
+
+// approvalInnerWidth is the number of columns of text that fit inside the
+// approval box when the transcript is width columns wide. The box is sized to
+// width minus its frame, and that size already includes the border and padding.
+func approvalInnerWidth(width int) int {
+	style := approvalBoxStyle()
+	return max(1, width-style.GetHorizontalFrameSize()-style.GetHorizontalBorderSize()-style.GetHorizontalPadding())
 }
 
 func thoughtBodyStyle(width int) lipgloss.Style {
@@ -434,12 +456,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 	}
 	if s.State == StateConfirmTool && s.PendingConfirm != nil {
-		tc := s.PendingConfirm.ToolCall
-		name := tc.Function.Name
-		if runtime.GOOS == "windows" && name == "bash" {
-			name = "PowerShell"
+		preview := s.PendingConfirm.preview
+		if preview == nil {
+			preview = buildApprovalPreview(s.PendingConfirm.ToolCall)
 		}
-		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: fmt.Sprintf("The agent wants to execute **%s**.\n\n```json\n%s\n```\n\n**[y]** Allow once · **[s]** Session · **[p]** Project · **[g]** Global · **[n]** Deny", name, tc.Function.Arguments)})
+		maxRows := min(60, max(8, m.Viewport.Height()-14))
+		entries = append(entries, transcriptEntry{index: -1, role: "approval", content: preview.heading, raw: preview.render(approvalInnerWidth(width), maxRows)})
 	}
 	if s.State == StateContextWarning {
 		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: "**Context Limit Warning**\n\nOver 90% of the context is used. Press Enter again to proceed, or start a new session."})
@@ -463,7 +485,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	// Glamour renderer; only immutable strings and cached rows cross threads.
 	headerStyle := thoughtHeaderStyle
 	queueStyle := queuedMsgStyle
-	noticeStyle := aiMsgStyle.MarginLeft(1).Border(boxBorderStyle).BorderForeground(warningColor)
+	noticeStyle := noticeBoxStyle()
 	errorStyle := noticeStyle.BorderForeground(errorBorderColor)
 	bg := appBgColor
 	activityHeader := m.renderActivityAt("thinking...", toolWidth, time.Unix(0, 0))
@@ -491,7 +513,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		r := transcriptRowRenderer{width: width, background: bg, answer: answerStyle, thought: reasoningStyle, markdown: markdown, plainTheme: plainTheme, old: oldFragments, next: make(map[string][]string)}
 		for _, entry := range entries {
-			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels)
+			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.raw)
 			rows, ok := oldCache[key]
 			if ok && entry.active {
 				// An unchanged entry still owns its reusable rows. The maps are
@@ -559,6 +581,13 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						style = errorStyle
 					}
 					parts = append(parts, style.Width(max(1, width-style.GetHorizontalFrameSize())).Render(markdown(entry.content)))
+				case "approval":
+					body := strings.Trim(markdown(entry.content), "\r\n")
+					if entry.raw != "" {
+						body += "\n\n" + entry.raw
+					}
+					box := approvalBoxStyle()
+					parts = append(parts, box.Width(max(1, width-box.GetHorizontalFrameSize())).Render(body))
 				case "queued":
 					parts = append(parts, queueStyle.Width(max(1, width-queueStyle.GetHorizontalMargins())).Render(entry.content))
 				case "raw":

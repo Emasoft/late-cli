@@ -175,6 +175,10 @@ When prompted, you can approve:
 * for the current project;
 * globally.
 
+The prompt shows what is about to happen: the command and its working directory for shell commands, and a line-by-line diff (with line numbers) for file edits and writes. It also lists exactly what `s`, `p` and `g` would trust beyond this one call, for example `go test (flags: -race)`.
+
+To deny, press `n`. To deny *and tell the agent why*, type your reply and press `Enter`: the agent receives it together with the denial and can change course instead of guessing.
+
 Read-only operations are generally handled automatically.
 
 Approvals decay over time rather than becoming permanent trust forever.

@@ -1900,6 +1900,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 	case ConfirmRequestMsg:
 		s := m.GetAgentState(msg.OrchestratorID)
 		s.State = StateConfirmTool
+		msg.preview = buildApprovalPreview(msg.ToolCall)
 		s.PendingConfirm = &msg
 		m.updateViewport()
 		return m, nil
@@ -1955,6 +1956,13 @@ func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 	// another paste's placeholder token is never corrupted.
 	expandedInput := expandPastes(input, m.Pastes)
 
+	// While a tool approval is pending the agent is blocked on it, so a typed
+	// reply cannot be queued for later: it is the user's answer. Deny the call
+	// and hand the agent the reason instead of leaving the prompt unanswered.
+	if focusedState.State == StateConfirmTool && focusedState.PendingConfirm != nil {
+		return m.denyPendingWithReason(focusedState, expandedInput), nil
+	}
+
 	if m.MessageHook == nil {
 		// No plugin onMessageSend hooks registered — submit synchronously,
 		// unchanged from before hooks existed.
@@ -1993,6 +2001,25 @@ func (m Model) submitMessage(input string) (Model, tea.Cmd) {
 			submitted:     applyMessageHook(hook, expandedInput),
 		}
 	}
+}
+
+// denyPendingWithReason answers the focused agent's pending tool approval with
+// a denial that carries the user's own words, and clears the editor.
+func (m Model) denyPendingWithReason(state *AppState, reason string) Model {
+	state.PendingConfirm.ResultCh <- denyReasonPrefix + reason
+	state.PendingConfirm = nil
+	state.State = StateThinking
+
+	if len(m.InputHistory) == 0 || m.InputHistory[len(m.InputHistory)-1] != reason {
+		m.InputHistory = append(m.InputHistory, reason)
+	}
+	m.Pastes = make(map[string]string)
+	m.HistoryIndex = -1
+	m.HistoryWorking = ""
+	m.Input.Reset()
+	m.Input.SetValue("")
+	m.updateViewport()
+	return m
 }
 
 // finishSubmit performs the bookkeeping that follows a successful
