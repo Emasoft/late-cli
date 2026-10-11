@@ -158,7 +158,7 @@ func TestEnterCompletesIncompleteMentionThenSendsCompleteOne(t *testing.T) {
 	}
 
 	// With the path complete there is no dropdown any more: enter sends.
-	m, _ = press(t, m, mockKey{code: '\r', text: "enter"})
+	_, _ = press(t, m, mockKey{code: '\r', text: "enter"})
 	if orch.submitCount != 1 || orch.submittedText != "@cmd/late/main.go " {
 		t.Errorf("submit count=%d text=%q", orch.submitCount, orch.submittedText)
 	}
@@ -169,7 +169,7 @@ func TestEnterOnTypedFullPathSends(t *testing.T) {
 	m = loadIndex(t, m, sampleFiles...)
 	m = typeText(t, m, "@README.md")
 
-	m, _ = press(t, m, mockKey{code: '\r', text: "enter"})
+	_, _ = press(t, m, mockKey{code: '\r', text: "enter"})
 	if orch.submitCount != 1 || orch.submittedText != "@README.md" {
 		t.Errorf("a fully typed path must send as is: count=%d text=%q", orch.submitCount, orch.submittedText)
 	}
