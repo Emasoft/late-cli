@@ -230,6 +230,10 @@ func (m *Model) autocompleteView() string {
 	var lines []string
 	for i := start; i < end; i++ {
 		item := m.AutocompleteItems[i]
+		if m.AutocompleteKind == autocompleteFile {
+			lines = append(lines, fileSuggestionLine(item, m.autocompleteQuery, i == m.AutocompleteIndex, w-2))
+			continue
+		}
 		prefix := "  "
 		nameStyle := lipgloss.NewStyle().
 			Foreground(subtextColor).
@@ -820,6 +824,7 @@ func (m *Model) updateViewport() {
   **enter**           Submit prompt
   **alt+enter**       Insert newline into prompt
   **/compose**        Draft prompt in external $EDITOR
+  **@path**           Mention a project file (tab / enter completes)
 
 ### Attachments & Tools
   **ctrl+o**          Toggle file / image attachment picker

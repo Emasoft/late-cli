@@ -425,6 +425,29 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if msg, ok := msg.(fileIndexLoadedMsg); ok {
+		m.fileIdxLoading = false
+		if msg.root == m.projectRoot() {
+			m.fileIdx = newFileIndex(msg.root, msg.files)
+			m.updateAutocomplete()
+		}
+		return m, nil
+	}
+
+	// Tab and Enter complete the highlighted @file instead of moving the
+	// selection or submitting. Enter on an already-complete path still sends.
+	if key, ok := msg.(tea.KeyMsg); ok && m.ShowAutocomplete && m.AutocompleteKind == autocompleteFile && m.RunningPluginAction == "" {
+		switch key.String() {
+		case "tab":
+			return m.acceptFileCompletion(), nil
+		case "enter":
+			if query, _, ok := m.fileToken(); ok && m.AutocompleteIndex < len(m.AutocompleteItems) &&
+				m.AutocompleteItems[m.AutocompleteIndex].Name != "@"+quoteIfSpaced(query) {
+				return m.acceptFileCompletion(), nil
+			}
+		}
+	}
+
 	// Snapshot state before updateChat processes the key and potentially changes it
 	var stateBefore ValidationState
 	escBefore := false
@@ -512,6 +535,11 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 
 	// Update autocomplete state whenever the input changes
 	m.updateAutocomplete()
+	var fileIdxCmd tea.Cmd
+	if m.fileIndexNeeded() {
+		m.fileIdxLoading = true
+		fileIdxCmd = loadFileIndexCmd(m.projectRoot())
+	}
 
 	// Detect large pastes (input grew by > 50 chars in one update cycle)
 	currentLen := len(m.Input.Value())
@@ -668,7 +696,7 @@ func (m Model) updateInternal(msg tea.Msg) (Model, tea.Cmd) {
 		}
 	}
 
-	return m, tea.Batch(cmd, tiCmd, vpCmd, spCmd, fpCmd)
+	return m, tea.Batch(cmd, tiCmd, vpCmd, spCmd, fpCmd, fileIdxCmd)
 }
 
 func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
@@ -998,7 +1026,8 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m = m.acceptAutocomplete()
 				// Fall through to normal "enter" handling for submission
 			case "esc":
-				m.ShowAutocomplete = false
+				m.autocompleteDismissed = m.currentAutocompleteTrigger()
+				m.closeAutocomplete()
 				return m, nil
 			}
 		}
@@ -1965,10 +1994,21 @@ func (m *Model) updateLayout() {
 // updateAutocomplete checks if the input looks like a slash command and updates
 // the autocomplete dropdown items.
 func (m *Model) updateAutocomplete() {
+	// An @-mention at the cursor takes precedence: it can appear anywhere in
+	// the prompt, while slash commands only exist at its very start.
+	if m.updateFileAutocomplete() {
+		return
+	}
+
 	input := m.Input.Value()
 
 	// Only show autocomplete when input starts with "/" and has no space yet
 	if strings.HasPrefix(input, "/") && !strings.Contains(input, " ") {
+		if m.autocompleteDismissed == input {
+			m.closeAutocomplete()
+			return
+		}
+		m.autocompleteDismissed = ""
 		prefix := strings.ToLower(input)
 		var matches []CommandDef
 		for _, cmd := range AvailableCommands {
@@ -1993,7 +2033,12 @@ func (m *Model) updateAutocomplete() {
 			sort.Slice(matches, func(i, j int) bool {
 				return strings.ToLower(matches[i].Name) < strings.ToLower(matches[j].Name)
 			})
+			if m.AutocompleteKind != autocompleteCommand {
+				m.AutocompleteIndex = 0
+				m.AutocompleteOffset = 0
+			}
 			m.ShowAutocomplete = true
+			m.AutocompleteKind = autocompleteCommand
 			m.AutocompleteItems = matches
 			if m.AutocompleteIndex >= len(matches) {
 				m.AutocompleteIndex = 0
@@ -2003,14 +2048,27 @@ func (m *Model) updateAutocomplete() {
 		}
 	}
 
-	m.ShowAutocomplete = false
-	m.AutocompleteItems = nil
-	m.AutocompleteIndex = 0
-	m.AutocompleteOffset = 0
+	m.autocompleteDismissed = ""
+	m.closeAutocomplete()
+}
+
+// currentAutocompleteTrigger identifies what the open dropdown is completing,
+// so an esc can keep it closed until the user types something different.
+func (m Model) currentAutocompleteTrigger() string {
+	if query, _, ok := m.fileToken(); ok {
+		return "@" + query
+	}
+	return m.Input.Value()
 }
 
 // acceptAutocomplete replaces the current input with the selected command.
 func (m Model) acceptAutocomplete() Model {
+	if m.AutocompleteKind == autocompleteFile {
+		// Reached only when the mention is already complete (Enter on a
+		// finished path): close the list and let the message be submitted.
+		m.closeAutocomplete()
+		return m
+	}
 	if m.AutocompleteIndex >= 0 && m.AutocompleteIndex < len(m.AutocompleteItems) {
 		selected := m.AutocompleteItems[m.AutocompleteIndex].Name
 		m.Input.SetValue(selected + " ")

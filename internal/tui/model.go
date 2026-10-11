@@ -19,7 +19,7 @@ import (
 
 func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *config.Config) Model {
 	ti := textarea.New()
-	ti.Placeholder = "Ask Late to build, refactor, search, run bash... (Type / for commands)"
+	ti.Placeholder = "Ask Late to build, refactor, search, run bash... (/ commands, @ files)"
 	ti.Focus()
 	ti.CharLimit = 100000 // Allow pasting large code blocks
 	ti.SetWidth(72)

@@ -243,6 +243,14 @@ type Model struct {
 	AutocompleteItems  []CommandDef
 	AutocompleteIndex  int
 	AutocompleteOffset int
+	AutocompleteKind   autocompleteKind
+
+	// @file completion state (see filecomplete.go).
+	autocompleteQuery     string     // file query the open dropdown was ranked for
+	autocompleteSig       string     // query + index generation, to skip redundant re-ranking
+	autocompleteDismissed string     // trigger the user closed with esc; stays closed until it changes
+	fileIdx               *fileIndex // project files for @ completion; nil until the first scan lands
+	fileIdxLoading        bool
 
 	// Plugin-provided slash commands (registered at startup from plugins)
 	PluginCommands []string // each entry should include leading slash, e.g. "/query"
