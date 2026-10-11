@@ -311,10 +311,10 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 	onEndTurn := func() {
 		o.RefreshContextSize(ctx)
 		o.mu.Lock()
-		usage := o.acc.Usage
+		usage, timings := o.acc.Usage, o.acc.Timings
 		o.acc.Reset()
 		o.mu.Unlock()
-		o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true}
+		o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true, Timings: timings}
 	}
 
 	res, err := executor.RunLoop(
@@ -336,6 +336,8 @@ func (o *BaseOrchestrator) Execute(text string) (string, error) {
 				ReasoningContent: accCopy.Reasoning,
 				ToolCalls:        accCopy.ToolCalls,
 				Usage:            accCopy.Usage,
+				Timings:          accCopy.Timings,
+				Progress:         accCopy.Progress,
 			}
 		},
 		func(ev common.RetryEvent) {
@@ -435,10 +437,10 @@ func (o *BaseOrchestrator) run() {
 		onEndTurn := func() {
 			o.RefreshContextSize(ctx)
 			o.mu.Lock()
-			usage := o.acc.Usage
+			usage, timings := o.acc.Usage, o.acc.Timings
 			o.acc.Reset()
 			o.mu.Unlock()
-			o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true}
+			o.eventCh <- common.ContentEvent{ID: o.id, Usage: usage, Completed: true, Timings: timings}
 		}
 
 		// Build extra body
@@ -463,6 +465,8 @@ func (o *BaseOrchestrator) run() {
 					ReasoningContent: accCopy.Reasoning,
 					ToolCalls:        accCopy.ToolCalls,
 					Usage:            accCopy.Usage,
+					Timings:          accCopy.Timings,
+					Progress:         accCopy.Progress,
 				}
 			},
 			func(ev common.RetryEvent) {

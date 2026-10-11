@@ -116,7 +116,8 @@ type AppState struct {
 	TokenCount           int      // Estimated token count for current streaming content
 	CumulativeTokenCount int      // Total tokens accumulated across entire session (all messages)
 	Usage                client.Usage
-	LastRenderTime       int64 // Unix milliseconds of the last render during streaming
+	Perf                 perfState // inference speed of the current or last model call
+	LastRenderTime       int64     // Unix milliseconds of the last render during streaming
 
 	// Streaming render cache: paragraph-chunked incremental rendering
 	StreamingStyledCache string // Fully assembled + styled output of all completed paragraphs

@@ -1626,6 +1626,12 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 
 		switch event := msg.Event.(type) {
 		case common.ContentEvent:
+			s.Perf.observe(event, time.Now())
+			if isPrefillOnly(event) {
+				// Only prompt-evaluation progress: nothing is streaming yet, so the
+				// agent stays in its "thinking" state.
+				return m, nil
+			}
 			if s.RetryVerb != "" {
 				s.StatusText = ""
 				if s.RetryVerb == retryVerbRejectedByAPI {
@@ -1678,6 +1684,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 		case common.StatusEvent:
 			switch event.Status {
 			case "thinking":
+				s.Perf.begin(time.Now())
 				s.Transcript.generation++
 				s.Transcript.busy = false
 				if s.State != StateConfirmTool {
@@ -1699,6 +1706,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				s.StreamingStyledCache = ""
 				s.StreamingChunkCount = 0
 			case "closed":
+				s.Perf.abort()
 				s.State = StateIdle
 				s.StatusText = "Closed"
 				s.Closed = true
@@ -1715,6 +1723,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			case "error":
+				s.Perf.abort()
 				s.State = StateIdle
 				if event.Error != nil && event.Error.Error() == "image_unsupported" {
 					s.StatusText = "Model does not support images"
@@ -1797,6 +1806,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				m.updateViewport()
 			}
 		case common.RecoveryEvent:
+			s.Perf.recovered(time.Now())
 			// The retried attempt actually produced a response — announce it
 			// immediately instead of guessing on the next turn's thinking
 			// event (which may never come before content streams).
@@ -1831,6 +1841,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 			s.StatusText = "Subagent spawned"
 			m.updateViewport()
 		case common.StopRequestedEvent:
+			s.Perf.abort()
 			s.Transcript.generation++
 			s.Transcript.busy = false
 			s.PendingStop = false

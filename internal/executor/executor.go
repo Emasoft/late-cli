@@ -27,6 +27,10 @@ type StreamAccumulator struct {
 	ToolCalls    []client.ToolCall
 	Usage        client.Usage
 	FinishReason string
+	// Timings and Progress hold the latest speed numbers the server sent for
+	// the current stream (llama.cpp); zero / nil when it sends none.
+	Timings  client.Timings
+	Progress *client.PromptProgress
 }
 
 // Append merges a single streaming delta into the accumulated state.
@@ -40,6 +44,12 @@ func (a *StreamAccumulator) Append(res common.StreamResult) {
 
 	if res.FinishReason != "" {
 		a.FinishReason = res.FinishReason
+	}
+	if res.Timings != (client.Timings{}) {
+		a.Timings = res.Timings
+	}
+	if res.Progress != nil {
+		a.Progress = res.Progress
 	}
 
 	for _, delta := range res.ToolCalls {
@@ -81,6 +91,8 @@ func (a *StreamAccumulator) Reset() {
 	a.Reasoning = ""
 	a.ToolCalls = nil
 	a.FinishReason = ""
+	a.Timings = client.Timings{}
+	a.Progress = nil
 }
 
 // --- Tool Execution ---

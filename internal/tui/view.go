@@ -692,6 +692,11 @@ func (m *Model) statusBarView() string {
 
 	// Right: Context, Attachments
 	var rightItems []string
+	if w >= perfMinWidth {
+		if chip := perfChip(&s.Perf, time.Now()); chip != "" {
+			rightItems = append(rightItems, chip)
+		}
+	}
 	maxTokens := m.Focused.MaxTokens()
 	if s.CumulativeTokenCount > 0 {
 		rightItems = append(rightItems, m.renderContextBar(s.CumulativeTokenCount, maxTokens))

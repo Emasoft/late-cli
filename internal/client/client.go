@@ -181,6 +181,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 		}
 
 		req.LogitBias = c.mergeLogitBias(req.LogitBias)
+		if c.getBackend() == BackendLlamaCPP {
+			req.ExtraBody = withLlamaTelemetry(req.ExtraBody)
+		}
 
 		body, err := c.marshalFlattened(req)
 		if err != nil {
@@ -677,6 +680,20 @@ func (c *Client) SupportsVision() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.cfg.EnableImages || c.supportsVision
+}
+
+// withLlamaTelemetry asks llama-server to report its own speed numbers on every
+// streamed chunk (timings) and its progress through the prompt (prompt_progress).
+// Only llama.cpp backends get these fields. Values the caller already set win,
+// and the caller's map is never modified.
+func withLlamaTelemetry(extra map[string]any) map[string]any {
+	out := make(map[string]any, len(extra)+2)
+	out["timings_per_token"] = true
+	out["return_progress"] = true
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 func (c *Client) marshalFlattened(req ChatCompletionRequest) ([]byte, error) {
