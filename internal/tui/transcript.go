@@ -596,15 +596,19 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 				case "tool":
 					// Tool results render their FULL output by default
 					// (the user directive: thinking and tool output must be
-					// shown, not hidden). One muted body row per source line
-					// is cached in the block cache like any other role, so
-					// large outputs cost one style pass and a growable slice
-					// copy, not a re-render per frame; the transcript still
-					// paginates via the viewport. /collapse folds these
-					// blocks to a one-line "tool output (N bytes)" summary
-					// carrying the answering call ID; /expand restores. The
-					// collapsed summary is cached under its own key so the
-					// full body never re-renders through the shared key.
+					// shown, not hidden). Body rows are soft-wrapped at the
+					// viewport width by toolBodyRows (word-aware, so long
+					// lines wrap instead of being hard-cut by padRow) and
+					// capped at maxToolBodyRows with an explicit tail hint —
+					// truncation is never silent. Rows are cached in the
+					// block cache like any other role, so large outputs cost
+					// one style pass and a growable slice copy, not a
+					// re-render per frame; the transcript still paginates via
+					// the viewport. /collapse folds these blocks to a
+					// one-line "tool output (N bytes)" summary carrying the
+					// answering call ID; /expand restores. The collapsed
+					// summary is cached under its own key so the full body
+					// never re-renders through the shared key.
 					if collapseToolOutputs {
 						summary := collapsedToolSummaryPrefix
 						if entry.toolCallID != "" {
@@ -625,8 +629,8 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						header += " for " + entry.toolCallID
 					}
 					parts = append(parts, toolStyle.Render(header))
-					for _, line := range strings.Split(entry.content, "\n") {
-						parts = append(parts, toolStyle.Render("│ "+line))
+					for _, row := range toolBodyRows(entry.content, width) {
+						parts = append(parts, toolStyle.Render(row))
 					}
 					parts = append(parts, "")
 				case "raw":
@@ -692,6 +696,109 @@ func padRow(row string, width int, bg color.Color) string {
 		row += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", missing))
 	}
 	return row
+}
+
+// toolGutter prefixes every tool-output body row; toolWrapIndent prefixes
+// continuation rows produced by wrapping so a wrapped tail stays visually
+// nested under its source line instead of reading as a fresh row.
+const (
+	toolGutter     = "│ "
+	toolWrapIndent = "  "
+)
+
+// maxToolBodyRows caps the rendered rows of one expanded tool-output block.
+// The transcript paginates via the viewport, so the cap only bounds
+// worst-case per-block render work and block-cache size; anything beyond it
+// is summarized in the tail hint rather than silently dropped.
+const maxToolBodyRows = 400
+
+// toolBodyRows renders one tool result's raw text into gutter-prefixed body
+// rows. Every source line is soft-wrapped with ansi.Wrap — word-aware with a
+// hard break for tokens longer than the limit (a 300-char URL still wraps),
+// grapheme/wide-char aware so emoji and CJK wrap without corruption, and
+// ANSI-escape preserving. Continuation rows carry toolWrapIndent. Rendered
+// rows are capped at maxToolBodyRows; when the cap fires, a tail hint reports
+// how many source lines were not shown and — when the executor's archive
+// marker is present in the content — where the durable full copy lives.
+func toolBodyRows(content string, width int) []string {
+	limit, indent := toolWrapLimit(width)
+	indentStr := strings.Repeat(" ", indent)
+	lines := strings.Split(content, "\n")
+	rows := make([]string, 0, min(len(lines), maxToolBodyRows))
+	appendWrapped := func(text string) {
+		for j, seg := range strings.Split(ansi.Wrap(text, limit, ""), "\n") {
+			if j > 0 {
+				seg = indentStr + seg
+			}
+			rows = append(rows, toolGutter+seg)
+		}
+	}
+	for i, line := range lines {
+		if len(rows) >= maxToolBodyRows {
+			appendWrapped(cappedToolHint(len(lines)-i, content))
+			return rows
+		}
+		for j, seg := range strings.Split(ansi.Wrap(line, limit, ""), "\n") {
+			if len(rows) >= maxToolBodyRows {
+				// Mid-line cap: this source line is only partly shown, so
+				// it counts among the remaining lines in the hint.
+				appendWrapped(cappedToolHint(len(lines)-i, content))
+				return rows
+			}
+			if j > 0 {
+				seg = indentStr + seg
+			}
+			rows = append(rows, toolGutter+seg)
+		}
+	}
+	return rows
+}
+
+// toolWrapLimit returns the wrap width available for tool body text after the
+// gutter and continuation indent, and the indent to use. Ultra-narrow
+// terminals (width below gutter+indent+1) drop the continuation indent before
+// giving up on wrapping; below gutter+1 the gutter itself cannot fit and
+// padRow's clamp takes over as the degenerate last resort.
+func toolWrapLimit(width int) (limit, indent int) {
+	indent = ansi.StringWidth(toolWrapIndent)
+	if limit = width - ansi.StringWidth(toolGutter) - indent; limit >= 1 {
+		return limit, indent
+	}
+	if limit = width - ansi.StringWidth(toolGutter); limit >= 1 {
+		return limit, 0
+	}
+	return 1, 0
+}
+
+// cappedToolHint builds the tail hint shown when a tool block hits the row
+// cap: how many source lines were not rendered and, when the executor's
+// archive marker ("…[full output archived: <path> — read_file it to view
+// everything]") is present in the content, the path of the durable full copy.
+func cappedToolHint(remainingLines int, content string) string {
+	hint := fmt.Sprintf("…[output continues — %d more lines", remainingLines)
+	if p := archivedToolOutputPath(content); p != "" {
+		hint += "; archived copy: " + p
+	}
+	return hint + "]"
+}
+
+// archivedToolOutputPath extracts the on-disk path from the executor's
+// archive marker when the tool result carries one, or "" when it does not.
+func archivedToolOutputPath(content string) string {
+	const (
+		markerKey = "archived: "
+		markerEnd = " — read_file it to view everything]"
+	)
+	i := strings.LastIndex(content, markerKey)
+	if i < 0 {
+		return ""
+	}
+	rest := content[i+len(markerKey):]
+	j := strings.Index(rest, markerEnd)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
 }
 
 // splitStreamingMarkdown returns stable blocks ending at blank lines outside
