@@ -171,7 +171,7 @@ func (m *Model) inputView() string {
 	if s.State == StateThinking || s.State == StateStreaming || showPluginAction {
 		ms := float64(time.Now().UnixNano()) / 1e6
 		pulse := (math.Sin(ms/250.0) + 1.0) / 2.0
-		borderGrad := lipgloss.Blend1D(100, lipgloss.Color("#232329"), lipgloss.Color("#62B3D5"))
+		borderGrad := lipgloss.Blend1D(100, borderColor, secondaryColor) // rest -> active
 		outerStyle = outerStyle.BorderForeground(borderGrad[int(pulse*99)])
 	} else if s.State == StateConfirmTool {
 		outerStyle = outerStyle.BorderForeground(warnBorderColor)
@@ -396,7 +396,7 @@ func (m *Model) renderMinimalEqualizerAt(now time.Time) string {
 
 	bracketStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 	equalizerStyle := lipgloss.NewStyle().Foreground(secondaryColor).Background(appBgColor)
-	peakStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Bold(true).Background(appBgColor)
+	peakStyle := lipgloss.NewStyle().Foreground(peakColor).Bold(true).Background(appBgColor)
 
 	var sb strings.Builder
 	sb.WriteString(bracketStyle.Render("["))
@@ -488,7 +488,7 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 	bracketStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 	headStyle := lipgloss.NewStyle().Foreground(symbolColor).Bold(true).Background(appBgColor)
 	trailSparkStyle := lipgloss.NewStyle().Foreground(symbolColor).Background(appBgColor)
-	auraBulletStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#C48D46")).Background(appBgColor)
+	auraBulletStyle := lipgloss.NewStyle().Foreground(auraColor).Background(appBgColor)
 	dotStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 
 	var sb strings.Builder
@@ -1664,7 +1664,7 @@ func todoContentLines(todos []common.TodoItem, innerWidth int) []string {
 		itemStyle := lipgloss.NewStyle().Foreground(textColor)
 		if td.Done {
 			icon = "✓"
-			itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#549B68"))
+			itemStyle = lipgloss.NewStyle().Foreground(accentEmerald)
 		}
 
 		prefix := fmt.Sprintf(" %2d  %s  ", i+1, icon)
@@ -1706,13 +1706,13 @@ func (m Model) todoPaneView(height int) string {
 	}
 	title := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#7D56F4")).
+		Foreground(todoTitleColor).
 		Render("  Todos" + focusMarker)
 	lines = append(lines, title)
 
 	if len(todos) == 0 {
 		emptyMsg := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#4A4B50")).
+			Foreground(mutedTextColor).
 			Italic(true).
 			Render("  No todos created yet.\n  Waiting for plan…")
 		lines = append(lines, strings.Split(emptyMsg, "\n")...)
@@ -1732,7 +1732,7 @@ func (m Model) todoPaneView(height int) string {
 			help = fmt.Sprintf("%d–%d/%d · %s", offset+1, end, len(content), help)
 		}
 		lines = append(lines, lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#67686E")).
+			Foreground(subtextColor).
 			Render("  "+help))
 	}
 
@@ -1750,7 +1750,7 @@ func (m Model) todoPaneView(height int) string {
 		Height(innerHeight).
 		MaxHeight(innerHeight).
 		Border(lipgloss.NormalBorder(), false, false, false, true).
-		BorderForeground(lipgloss.Color("#232329")).
+		BorderForeground(activeBorder).
 		Background(appBgColor)
 
 	return boxStyle.Render(content)

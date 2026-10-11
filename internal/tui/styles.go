@@ -24,6 +24,13 @@ var (
 	borderColor  = lipgloss.Color("#1C1F26") // Hairline Divider
 	activeBorder = lipgloss.Color("#2D323E") // Focused / Active Border
 
+	todoTitleColor = lipgloss.Color("#7D56F4") // Violet title of the todo pane
+
+	// Accents that are derived from the palette instead of being free-standing
+	// hex values, so they can never drift away from it.
+	peakColor = lipgloss.Lighten(secondaryColor, 0.2) // crest of the streaming equalizer
+	auraColor = lipgloss.Darken(primaryColor, 0.15)   // glow around the thinking scanner
+
 	// Centralized Border Styles & Colors
 	boxBorderStyle   = lipgloss.RoundedBorder()
 	modalBorderColor = secondaryColor // Primary border color for dialogs & overlays (/help, /themes, commit detail)
