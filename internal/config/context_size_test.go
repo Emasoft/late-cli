@@ -32,7 +32,7 @@ func TestModelSettingContextSizeOverride(t *testing.T) {
 // TestUnmarshalConfig_ContextSizeTokensAccepted pins that the per-model
 // key decodes from config.json and survives into the struct.
 func TestUnmarshalConfig_ContextSizeTokensAccepted(t *testing.T) {
-	content := []byte(`{"models": [{"id": "local", "url": "http://a:8080", "key": "", "model": "m", "context-size-tokens": 32768}]}`)
+	content := []byte(`{"models": [{"id": "local", "url": "http://a:9931", "key": "", "model": "m", "context-size-tokens": 32768}]}`)
 	var cfg Config
 	if err := json.Unmarshal(content, &cfg); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
@@ -50,7 +50,7 @@ func TestUnmarshalConfig_ContextSizeTokensAccepted(t *testing.T) {
 // declare the window at the top level and it survives into the struct
 // (main.go applies it when no agent_models entry exists).
 func TestUnmarshalConfig_TopLevelContextSizeTokensAccepted(t *testing.T) {
-	content := []byte(`{"openai_base_url": "http://a:8080", "openai_model": "m", "context-size-tokens": 16384}`)
+	content := []byte(`{"openai_base_url": "http://a:9931", "openai_model": "m", "context-size-tokens": 16384}`)
 	var cfg Config
 	if err := json.Unmarshal(content, &cfg); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)

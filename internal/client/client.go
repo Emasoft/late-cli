@@ -88,7 +88,7 @@ func (c *Client) applyHeaders(req *http.Request) {
 }
 
 // chatCompletionURL builds the chat completions endpoint from BaseURL.
-// If the base URL has no path (e.g. "http://localhost:8080"), /v1 is
+// If the base URL has no path (e.g. "http://localhost:9931"), /v1 is
 // appended automatically for backwards compatibility. If a path is already
 // present (e.g. "https://api.z.ai/api/coding/paas/v4"), it is used as-is
 // and only /chat/completions is appended — consistent with the OpenAI SDK

@@ -9,7 +9,7 @@ import (
 	"runtime"
 )
 
-const DefaultOpenAIBaseURL = "http://localhost:8080"
+const DefaultOpenAIBaseURL = "http://localhost:9931"
 
 // Permission modes for supervising potentially dangerous commands.
 // The effective mode is resolved by ResolvePermissionMode:

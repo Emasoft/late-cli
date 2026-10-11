@@ -18,7 +18,7 @@ import (
 func TestSupportsVisionOverride(t *testing.T) {
 	// Case 1: Config without EnableImages, and supportsVision is false
 	c1 := NewClient(Config{
-		BaseURL:      "http://localhost:8080",
+		BaseURL:      "http://localhost:9931",
 		EnableImages: false,
 	})
 	if c1.SupportsVision() {
@@ -27,7 +27,7 @@ func TestSupportsVisionOverride(t *testing.T) {
 
 	// Case 2: Config with EnableImages = true
 	c2 := NewClient(Config{
-		BaseURL:      "http://localhost:8080",
+		BaseURL:      "http://localhost:9931",
 		EnableImages: true,
 	})
 	if !c2.SupportsVision() {
@@ -36,7 +36,7 @@ func TestSupportsVisionOverride(t *testing.T) {
 
 	// Case 3: Config without EnableImages, but supportsVision is true
 	c3 := NewClient(Config{
-		BaseURL: "http://localhost:8080",
+		BaseURL: "http://localhost:9931",
 	})
 	c3.supportsVision = true
 	if !c3.SupportsVision() {
@@ -110,10 +110,10 @@ func TestClient_Headers(t *testing.T) {
 	t.Run("custom UserAgent override", func(t *testing.T) {
 		customUA := "custom-agent/1.0"
 		c := NewClient(Config{
-			BaseURL:   "http://localhost:8080",
+			BaseURL:   "http://localhost:9931",
 			UserAgent: customUA,
 		})
-		req, _ := http.NewRequestWithContext(context.Background(), "POST", "http://localhost:8080", nil)
+		req, _ := http.NewRequestWithContext(context.Background(), "POST", "http://localhost:9931", nil)
 		c.applyHeaders(req)
 
 		if got := req.Header.Get("User-Agent"); got != customUA {

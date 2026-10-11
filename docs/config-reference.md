@@ -62,7 +62,7 @@ Late prefers a located error over silently accepting a typo'd config:
   "models": [
     {
       "id": "local",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "qwen3.6-35b-a3b"
     }
@@ -89,7 +89,7 @@ Late prefers a located error over silently accepting a typo'd config:
     },
     {
       "id": "local",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "qwen3.6-35b-a3b",
       "context-size-tokens": 32768
@@ -111,7 +111,7 @@ Late prefers a located error over silently accepting a typo'd config:
 | --- | --- | --- | --- | --- |
 | `models` | array | `[]` | — | Model registry for `/model` and `agent_models`; each entry is `{id, url, key, model, context-size-tokens}` (see the nested schema below). |
 | `agent_models` | object | `{}` | — | Maps agent roles (`orchestrator`, `researcher`, `coder`, …) to a `models` entry `id` (or, legacy, its model name); persisted by `/model`. |
-| `openai_base_url` | string | `http://localhost:8080` | — | Base URL of the main OpenAI-compatible API; `OPENAI_BASE_URL` env overrides when set. |
+| `openai_base_url` | string | `http://localhost:9931` | — | Base URL of the main OpenAI-compatible API; `OPENAI_BASE_URL` env overrides when set. |
 | `openai_api_key` | string | `""` | — | API key for the main provider; `OPENAI_API_KEY` env overrides when set. |
 | `openai_model` | string | `""` | — | Main model id used when no `models`/`agent_models` routing applies; `OPENAI_MODEL` env overrides when set. |
 | `context-size-tokens` | number | `0` | — | Single-model fallback for the per-entry `models[].context-size-tokens`: declares the model's context window for setups without `agent_models` routing (the orchestrator and the subagent share it). `0`/unset = unknown (auto-discovery only). |

@@ -24,7 +24,7 @@ Manual binaries for Linux, macOS, and native Windows are available from the [Git
 
 ## Local Models: Zero Configuration
 
-Late automatically looks for an OpenAI-compatible `llama-server` on `localhost:8080`.
+Late automatically looks for an OpenAI-compatible `llama-server` on `localhost:9931`.
 
 Start `llama-server` with your GGUF model as usual, then launch Late from your project:
 
@@ -33,7 +33,7 @@ cd your-project
 late
 ```
 
-That's it. If `llama-server` is already running on `:8080` (its default port) Late will connect with no configuration required.
+That's it. If `llama-server` is already running on `:9931` (its default port) Late will connect with no configuration required.
 
 ---
 
@@ -75,7 +75,7 @@ Configuration precedence is:
 2. `config.json`
 3. Late defaults
 
-For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
+For the standard local `llama-server` setup on `localhost:9931`, you do not need to create a configuration file.
 
 ### Tool Approval Mode (`permission-mode`)
 
@@ -115,13 +115,13 @@ You can change models interactively using `/model` inside the TUI, or persist yo
     },
     {
       "id": "local-qwen",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "qwen3.6-35b-a3b"
     },
     {
       "id": "local-gemma",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "gemma-4-e4b"
     }

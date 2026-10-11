@@ -354,7 +354,7 @@ func TestValidateSuppressThinkingWords(t *testing.T) {
 }
 
 func TestBuildMiddlewares_SubagentInheritsPluginHooks(t *testing.T) {
-	c := client.NewClient(client.Config{BaseURL: "http://localhost:8080"})
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:9931"})
 	parentSess := session.New(c, "", nil, "parent prompt", false)
 	parent := orchestrator.NewBaseOrchestrator("parent", parentSess, nil, 10)
 

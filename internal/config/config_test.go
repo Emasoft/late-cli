@@ -604,7 +604,7 @@ func TestResolveSaveSubagentHistories(t *testing.T) {
 func TestConfig_GetModelForAgent(t *testing.T) {
 	cfg := &Config{
 		Models: []ModelSetting{
-			{URL: "http://localhost:8080", Key: "key-1", Model: "model-1"},
+			{URL: "http://localhost:9931", Key: "key-1", Model: "model-1"},
 			{URL: "http://localhost:9090", Key: "key-2", Model: "model-2"},
 		},
 		AgentModels: map[string]string{

@@ -54,7 +54,7 @@ func TestBaseOrchestrator_Rewind(t *testing.T) {
 		{Role: "assistant", Content: client.TextContent("Reply 2")},
 	}
 
-	c := client.NewClient(client.Config{BaseURL: "http://localhost:8080"})
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:9931"})
 	sess := session.New(c, historyPath, history, "", false)
 	o := NewBaseOrchestrator("test-orch", sess, nil, 10)
 

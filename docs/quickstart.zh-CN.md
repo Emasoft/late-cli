@@ -24,7 +24,7 @@ curl -sfL https://raw.githubusercontent.com/mlhher/late-cli/main/install.sh | ba
 
 ## 本地模型：零配置
 
-Late 会自动寻找运行在 `localhost:8080` 上的兼容 OpenAI 的 `llama-server`。
+Late 会自动寻找运行在 `localhost:9931` 上的兼容 OpenAI 的 `llama-server`。
 
 正常使用 GGUF 模型启动 `llama-server`，然后在你的项目中启动 Late：
 
@@ -33,7 +33,7 @@ cd your-project
 late
 ```
 
-就是这样。如果 `llama-server` 已经在 `:8080`（其默认端口）上运行，Late 会在不需要任何配置的情况下自动连接。
+就是这样。如果 `llama-server` 已经在 `:9931`（其默认端口）上运行，Late 会在不需要任何配置的情况下自动连接。
 
 ---
 
@@ -75,7 +75,7 @@ late
 2. `config.json`
 3. Late 默认值
 
-对于在 `localhost:8080` 上运行的标准本地 `llama-server`，你不需要创建配置文件。
+对于在 `localhost:9931` 上运行的标准本地 `llama-server`，你不需要创建配置文件。
 
 ### 工具授权模式（`permission-mode`）
 
@@ -115,13 +115,13 @@ late
     },
     {
       "id": "local-qwen",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "qwen3.6-35b-a3b"
     },
     {
       "id": "local-gemma",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "gemma-4-e4b"
     }
