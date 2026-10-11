@@ -44,18 +44,30 @@ func (a *StreamAccumulator) Append(res common.StreamResult) {
 
 	for _, delta := range res.ToolCalls {
 		index := delta.Index
-		// Merge into a slot only when the slot exists AND belongs to this
-		// index: a malformed negative index would otherwise panic (index out
-		// of range), and an out-of-order index would splice its arguments
-		// into another tool call's slot. Deltas that match no slot are
-		// appended as new entries instead, preserving the data.
-		if index >= 0 && index < len(a.ToolCalls) && a.ToolCalls[index].Index == index {
-			a.ToolCalls[index].Function.Arguments += delta.Function.Arguments
+		// Locate the slot BY ITS INDEX FIELD, not by slice position:
+		// providers are not required to number tool calls from zero, and
+		// fragments may interleave (e.g. 1-based numbering with deltas for
+		// call 1 and call 2 alternating). Position-based lookup treated the
+		// index as a slice offset, so such fragments landed as orphaned
+		// entries (no ID, no name) or spliced into another call's slot.
+		// Matching on the Index field merges fragments by identity; a delta
+		// whose index matches no existing slot is appended as a new entry,
+		// preserving the data. Lookup only ever ranges over the slice, so a
+		// malformed index can never index out of range.
+		slot := -1
+		for i := range a.ToolCalls {
+			if a.ToolCalls[i].Index == index {
+				slot = i
+				break
+			}
+		}
+		if slot >= 0 {
+			a.ToolCalls[slot].Function.Arguments += delta.Function.Arguments
 			if delta.Function.Name != "" {
-				a.ToolCalls[index].Function.Name = delta.Function.Name
+				a.ToolCalls[slot].Function.Name = delta.Function.Name
 			}
 			if delta.ID != "" {
-				a.ToolCalls[index].ID = delta.ID
+				a.ToolCalls[slot].ID = delta.ID
 			}
 		} else {
 			a.ToolCalls = append(a.ToolCalls, delta)

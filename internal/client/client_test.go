@@ -586,8 +586,10 @@ func TestChatCompletionStream_MidBodyDisconnectErrorType(t *testing.T) {
 		// io.ErrUnexpectedEOF (verified against this Go version; an RST-style
 		// close would surface *net.OpError instead and is deliberately
 		// avoided). The trailing empty line of a normal SSE frame is
-		// deliberately omitted: the loop treats an empty data line as a clean
-		// end-of-stream and would miss the transport error entirely.
+		// deliberately omitted so the unterminated line is the last thing the
+		// scanner sees: since empty data lines (keepalives) are skipped rather
+		// than treated as end-of-stream, the omission keeps the truncation —
+		// not a benign keepalive — the event under test.
 		head := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\n\r\n"
 		complete := "data: " + sampleChunkHello + "\n"
 		partial := "data: " + sampleChunkWorld // no trailing newline

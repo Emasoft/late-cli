@@ -135,9 +135,16 @@ func (c *Client) ChatCompletion(ctx context.Context, req ChatCompletionRequest) 
 	}
 
 	var chatResp ChatCompletionResponse
-	body, err = io.ReadAll(io.LimitReader(resp.Body, maxCompletionBodyBytes))
+	// Read one byte past the cap: a body of exactly maxCompletionBodyBytes
+	// is legal, but the presence of a (max+1)-th byte proves the response
+	// exceeded the cap. A silently truncated read would instead fail decode
+	// with a confusing "unexpected end of JSON input".
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxCompletionBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(body)) > maxCompletionBodyBytes {
+		return nil, &BodyTooLargeError{Limit: maxCompletionBodyBytes}
 	}
 	// Tolerate a UTF-8 BOM prepended by gateways/proxies: encoding/json
 	// rejects it, which would surface as a confusing parse error.
@@ -232,9 +239,13 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 				break
 			}
 
-			// Handle empty data line — some servers signal end this way
+			// Bare "data:" line (nothing after the colon): SSE keepalives
+			// and heartbeats are commonly sent this way. Skip it instead of
+			// treating it as end-of-stream — a keepalive interleaved with
+			// real chunks would otherwise end the turn early, committing a
+			// truncated response with no error for any retry tier to see.
 			if data == "" {
-				break
+				continue
 			}
 
 			var chunk ChatCompletionChunk
@@ -248,8 +259,10 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatCompletionReq
 			}
 		}
 
-		// If the loop exited because scanner.Scan() returned false (connection closed)
-		// or an empty data line, check for read errors and propagate them.
+		// The loop exits when scanner.Scan() returns false (connection
+		// closed) or on the [DONE] sentinel. Empty data lines (keepalives)
+		// were skipped above, so a transport failure on the next read still
+		// reaches scanner.Err() and is propagated.
 		if err := scanner.Err(); err != nil {
 			select {
 			case errCh <- &StreamInterruptedError{Err: err}:
@@ -291,9 +304,14 @@ func (c *Client) Completion(ctx context.Context, req CompletionRequest) (*Comple
 	}
 
 	var completionResp CompletionResponse
-	body, err = io.ReadAll(io.LimitReader(resp.Body, maxCompletionBodyBytes))
+	// Same one-byte-past-the-cap read as ChatCompletion above: diagnose an
+	// oversized body as size, not as a confusing decode failure.
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxCompletionBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(body)) > maxCompletionBodyBytes {
+		return nil, &BodyTooLargeError{Limit: maxCompletionBodyBytes}
 	}
 	body = bytes.TrimPrefix(body, []byte(utf8BOM))
 	if err := json.Unmarshal(body, &completionResp); err != nil {
@@ -685,6 +703,20 @@ func (e *StreamInterruptedError) Error() string {
 }
 
 func (e *StreamInterruptedError) Unwrap() error { return e.Err }
+
+// BodyTooLargeError reports a 200 response body that exceeded
+// maxCompletionBodyBytes: the bounded read stops one byte past the cap
+// before decoding, so the failure is diagnosed as size instead of surfacing
+// as a confusing "unexpected end of JSON input" parse error. It is
+// errors.As-able in the style of StatusError. It is not retryable: the same
+// request would produce the same oversized response.
+type BodyTooLargeError struct {
+	Limit int64 // the body cap (in bytes) that the response exceeded
+}
+
+func (e *BodyTooLargeError) Error() string {
+	return fmt.Sprintf("response body too large (> %d bytes)", e.Limit)
+}
 
 const (
 	// maxErrorBodyBytes bounds how much of an error response body is read
