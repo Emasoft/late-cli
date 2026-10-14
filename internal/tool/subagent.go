@@ -143,16 +143,17 @@ func (t SpawnSubagentTool) Parameters() json.RawMessage {
 			},
 			"resume": {
 				"type": "string",
-				"description": "The ID of a previously interrupted subagent to resume exactly where it stopped (e.g. \"coder-subagent-0\"). All other parameters are ignored; the agent restores with its complete history and continues its task."
+				"description": "For a NEW subagent use \"\" (or omit). Set a saved agent ID only for explicit resume."
 			},
 			"action": {
 				"type": "string",
-				"enum": ["freeze", "unfreeze"],
-				"description": "Lifecycle action instead of a spawn or resume. \"freeze\": pause a RUNNING subagent at its next turn boundary, marking it frozen (its history is preserved; resume later with spawn_subagent {\"resume\": id}). \"unfreeze\": resume a previously frozen subagent in the background (a running/queued child unfreezes nothing and reports its live state). All other parameters are ignored."
+				"enum": ["", "freeze", "unfreeze"],
+				"default": "",
+				"description": "For a NEW subagent, set action to the empty string \"\" (or omit it when allowed). Only set freeze/unfreeze to control an EXISTING agent, and provide its exact non-empty id. Empty action has no lifecycle effect. \"freeze\": pause a RUNNING subagent at its next turn boundary, marking it frozen (its history is preserved; resume later with spawn_subagent {\"resume\": id}). \"unfreeze\": resume a previously frozen subagent in the background (a running/queued child unfreezes nothing and reports its live state). All other parameters are ignored."
 			},
 			"id": {
 				"type": "string",
-				"description": "With \"action\": the subagent ID to freeze or unfreeze, exactly as a launch acknowledgement or [late harness] notification reported it (e.g. \"coder-subagent-2\"). Ignored without \"action\"."
+				"description": "For a NEW subagent use \"\" (or omit). Non-empty id is required only with freeze/unfreeze."
 			},
 			"worktree": {
 				"type": "string",
@@ -182,10 +183,20 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 
 	// Lifecycle actions short-circuit before every spawn/resume surface:
 	// they carry no goal and must never touch the worktree or timeout
-	// validation. Unknown actions fall through and are rejected by the
-	// runner (the tool stays schema-tolerant the same way it is for goal).
-	if params.Action == SubagentActionFreeze || params.Action == SubagentActionUnfreeze {
+	// validation. The empty action is the explicit no-lifecycle value for
+	// providers that require every schema property; unknown values fail
+	// here before the runner can create a worktree or spawn a child.
+	switch params.Action {
+	case "":
+		// Continue through the normal spawn/resume path below.
+	case SubagentActionFreeze, SubagentActionUnfreeze:
+		if strings.TrimSpace(params.ActionID) == "" {
+			return fmt.Sprintf("Error: action %q requires a non-empty subagent id", params.Action), nil
+		}
 		return t.Runner(ctx, params, nil)
+	default:
+		return fmt.Sprintf("Error: unknown action %q — valid actions: %q, %q, or empty string for a new spawn",
+			params.Action, SubagentActionFreeze, SubagentActionUnfreeze), nil
 	}
 
 	timeoutOverride, err := parseSubagentTimeout(params.Timeout)

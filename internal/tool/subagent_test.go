@@ -159,8 +159,8 @@ func TestSpawnSubagentTool_ParametersDocumentResumeAndWorktree(t *testing.T) {
 	if !strings.Contains(schema, `"resume"`) {
 		t.Fatal("parameters schema does not advertise the resume property")
 	}
-	if !strings.Contains(schema, "All other parameters are ignored") {
-		t.Fatal("resume schema description does not document the ignored-parameters semantics")
+	if !strings.Contains(schema, `For a NEW subagent use \"\" (or omit). Set a saved agent ID only for explicit resume.`) {
+		t.Fatal("resume schema description does not document the fresh-spawn and explicit-resume forms")
 	}
 	if !strings.Contains(schema, `"worktree"`) {
 		t.Fatal("parameters schema does not advertise the worktree property")
@@ -216,7 +216,205 @@ func TestSpawnSubagentTool_CallStringResume(t *testing.T) {
 	}
 }
 
+// TestSpawnSubagentTool_ActionSchemaSupportsFreshSpawn pins the empty-action
+// sentinel, lifecycle actions, and source-required fields in the tool schema.
+func TestSpawnSubagentTool_ActionSchemaSupportsFreshSpawn(t *testing.T) {
+	var schema struct {
+		Properties map[string]struct {
+			Type        string   `json:"type"`
+			Enum        []string `json:"enum"`
+			Default     string   `json:"default"`
+			Description string   `json:"description"`
+		} `json:"properties"`
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(SpawnSubagentTool{}.Parameters(), &schema); err != nil {
+		t.Fatalf("unmarshal Parameters(): %v", err)
+	}
+
+	action := schema.Properties["action"]
+	if action.Type != "string" {
+		t.Fatalf("action type = %q, want string", action.Type)
+	}
+	if got, want := action.Enum, []string{"", SubagentActionFreeze, SubagentActionUnfreeze}; !equalStrings(got, want) {
+		t.Fatalf("action enum = %q, want %q", got, want)
+	}
+	if action.Default != "" {
+		t.Fatalf("action default = %q, want empty string", action.Default)
+	}
+	if !strings.HasPrefix(action.Description, `For a NEW subagent, set action to the empty string "" (or omit it when allowed). Only set freeze/unfreeze to control an EXISTING agent, and provide its exact non-empty id. Empty action has no lifecycle effect.`) {
+		t.Fatalf("action description does not explain the fresh-spawn sentinel: %q", action.Description)
+	}
+	if got, want := schema.Required, []string{"goal", "agent_type"}; !equalStrings(got, want) {
+		t.Fatalf("required fields = %q, want %q", got, want)
+	}
+	if !strings.Contains(schema.Properties["id"].Description, "Non-empty id is required only with freeze/unfreeze.") {
+		t.Fatalf("id description does not explain lifecycle-only requirement: %q", schema.Properties["id"].Description)
+	}
+	if schema.Properties["resume"].Description != `For a NEW subagent use "" (or omit). Set a saved agent ID only for explicit resume.` {
+		t.Fatalf("resume description = %q", schema.Properties["resume"].Description)
+	}
+}
+
+// TestSpawnSubagentTool_ActionDispatch verifies omitted and empty actions both
+// reach ordinary spawn dispatch, including a fully populated argument object.
+func TestSpawnSubagentTool_ActionDispatch(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      string
+		allFields bool
+	}{
+		{
+			name: "omitted action is a fresh spawn",
+			args: `{"goal":"g","agent_type":"researcher"}`,
+		},
+		{
+			name:      "empty action and every advertised property are a fresh spawn",
+			args:      `{"action":"","agent_type":"researcher","ctx_files":[],"execution":"sync","goal":"g","id":"","resume":"","timeout":"5m","worktree":""}`,
+			allFields: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerCalls := 0
+			var got SubagentSpawnRequest
+			var gotOverride *time.Duration
+			spawnTool := SpawnSubagentTool{
+				Runner: func(ctx context.Context, request SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+					runnerCalls++
+					got = request
+					gotOverride = timeoutOverride
+					return "spawned", nil
+				},
+			}
+
+			result, err := spawnTool.Execute(context.Background(), json.RawMessage(tt.args))
+			if err != nil {
+				t.Fatalf("Execute() error = %v, want nil", err)
+			}
+			if result != "spawned" {
+				t.Fatalf("result = %q, want spawned", result)
+			}
+			if runnerCalls != 1 {
+				t.Fatalf("runner calls = %d, want 1", runnerCalls)
+			}
+			if got.Goal != "g" || got.AgentType != "researcher" || got.Action != "" {
+				t.Fatalf("runner request = %+v, want fresh researcher spawn for goal g", got)
+			}
+			if tt.allFields {
+				if got.CtxFiles == nil || len(got.CtxFiles) != 0 {
+					t.Fatalf("ctx_files = %#v, want an explicitly supplied empty array", got.CtxFiles)
+				}
+				if got.ActionID != "" || got.ResumeID != "" || got.Worktree != "" {
+					t.Fatalf("empty lifecycle fields changed: id=%q resume=%q worktree=%q", got.ActionID, got.ResumeID, got.Worktree)
+				}
+				if gotOverride == nil || *gotOverride != 5*time.Minute {
+					t.Fatalf("timeout override = %v, want 5m", gotOverride)
+				}
+			}
+		})
+	}
+}
+
+// TestSpawnSubagentTool_LifecycleActionsRequireID keeps valid lifecycle
+// routing intact and prevents missing IDs from falling through to spawn.
+func TestSpawnSubagentTool_LifecycleActionsRequireID(t *testing.T) {
+	for _, action := range []string{SubagentActionFreeze, SubagentActionUnfreeze} {
+		t.Run(action+" valid ID dispatches unchanged", func(t *testing.T) {
+			runnerCalls := 0
+			spawnTool := SpawnSubagentTool{
+				Runner: func(ctx context.Context, request SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+					runnerCalls++
+					if request.Action != action || request.ActionID != "researcher-subagent-2" {
+						t.Errorf("lifecycle request = action %q id %q, want action %q and exact id", request.Action, request.ActionID, action)
+					}
+					if timeoutOverride != nil {
+						t.Errorf("timeout override = %v, want nil for lifecycle dispatch", *timeoutOverride)
+					}
+					return "handled", nil
+				},
+			}
+
+			args, err := json.Marshal(map[string]string{"action": action, "id": "researcher-subagent-2"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := spawnTool.Execute(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Execute() error = %v, want nil", err)
+			}
+			if result != "handled" || runnerCalls != 1 {
+				t.Fatalf("result = %q, runner calls = %d, want handled and one call", result, runnerCalls)
+			}
+		})
+
+		for _, id := range []string{"", "   "} {
+			t.Run(action+" missing ID "+fmt.Sprintf("%q", id)+" never spawns", func(t *testing.T) {
+				runnerCalls := 0
+				spawnTool := SpawnSubagentTool{
+					Runner: func(ctx context.Context, request SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+						runnerCalls++
+						return "spawned", nil
+					},
+				}
+				args, err := json.Marshal(map[string]string{"action": action, "id": id})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				result, err := spawnTool.Execute(context.Background(), args)
+				if err != nil {
+					t.Fatalf("Execute() error = %v, want nil", err)
+				}
+				if runnerCalls != 0 {
+					t.Fatalf("runner calls = %d, want 0 for missing lifecycle ID", runnerCalls)
+				}
+				if !strings.Contains(result, "requires a non-empty subagent id") {
+					t.Fatalf("result = %q, want missing-ID validation error", result)
+				}
+			})
+		}
+	}
+}
+
+// TestSpawnSubagentTool_UnknownActionRejectedBeforeRunner prevents invalid
+// lifecycle values from reaching the runner or creating a child.
+func TestSpawnSubagentTool_UnknownActionRejectedBeforeRunner(t *testing.T) {
+	runnerCalls := 0
+	spawnTool := SpawnSubagentTool{
+		Runner: func(ctx context.Context, request SubagentSpawnRequest, timeoutOverride *time.Duration) (string, error) {
+			runnerCalls++
+			return "spawned", nil
+		},
+	}
+
+	result, err := spawnTool.Execute(context.Background(), json.RawMessage(
+		`{"action":"spawn","goal":"g","agent_type":"researcher"}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if runnerCalls != 0 {
+		t.Fatalf("runner calls = %d, want 0 for unknown action", runnerCalls)
+	}
+	if !strings.Contains(result, `unknown action "spawn"`) || !strings.Contains(result, `empty string for a new spawn`) {
+		t.Fatalf("result = %q, want actionable unknown-action guidance", result)
+	}
+}
+
 func subagentTimeoutPtr(d time.Duration) *time.Duration { return &d }
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // initTestGitRepo creates a git repo with one commit at dir and configures
 // an identity locally so the commit cannot pick up user-level settings.
