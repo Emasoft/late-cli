@@ -207,7 +207,7 @@ func TestResumeRequestToolWiringThroughRegistry(t *testing.T) {
 	if gotID != "coder-subagent-7" {
 		t.Errorf("ResumeID = %q, want coder-subagent-7", gotID)
 	}
-	if result != "resumed ok" {
-		t.Errorf("result = %q, want resumed ok", result)
+	if result != "resumed ok"+tool.OrchestratorTodoReminder {
+		t.Errorf("result = %q, want resumed ok + todo reminder", result)
 	}
 }

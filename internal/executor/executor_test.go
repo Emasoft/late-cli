@@ -2,9 +2,12 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"late/internal/client"
 	"late/internal/common"
 	"late/internal/session"
+	"late/internal/todostore"
+	"late/internal/tool"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -389,6 +392,63 @@ func TestRegisterTools_TodoTools(t *testing.T) {
 		if sessDisabled.Registry.Get(name) != nil {
 			t.Errorf("expected tool '%s' not to be registered when disabled", name)
 		}
+	}
+}
+
+// TestRegisterToolsWithTodoStore_SeededTodos verifies the todo tools are
+// wired to a todo store and that initialTodos seed the list visible to
+// list_todos.
+func TestRegisterToolsWithTodoStore_SeededTodos(t *testing.T) {
+	isolateSessionDir(t)
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	histPath := filepath.Join(t.TempDir(), "history.json")
+	sess := session.New(c, histPath, nil, "", false)
+
+	store := &todostore.Store{Root: t.TempDir()}
+	initial := []tool.Todo{{Text: "seed one"}, {Text: "seed two", Done: true}}
+	RegisterToolsWithTodoStore(sess.Registry, map[string]bool{"create_todos": true, "list_todos": true, "finish_todo": true}, initial, store)
+
+	listed, ok := sess.Registry.Get("list_todos").(tool.ListTodosTool)
+	if !ok {
+		t.Fatalf("list_todos not registered as ListTodosTool")
+	}
+	if listed.Store != store {
+		t.Error("expected ListTodosTool.Store to be the provided store")
+	}
+	out, err := listed.Execute(context.Background(), json.RawMessage("{}"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, want := range []string{"seed one", "seed two"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("list output %q missing %q", out, want)
+		}
+	}
+}
+
+// TestRegisterTools_LegacyTodoDefaults verifies legacy RegisterTools wires
+// the todo tools with an empty list and no store.
+func TestRegisterTools_LegacyTodoDefaults(t *testing.T) {
+	isolateSessionDir(t)
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:0"})
+	histPath := filepath.Join(t.TempDir(), "history.json")
+	sess := session.New(c, histPath, nil, "", false)
+
+	RegisterTools(sess.Registry, map[string]bool{"create_todos": true, "list_todos": true})
+
+	listed, ok := sess.Registry.Get("list_todos").(tool.ListTodosTool)
+	if !ok {
+		t.Fatalf("list_todos not registered as ListTodosTool")
+	}
+	if listed.Store != nil {
+		t.Error("expected nil Store for legacy RegisterTools")
+	}
+	out, err := listed.Execute(context.Background(), json.RawMessage("{}"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out, "No todos have been created yet") {
+		t.Errorf("expected empty todo list, got %q", out)
 	}
 }
 

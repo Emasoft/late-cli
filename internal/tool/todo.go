@@ -8,7 +8,13 @@ import (
 	"sync"
 
 	"late/internal/common"
+	"late/internal/todostore"
 )
+
+// OrchestratorTodoReminder is appended to subagent runner results so the
+// orchestrator is reminded it owns the project todos and must decide what
+// to spawn next.
+var OrchestratorTodoReminder = "\n\nReminder: subagent finished. Review the project todos (/todos) — you, the orchestrator, own them (file: todos.md, git-tracked — done tasks are archived to todos_history.md). Decide whether and which subagent to spawn next, and with what task."
 
 // Todo represents a single todo item with its completion status.
 type Todo struct {
@@ -20,6 +26,7 @@ type Todo struct {
 type CreateTodosTool struct {
 	Todos *[]Todo
 	Mu    *sync.Mutex
+	Store *todostore.Store
 }
 
 func resetTodos(todos *[]Todo, mu *sync.Mutex) {
@@ -32,8 +39,21 @@ func resetTodos(todos *[]Todo, mu *sync.Mutex) {
 	}
 }
 
+// persistTodos writes the active todos to the project todo store. It returns
+// a warning suffix on failure, or "" on success / when no store is wired.
+func persistTodos(store *todostore.Store, todos []Todo) string {
+	if store == nil {
+		return ""
+	}
+	if err := store.WriteActive(); err != nil {
+		return fmt.Sprintf("\n\nwarning: failed to save todos: %v", err)
+	}
+	return ""
+}
+
 func (t CreateTodosTool) ResetConversationState() {
 	resetTodos(t.Todos, t.Mu)
+	persistTodos(t.Store, nil)
 }
 
 func (t CreateTodosTool) Name() string { return "create_todos" }
@@ -49,7 +69,8 @@ Instructions:
 Tips:
 - Make steps atomic and verifiable.
 - More granularity is better than less.
-- The list stays in memory for the entire session.`
+- Todos live in the project root file "todos.md" (git-tracked) — they are linked to the project, not to a session, so they survive restarts and resuming a session.
+- Finished items are archived to "todos_history.md" at the next session start.`
 }
 func (t CreateTodosTool) Parameters() json.RawMessage {
 	return json.RawMessage(`{
@@ -100,6 +121,7 @@ func (t CreateTodosTool) Execute(ctx context.Context, args json.RawMessage) (str
 		sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, todoText))
 	}
 	sb.WriteString("\nUse 'list_todos' to see your plan, or 'finish_todo' to mark items complete.\n")
+	sb.WriteString(persistTodos(t.Store, newTodos))
 	return sb.String(), nil
 }
 func (t CreateTodosTool) RequiresConfirmation(args json.RawMessage) bool { return false }
@@ -111,10 +133,12 @@ func (t CreateTodosTool) CallString(args json.RawMessage) string {
 type ListTodosTool struct {
 	Todos *[]Todo
 	Mu    *sync.Mutex
+	Store *todostore.Store
 }
 
 func (t ListTodosTool) ResetConversationState() {
 	resetTodos(t.Todos, t.Mu)
+	persistTodos(t.Store, nil)
 }
 
 func (t ListTodosTool) Name() string { return "list_todos" }
@@ -200,10 +224,12 @@ func (t ListTodosTool) GetTodos() []common.TodoItem {
 type FinishTodoTool struct {
 	Todos *[]Todo
 	Mu    *sync.Mutex
+	Store *todostore.Store
 }
 
 func (t FinishTodoTool) ResetConversationState() {
 	resetTodos(t.Todos, t.Mu)
+	persistTodos(t.Store, nil)
 }
 
 func (t FinishTodoTool) Name() string { return "finish_todo" }
@@ -265,7 +291,7 @@ func (t FinishTodoTool) Execute(ctx context.Context, args json.RawMessage) (stri
 				continue
 			}
 			todos[i].Done = true
-			return fmt.Sprintf("Completed: %s", todo.Text), nil
+			return fmt.Sprintf("Completed: %s", todo.Text) + persistTodos(t.Store, todos), nil
 		}
 	}
 	if foundCompleted {

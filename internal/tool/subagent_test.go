@@ -202,8 +202,8 @@ func TestSpawnSubagentTool_ResumePassthrough(t *testing.T) {
 	if !runnerCalled {
 		t.Fatal("runner was not invoked for a resume request")
 	}
-	if result != "resumed" {
-		t.Errorf("result = %q, want resumed", result)
+	if !strings.HasPrefix(result, "resumed") {
+		t.Errorf("result = %q, want the resumed result", result)
 	}
 }
 
@@ -293,8 +293,8 @@ func TestSpawnSubagentTool_ActionDispatch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Execute() error = %v, want nil", err)
 			}
-			if result != "spawned" {
-				t.Fatalf("result = %q, want spawned", result)
+			if result != "spawned"+OrchestratorTodoReminder {
+				t.Fatalf("result = %q, want the runner result plus the todo reminder", result)
 			}
 			if runnerCalls != 1 {
 				t.Fatalf("runner calls = %d, want 1", runnerCalls)
@@ -344,8 +344,8 @@ func TestSpawnSubagentTool_LifecycleActionsRequireID(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Execute() error = %v, want nil", err)
 			}
-			if result != "handled" || runnerCalls != 1 {
-				t.Fatalf("result = %q, runner calls = %d, want handled and one call", result, runnerCalls)
+			if result != "handled"+OrchestratorTodoReminder || runnerCalls != 1 {
+				t.Fatalf("result = %q, runner calls = %d, want handled plus reminder and one call", result, runnerCalls)
 			}
 		})
 
@@ -709,8 +709,8 @@ func TestSpawnSubagentTool_FreshSpawnArgumentValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Execute() Go error = %v, want nil", err)
 		}
-		if result != "ok" {
-			t.Fatalf("result = %q, want the runner's ok", result)
+		if result != "ok"+OrchestratorTodoReminder {
+			t.Fatalf("result = %q, want the runner's ok plus the todo reminder", result)
 		}
 		if got.Goal != " port the module " {
 			t.Errorf("goal = %q, want it passed through untrimmed (the trim is only a validation check)", got.Goal)
@@ -738,8 +738,8 @@ func TestSpawnSubagentTool_FreshSpawnArgumentValidation(t *testing.T) {
 		if !runnerCalled {
 			t.Fatal("runner must be invoked for a resume request")
 		}
-		if result != "ok" {
-			t.Fatalf("result = %q, want the runner's ok", result)
+		if !strings.HasPrefix(result, "ok") || !strings.Contains(result, "Reminder: subagent finished") {
+			t.Fatalf("result = %q, want the runner's ok plus the todo reminder", result)
 		}
 	})
 }

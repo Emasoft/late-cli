@@ -15,6 +15,7 @@ import (
 	"late/internal/session"
 	"late/internal/skill"
 	"late/internal/tool"
+	"late/internal/todostore"
 )
 
 // --- Stream Accumulator ---
@@ -363,6 +364,13 @@ func ExecuteToolCalls(ctx context.Context, sess *session.Session, toolCalls []cl
 // If isPlanning is true, it only registers read-only tools and the planning tool.
 // Otherwise, it registers the full set of coding tools.
 func RegisterTools(reg *tool.Registry, enabledTools map[string]bool) {
+	RegisterToolsWithTodoStore(reg, enabledTools, nil, nil)
+}
+
+// RegisterToolsWithTodoStore registers the common tool set on a registry,
+// wiring the todo planning tools to the given todo store. If initialTodos is
+// non-nil, the todo list starts with those items.
+func RegisterToolsWithTodoStore(reg *tool.Registry, enabledTools map[string]bool, initialTodos []tool.Todo, store *todostore.Store) {
 	if enabledTools == nil {
 		enabledTools = make(map[string]bool)
 	}
@@ -391,16 +399,16 @@ func RegisterTools(reg *tool.Registry, enabledTools map[string]bool) {
 
 	// Register Todo planning tools (orchestrator-only, not inherited by subagents)
 	if enabledTools["create_todos"] || enabledTools["list_todos"] || enabledTools["finish_todo"] {
-		var todos []tool.Todo
+		todos := initialTodos
 		var mu sync.Mutex
 		if enabledTools["create_todos"] {
-			reg.Register(tool.CreateTodosTool{Todos: &todos, Mu: &mu})
+			reg.Register(tool.CreateTodosTool{Todos: &todos, Mu: &mu, Store: store})
 		}
 		if enabledTools["list_todos"] {
-			reg.Register(tool.ListTodosTool{Todos: &todos, Mu: &mu})
+			reg.Register(tool.ListTodosTool{Todos: &todos, Mu: &mu, Store: store})
 		}
 		if enabledTools["finish_todo"] {
-			reg.Register(tool.FinishTodoTool{Todos: &todos, Mu: &mu})
+			reg.Register(tool.FinishTodoTool{Todos: &todos, Mu: &mu, Store: store})
 		}
 	}
 

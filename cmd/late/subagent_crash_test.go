@@ -1383,8 +1383,8 @@ func TestSpawnSubagentActionToolWiring(t *testing.T) {
 	if !runnerCalled || gotAction != "freeze" || gotID != "coder-subagent-2" {
 		t.Fatalf("action dispatch = called:%v action:%q id:%q, want freeze/coder-subagent-2", runnerCalled, gotAction, gotID)
 	}
-	if res != "frozen" {
-		t.Errorf("result = %q, want the runner's text", res)
+	if res != "frozen" + tool.OrchestratorTodoReminder {
+		t.Errorf("result = %q, want the runner's text + todo reminder", res)
 	}
 }
 

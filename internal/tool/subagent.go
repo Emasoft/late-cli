@@ -193,7 +193,7 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 		if strings.TrimSpace(params.ActionID) == "" {
 			return fmt.Sprintf("Error: action %q requires a non-empty subagent id", params.Action), nil
 		}
-		return t.Runner(ctx, params, nil)
+		return withTodoReminder(t.Runner(ctx, params, nil))
 	default:
 		return fmt.Sprintf("Error: unknown action %q — valid actions: %q, %q, or empty string for a new spawn",
 			params.Action, SubagentActionFreeze, SubagentActionUnfreeze), nil
@@ -207,7 +207,7 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	if params.IsResume() {
-		return t.Runner(ctx, params, timeoutOverride)
+		return withTodoReminder(t.Runner(ctx, params, timeoutOverride))
 	}
 
 	// Fresh-spawn input validation: every failure is an error RESULT (nil
@@ -233,7 +233,31 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 		params.Worktree = wtPath
 	}
 
-	return t.Runner(ctx, params, timeoutOverride)
+	return withTodoReminder(t.Runner(ctx, params, timeoutOverride))
+}
+
+// withTodoReminder appends OrchestratorTodoReminder to a successful subagent
+// runner result, so the orchestrator is reminded to review the project todos
+// and to decide what to spawn next. Error results and empty results are left
+// untouched.
+func withTodoReminder(result string, err error) (string, error) {
+	if err != nil || result == "" || strings.HasPrefix(result, "Error: ") {
+		return result, err
+	}
+	return result + OrchestratorTodoReminder, nil
+}
+
+// withTodoReminderFinal is withTodoReminder restricted to final results: it
+// never appends the reminder to live-state replies ("still running", "still
+// queued", pending notifications) — a child that has not finished gives the
+// orchestrator nothing to review yet.
+func withTodoReminderFinal(result string, err error) (string, error) {
+	if result != "" && (strings.Contains(result, "is still") ||
+		strings.Contains(result, "You will be notified") ||
+		strings.Contains(result, "You will receive")) {
+		return result, err
+	}
+	return withTodoReminder(result, err)
 }
 
 // validateFreshSpawnArgs checks the fresh-spawn argument surface the schema
@@ -430,7 +454,7 @@ func (t SubagentResultsTool) Execute(ctx context.Context, args json.RawMessage) 
 	if strings.TrimSpace(params.ID) == "" {
 		return `Error: empty id — pass the subagent ID exactly as the launch acknowledgement or the [late harness] notification reported it (e.g. "coder-subagent-2")`, nil
 	}
-	return t.Lookup(ctx, params.ID)
+	return withTodoReminderFinal(t.Lookup(ctx, params.ID))
 }
 
 func (t SubagentResultsTool) RequiresConfirmation(args json.RawMessage) bool { return false }

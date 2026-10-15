@@ -28,6 +28,7 @@ import (
 	"late/internal/plugin"
 	"late/internal/session"
 	"late/internal/skill"
+	"late/internal/todostore"
 	"late/internal/tool"
 	"late/internal/tui"
 
@@ -341,6 +342,24 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to load history %s (%v); starting with an empty history (the previous bytes were backed up alongside it if they could be read)\n", historyPath, err)
 		history = []client.ChatMessage{}
+	}
+
+	// Open the project todo store at the repository root (or the working
+	// directory when not inside a git repository) so todo planning tools
+	// persist todos.md across sessions. Failures degrade to a nil store —
+	// the session still runs, just without persistent todos.
+	todoRoot, ok := git.RepoRoot(cwd)
+	if !ok {
+		todoRoot = cwd
+	}
+	store, storeErr := todostore.Open(todoRoot)
+	if storeErr != nil || store == nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to open todo store at %s (%v); continuing without persistent todos\n", todoRoot, storeErr)
+	}
+	if store != nil {
+		if openStoreErr := store.LoadAndArchive(); openStoreErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to archive done todos in %s (%v)\n", filepath.Join(todoRoot, "todos.md"), openStoreErr)
+		}
 	}
 	// Initialize MCP client
 	mcpClient := mcp.NewClient()
@@ -746,7 +765,16 @@ func main() {
 	if synthesizeErr != nil {
 		common.LogErrorf("subagent-manifest", "subagent resume synthesis failed: %v", synthesizeErr)
 	}
-	executor.RegisterTools(sess.Registry, mainTools)
+	// Seed the todo tools from the persistent store. store may have failed to
+	// open — then nil initialTodos and nil store leave the tools session-local.
+	var seedTodos []tool.Todo
+	if store != nil {
+		seedTodos = make([]tool.Todo, len(store.Todos))
+		for i, t := range store.Todos {
+			seedTodos[i] = tool.Todo{Text: t.Text, Done: t.Done}
+		}
+	}
+	executor.RegisterToolsWithTodoStore(sess.Registry, mainTools, seedTodos, store)
 
 	// Register MCP tools into the session registry.
 	// MCP tool names are now namespaced as "{server}__{tool}" (sanitized —
@@ -2630,6 +2658,17 @@ func validateContinueFlags(continueFlag, continueProjectFlag bool) error {
 		return fmt.Errorf("continue flags are mutually exclusive; pass at most one of -continue, -continue-project")
 	}
 	return nil
+}
+
+// todosPathFor returns the path of the project todo file for cwd: the
+// repository root when cwd is inside a git repository (so todos.md is
+// git-tracked and shared across the project), otherwise cwd itself.
+func todosPathFor(cwd string) string {
+	root, ok := git.RepoRoot(cwd)
+	if !ok {
+		root = cwd
+	}
+	return filepath.Join(root, "todos.md")
 }
 
 // resolveContinueSession returns the session to resume for --continue: the

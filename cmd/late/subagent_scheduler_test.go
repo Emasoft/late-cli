@@ -403,8 +403,8 @@ func TestSubagentResultsToolShell(t *testing.T) {
 	}
 
 	got, err := toolObj.Execute(context.Background(), json.RawMessage(`{"id":"coder-subagent-2"}`))
-	if err != nil || got != "FULL" {
-		t.Errorf("Execute = %q, %v; want FULL, nil", got, err)
+	if err != nil || got != "FULL"+tool.OrchestratorTodoReminder {
+		t.Errorf("Execute = %q, %v; want FULL + todo reminder, nil", got, err)
 	}
 
 	got, err = toolObj.Execute(context.Background(), json.RawMessage(`{}`))
@@ -461,7 +461,7 @@ func TestSpawnSubagentExecutionParam(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Execute: %v", err)
 				}
-				if got != "ok" || seen != tc.wantSeen {
+				if got != "ok"+tool.OrchestratorTodoReminder || seen != tc.wantSeen {
 					t.Errorf("runner saw execution %q (result %q), want %q", seen, got, tc.wantSeen)
 				}
 				return
