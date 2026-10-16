@@ -15,11 +15,12 @@ import (
 // behind compaction-retrieval fires at every turn start — right before that
 // turn's stream request — and only when installed (the default is no-op).
 func TestBaseOrchestrator_RetrievalHookRunsPerTurn(t *testing.T) {
-	// The base_test.go stream stub: an immediate empty completion.
+	// A minimal non-empty completion (empty streams are now a typed
+	// run-loop failure, and hook timing is what this test pins).
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
 	}))
 	defer ts.Close()
 
@@ -46,7 +47,7 @@ func TestBaseOrchestrator_NoRetrievalHookIsNoOp(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
 	}))
 	defer ts.Close()
 

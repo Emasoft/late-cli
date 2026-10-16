@@ -559,6 +559,14 @@ func RunLoop(
 		// the three retry tiers. Capped at maxContextCompactionRounds: two
 		// compactions that still leave the request over the limit mean the
 		// window is gone; a third compaction would not change that.
+		// emptyRespRounds counts consecutive empty stream results in THIS
+		// turn's attempt loop — a stream that ends with no content, no
+		// reasoning, and no tool calls is treated as a transient
+		// provider/truncation failure and re-requested like any other
+		// retryable failure, instead of silently committing an empty
+		// assistant message and "finishing" the run. Capped at
+		// MaxEmptyResponseRounds.
+		emptyRespRounds := 0
 		contextRounds := 0
 		var recoveryFired bool
 		for {
@@ -623,6 +631,47 @@ func RunLoop(
 					float64(acc.Usage.TotalTokens) >= float64(ctxSize)*0.95 {
 					err = &client.ContextExceededError{Reason: "finish_reason=length"}
 				}
+			}
+			// Empty-response tier: a stream that completed without a single
+			// content chunk, reasoning block, or tool call (a stalled or
+			// truncated SSE, a silent server close) must NOT be committed as
+			// an empty assistant message, nor end the run with an empty
+			// result. Re-request it like any other transient failure.
+			// A finish_reason=length stream is excluded: a length finish on
+			// an empty body is the legacy output-truncation continuation
+			// path below, and must stay reachable there.
+			if err == nil && acc.FinishReason != "length" &&
+				acc.Content == "" && acc.Reasoning == "" && len(acc.ToolCalls) == 0 {
+				// The global disable contract applies to this tier too.
+				budget := MaxEmptyResponseRounds
+				if maxRetries <= 0 {
+					budget = 0
+				}
+				if emptyRespRounds >= budget {
+					return "", fmt.Errorf("model returned %d consecutive empty responses (no content, reasoning, or tool calls) — treating the turn as failed; the last stream may be truncated or the provider misbehaving", emptyRespRounds+1)
+				}
+				emptyRespRounds++
+				err = fmt.Errorf("empty response from model — re-requesting (attempt %d of %d)", emptyRespRounds, budget)
+				delay := effectiveRetryDelay(streamRetryDelay(emptyRespRounds), 0)
+				if onRetry != nil {
+					onRetry(common.RetryEvent{
+						ID:          common.GetOrchestratorID(ctx),
+						Attempt:     emptyRespRounds,
+						MaxAttempts: budget,
+						Delay:       delay,
+						Err:         err,
+					})
+				}
+				// Same backoff machinery as the other tiers.
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+					// Backoff elapsed: loop around for a fresh StartStream.
+				case <-ctx.Done():
+					timer.Stop()
+					return "", ctx.Err()
+				}
+				continue
 			}
 			if err == nil {
 				break

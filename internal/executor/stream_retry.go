@@ -48,6 +48,15 @@ const (
 	// flag; RunLoop additionally zeroes it when the global stream-retry
 	// budget is disabled, so a global disable silences every tier.
 	DefaultMaxThrottleRetries = 200
+	// MaxEmptyResponseRounds is the dedicated retry budget for "empty"
+	// stream results: a stream that completes with no content, no
+	// reasoning, and no tool calls (a stalled or truncated SSE, a silent
+	// server close). RunLoop re-requests the stream instead of committing
+	// an empty assistant message and ending the turn with an empty result;
+	// once the budget is exhausted it fails the turn with a typed error
+	// instead. RunLoop zeroes it when the global stream-retry budget is
+	// disabled, so a global disable silences this tier too.
+	MaxEmptyResponseRounds = 3
 	// streamRetryBaseDelay is the backoff for the first retry.
 	streamRetryBaseDelay = 500 * time.Millisecond
 	// streamRetryMaxDelay caps a single backoff interval.
