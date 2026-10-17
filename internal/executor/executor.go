@@ -503,6 +503,14 @@ func RunLoop(
 ) (string, error) {
 	var lastContent string
 
+	// everSucceeded flips on as soon as this run commits its first LLM
+	// stream. It gates the first-request fail-fast below: while the endpoint
+	// has not yet produced a single successful response, a dial-phase
+	// failure (connection refused, unroutable host, TLS error) surfaces
+	// immediately instead of burning the infra backoff budget — retrying a
+	// dead endpoint cannot help, and the failure must reach the user fast.
+	everSucceeded := false
+
 	// Retry budgets for failing LLM stream calls, resolved once per run.
 	// Three independent tiers: infrastructure failures (transport errors,
 	// 408/5xx) draw from the classic maxRetries budget, HTTP 400 bad-body
@@ -734,6 +742,15 @@ func RunLoop(
 				// Non-retryable failure, same as before.
 				return "", err
 			case retryClassInfra:
+				if !everSucceeded && infraAttempts == 0 && isStreamDialFailure(err) {
+					// First-request fail-fast: the process has not yet had a
+					// single successful LLM stream, and this failure came
+					// from the dial phase — the server was never reached.
+					// No amount of backoff revives a dead endpoint, so
+					// surface the error now (fail within one attempt, not
+					// after the ~75s infra budget or more).
+					return "", err
+				}
 				if infraAttempts >= maxRetries {
 					return "", err
 				}
@@ -860,6 +877,7 @@ func RunLoop(
 		if err := sess.AddAssistantMessageWithTools(acc.Content, acc.Reasoning, acc.ToolCalls); err != nil {
 			return "", fmt.Errorf("failed to save history: %w", err)
 		}
+		everSucceeded = true
 
 		if onEndTurn != nil {
 			onEndTurn()

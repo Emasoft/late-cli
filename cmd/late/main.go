@@ -1128,6 +1128,7 @@ func main() {
 		restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents, nil)
 	}
 	model := tui.NewModel(rootAgent, renderer, appConfig)
+	model.PromptExitOn = *promptReq != ""
 	model.SetActiveThemeStyles(themeBytes)
 	if themeID != "" {
 		model.SelectedTheme = themeID
@@ -1798,9 +1799,20 @@ func main() {
 		})
 	}
 
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Unspecified error: %v", err)
+	finalModel, runErr := p.Run()
+	if runErr != nil {
+		fmt.Printf("Unspecified error: %v", runErr)
 		os.Exit(1)
+	}
+	// Prompt-exit (-prompt) mode: a terminal root-agent error recorded by
+	// the TUI (e.g. the very first chat-completions request failing against
+	// a dead LLM endpoint) surfaces here as a stderr error and a non-zero
+	// exit instead of the invisible, idle-forever TUI.
+	if *promptReq != "" {
+		if fm, ok := finalModel.(tui.Model); ok && fm.ExitErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", fm.ExitErr)
+			os.Exit(1)
+		}
 	}
 }
 

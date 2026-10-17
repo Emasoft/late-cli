@@ -316,6 +316,39 @@ func isPermanentNetworkError(ue *url.Error) bool {
 		strings.HasPrefix(msg, "http: server gave HTTP response to HTTPS client")
 }
 
+// isStreamDialFailure reports whether err came from the dial / handshake
+// phase of the HTTP request — the server was never reached (connection
+// refused, unroutable host, DNS failure, dial timeout, TLS/negotiation
+// error) — as opposed to a StatusError (the server responded) or a
+// StreamInterruptedError (the server accepted the request and the stream
+// died mid-body). RunLoop uses it for the first-request fail-fast: a dial
+// failure against an endpoint that has not yet served a single response
+// gains nothing from the infra backoff budget, so the error surfaces
+// immediately.
+func isStreamDialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var se *client.StatusError
+	if errors.As(err, &se) {
+		return false
+	}
+	var ie *client.StreamInterruptedError
+	if errors.As(err, &ie) {
+		return false
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		// url.Errors that isPermanentNetworkError treats as permanent (TLS
+		// cert failures, bad scheme) are dial-phase by definition too.
+		return true
+	}
+	return false
+}
+
 // isRetryableStreamError reports whether a failed LLM stream attempt should
 // be automatically retried from the infrastructure budget. See
 // classifyStreamError for the tiering; HTTP 429s are retried too, but from

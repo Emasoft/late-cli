@@ -221,6 +221,15 @@ type Model struct {
 	InspectingTool bool
 	LazyHistory    bool // When true, startup renders only the visible tail of history and defers older messages
 
+	// Prompt-exit mode (-prompt): the process was launched one-shot with a
+	// pre-filled prompt. When the ROOT agent's run terminates in an error
+	// (e.g. a dead LLM endpoint surfacing at the very first request), the
+	// TUI records the error and quits; cmd/late/main.go prints it to stderr
+	// and exits non-zero. Subagent failures never trigger this: background
+	// coders are not the run's own turn.
+	PromptExitOn bool
+	ExitErr      error
+
 	// Unified Orchestration
 	Root    common.Orchestrator
 	Focused common.Orchestrator

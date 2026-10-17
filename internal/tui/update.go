@@ -1958,6 +1958,16 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 				// toast on the next turn.
 				s.RetryVerb = ""
 				// We don't clear rendered history so user can see what happened
+				// Prompt-exit mode (-prompt): a terminal error on the ROOT
+				// agent means the one-shot run failed — record it for
+				// cmd/late/main.go (stderr print + non-zero exit) and quit.
+				if m.PromptExitOn && event.ID == m.Root.ID() {
+					m.ExitErr = event.Error
+					if event.Error == nil {
+						m.ExitErr = fmt.Errorf("agent run failed with unknown error")
+					}
+					return m, tea.Quit
+				}
 			default:
 				s.State = StateIdle
 				s.StatusText = "Ready"

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -47,6 +48,11 @@ var defaultRequestTimeout = 5 * time.Minute
 
 // SetRequestTimeout overrides defaultRequestTimeout (test use).
 func SetRequestTimeout(d time.Duration) { defaultRequestTimeout = d }
+
+// dialTimeout bounds the TCP connect and TLS handshake phases. A dead
+// endpoint must surface as an error on the first request instead of stalling
+// the dial for the OS TCP lifetime.
+const dialTimeout = 10 * time.Second
 
 type Config struct {
 	BaseURL      string
@@ -100,6 +106,16 @@ func NewClient(cfg Config) *Client {
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				DisableKeepAlives: true,
+				// Bound the CONNECT phase only: a dead endpoint (connection
+				// refused, unroutable host, dead TLS) must surface as an
+				// error quickly instead of hanging inside the dial /
+				// handshake for the OS TCP lifetime. An established,
+				// slow-but-healthy server is unaffected — no overall
+				// timeout is set (streaming responses are legitimately
+				// long-lived; stalls fold bounds via streamIdleTimeout and
+				// defaultRequestTimeout below).
+				DialContext:         (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout: dialTimeout,
 			},
 			// No client-level timeout: streaming responses are legitimately
 			// long-lived, so stalls are bounded by the stream idle watchdog
