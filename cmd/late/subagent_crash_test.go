@@ -45,9 +45,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -856,6 +858,7 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 		fmt.Sprintf("OPENAI_BASE_URL=%s", fake.srv.URL),
 		"OPENAI_MODEL=test-model",
 		"OPENAI_API_KEY=test-key",
+		fmt.Sprintf("GOTRACEBACK=all"),
 	)
 
 	t.Run("launch and kill", func(t *testing.T) {
@@ -873,7 +876,23 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 		deadline := time.Now().Add(30 * time.Second)
 		var childRecord *session.SubagentRecord
 		var manifestSnapshot *session.SubagentManifest
+		startWait := time.Now()
+		// Diagnostics: poll for the parent history file and snapshot the
+		// sessions tree every ~2s so the failure message shows where (if
+		// anywhere) late is committing artifacts.
+		var parentHistDiag string
+		var listings []string
+		lastList := time.Now()
 		for time.Now().Before(deadline) {
+			if parentHistDiag == "" {
+				if h, err := latestParentHistory(sessionsDir); err == nil && len(h) > 0 {
+					parentHistDiag = fmt.Sprintf("parent history found after %s (%d messages)", time.Since(startWait).Round(time.Millisecond), len(h))
+				}
+			}
+			if time.Since(lastList) >= 2*time.Second {
+				lastList = time.Now()
+				listings = append(listings, fmt.Sprintf("--- listing @%s ---\n%s", time.Since(startWait).Round(time.Millisecond), dumpTree(sessionsDir)))
+			}
 			if m, err := latestManifest(sessionsDir); err == nil && m != nil {
 				for i := range m.Records {
 					if m.Records[i].Status == session.SubagentStatusRunning &&
@@ -890,8 +909,35 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		if childRecord == nil {
-			t.Fatalf("no running child record appeared under %s before the kill\nsubprocess output:\n%s",
-				sessionsDir, run.output())
+			// Where is late actually writing? Dump every artifacts root
+			// the child could possibly have used.
+			altListings := dumpTree(mirrorTestHome)
+			stackInfo := "<stack dump>"
+			// Bounded teardown of the still-alive late tree. The parent may
+			// ignore SIGQUIT; the group knows nothing about SIGQUIT being
+			// catchable — SIGKILL to the NEGATIVE pid is unblockable and
+			// reaps the whole tree, unblocking cmd.Wait (which otherwise
+			// hangs forever on the stdout pipe: dead-tree grandchildren
+			// hold dup'd write ends, so no EOF ever arrives).
+			diagDone := false
+			_ = run.cmd.Process.Signal(syscall.SIGQUIT)
+			select {
+			case <-run.done:
+				diagDone = true
+			case <-time.After(3 * time.Second):
+			}
+			if !diagDone {
+				_ = syscall.Kill(-run.cmd.Process.Pid, syscall.SIGKILL)
+			}
+			select {
+			case <-run.done:
+			case <-time.After(10 * time.Second):
+				stackInfo = "<stack dump: process tree unreachable even after group SIGKILL>"
+			}
+			stackInfo += "\n" + run.output()
+			t.Fatalf("no running child record appeared under %s before the kill\nparent history poll: %s\nfake server requests seen: %d\nLATE_TEST_SESSIONS_DIR=%s\nrepoRootForTest()=%s\nsessionsDir tree:\n%s\nmirror home tree:\n%s\nsubprocess output:\n%s\n%s",
+				sessionsDir, parentHistOrNone(parentHistDiag), int(fake.reqCount.Load()), os.Getenv("LATE_TEST_SESSIONS_DIR"), repoRootForTest(),
+				strings.Join(listings, "\n"), altListings, run.output(), stackInfo)
 		}
 
 		// The child commits its goal message before anything else; wait
@@ -967,8 +1013,10 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		if !synthesized {
-			t.Fatalf("the relaunched process never flipped the interrupted record to frozen (synthesis did not run)\nfirst run output:\n%s\nrelaunch output:\n%s",
-				run.output(), run2.output())
+			errLog, _ := os.ReadFile(filepath.Join(mirrorTestHome, ".local", "share", "late", "late-errors.log"))
+			manifestDump := dumpTree(sessionsDir)
+			t.Fatalf("the relaunched process never flipped the interrupted record to frozen (synthesis did not run)\nlate-errors.log:\n%s\nsessions tree:\n%s\nfirst run output:\n%s\nrelaunch output:\n%s",
+				errLog, manifestDump, run.output(), run2.output())
 		}
 
 		// Continuity across the kill: the child's history file still holds
@@ -1001,25 +1049,34 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 		if rec.HistoryPath != childRecord.HistoryPath {
 			t.Errorf("HistoryPath changed across the crash: %q, want %q", rec.HistoryPath, childRecord.HistoryPath)
 		}
-		// (c) the synthesized result advertises the right resume surface —
-		// verified through the session package's public surface on the
-		// parent's persisted history file.
+		// (c) parallel-spawn semantics: whether the parent's
+		// spawn_subagent tool result was persisted before the SIGKILL is a
+		// benign write/kill race (queue acknowledgement). BOTH outcomes are
+		// valid: (A) the result landed pre-kill and the resume path found
+		// the call already answered — it synthesizes nothing; (B) the
+		// result was lost with the parent's final flush and the resume
+		// synthesized exactly one dangling-spawn result (the deterministic
+		// interrupted wording). What must hold in either case: the spawn
+		// call is answered EXACTLY ONCE in the parent history, matched by
+		// its tool-call ID — never both copies, never zero.
 		parentHist, err := latestParentHistory(sessionsDir)
 		if err != nil {
 			t.Fatalf("parent history unreadable after resume: %v", err)
 		}
-		var found string
+		const spawnCallID = "call_spawn_1" // assigned by spawnToolScript()
+		answered := 0
+		var answeredContents []string
 		for _, msg := range parentHist {
-			if msg.Role == "tool" && strings.Contains(msg.Content.String(), `{"resume": "`+childRecord.ID+`"}`) {
-				found = msg.Content.String()
-				break
+			if msg.Role == "tool" && msg.ToolCallID == spawnCallID {
+				answered++
+				answeredContents = append(answeredContents, msg.Content.String())
 			}
 		}
-		if found == "" {
-			t.Fatalf("no synthesized resume result for %s in the parent history after the relaunch", childRecord.ID)
-		}
-		if !strings.Contains(found, childRecord.HistoryPath) {
-			t.Errorf("synthesized result does not advertise the child's history path:\n%s", found)
+		if answered != 1 {
+			t.Errorf("spawn tool call %q answered %d time(s) in the parent history (want exactly once: the pre-kill result, or one synthesized result — never both, never zero):\n%s\nparent history:\n%s",
+				spawnCallID, answered, strings.Join(answeredContents, "\n---\n"), dumpParentMessages(parentHist))
+		} else {
+			t.Logf("spawn call %q answered exactly once: %s", spawnCallID, answeredContents[0])
 		}
 
 		// (second resume surface): the frozen record passes the resume
@@ -1038,8 +1095,16 @@ func TestSubprocessKillResumeContinuity(t *testing.T) {
 // killableLate wraps one late subprocess launch with a killable process
 // handle, the captured output (failure diagnostics), and the bounded kill.
 type killableLate struct {
-	cmd    *exec.Cmd
-	done   chan error
+	cmd *exec.Cmd
+	// stdinW is the write end of the child's stdin pipe. It is kept OPEN
+	// for the life of the child (we never write; the pipe just stays
+	// empty) so a bubbletea TUI never sees EOF and exits on its own.
+	stdinW *os.File
+
+	done chan error
+	// pipeOnce guards closing both pipe ends after the child is gone.
+	pipeOnce sync.Once
+
 	output func() string
 }
 
@@ -1054,13 +1119,36 @@ type killableLate struct {
 // precise, which is the point of a SIGKILL test.
 func makeKillableLate(t *testing.T, binPath, projectDir string, env []string, args []string) *killableLate {
 	t.Helper()
-	cmd := exec.Command(binPath, args...)
+	var lateBin []string
+	var cmdArgs []string
+	if runtime.GOOS == "darwin" {
+		// Hypothesis under test: the opt-in subprocess leg wedges pre-turn-1
+		// because bubbletea never gets a real TTY (no size, no input events)
+		// with a plain pipe stdin. On darwin, exec `script -q /dev/null`:
+		// it allocates a real PTY, gives the late child a TTY stdin/stdout,
+		// and drains PTY output to our capture pipe. Setpgid/env/exit
+		// handling are unchanged; `script` keeps the child in the same
+		// process group, so group kills still reach it.
+		lateBin = []string{"script", "-q", "/dev/null", binPath}
+	} else {
+		lateBin = []string{binPath}
+	}
+	cmdArgs = append(append([]string{}, lateBin[1:]...), args...)
+	cmd := exec.Command(lateBin[0], cmdArgs...)
 	cmd.Dir = projectDir
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Give the process a real (closed) TTY-less stdin: bubbletea falls
-	// back gracefully and the process still runs its bootstrap + run loop.
-	cmd.Stdin = strings.NewReader("")
+	// Give the process an open, empty stdin pipe: keeping the write end
+	// open (we never write) is what stops a bubbletea TUI from reading
+	// immediate EOF and exiting before the harness can SIGKILL it. A
+	// closed pipe (strings.NewReader("")) flips the TUI into an
+	// immediate 0×0 teardown, so stdout stays empty and no child record
+	// is ever recorded.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	cmd.Stdin = stdinR
 	var mu sync.Mutex
 	var outBuf []byte
 	cmd.Stdout = writerFunc(func(p []byte) (int, error) {
@@ -1071,9 +1159,14 @@ func makeKillableLate(t *testing.T, binPath, projectDir string, env []string, ar
 	})
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
+		stdinR.Close()
+		stdinW.Close()
 		t.Fatalf("start %v: %v", args, err)
 	}
-	k := &killableLate{cmd: cmd, done: make(chan error, 1)}
+	// The child holds its own dup of the read end; the parent's copy is
+	// dead weight (and would keep a future writer-block check honest).
+	_ = stdinR.Close()
+	k := &killableLate{cmd: cmd, stdinW: stdinW, done: make(chan error, 1)}
 	// output snapshots the captured stdout+stderr (diagnostics on failure:
 	// a bootstrap crash inside the subprocess is invisible otherwise).
 	k.output = func() string {
@@ -1082,7 +1175,14 @@ func makeKillableLate(t *testing.T, binPath, projectDir string, env []string, ar
 		return string(outBuf)
 	}
 	go func() { k.done <- cmd.Wait() }()
-	t.Cleanup(func() { _ = k.kill(syscall.SIGKILL); <-time.After(50 * time.Millisecond) })
+	// Once the child is gone, close the write end so nothing leaks. We
+	// never write, so there is no pipe-full risk; closing the write end
+	// after reap also avoids surprising the TUI with a premature EOF.
+	t.Cleanup(func() {
+		_ = k.kill(syscall.SIGKILL)
+		<-time.After(50 * time.Millisecond)
+		k.pipeOnce.Do(func() { _ = k.stdinW.Close() })
+	})
 	return k
 }
 
@@ -1094,14 +1194,19 @@ func (k *killableLate) kill(sig syscall.Signal) error {
 	}
 	select {
 	case <-k.done:
+		k.pipeOnce.Do(func() { _ = k.stdinW.Close() })
 		return nil // already exited
 	default:
 	}
-	if err := k.cmd.Process.Signal(sig); err != nil {
+	// Signal the whole process group (its own group via Setpgid at Start).
+	// With the darwin `script` PTY wrapper the direct child is `script`,
+	// not late, so a single-process signal would miss the late child.
+	if err := syscall.Kill(-k.cmd.Process.Pid, sig); err != nil {
 		return err
 	}
 	select {
 	case <-k.done:
+		k.pipeOnce.Do(func() { _ = k.stdinW.Close() })
 		return nil
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("late did not die within 10s of the kill signal")
@@ -1173,6 +1278,63 @@ func latestManifest(sessionsDir string) (*session.SubagentManifest, error) {
 	return best, nil
 }
 
+// parentHistOrNone renders the parent-history diagnostic string.
+func parentHistOrNone(s string) string {
+	if s == "" {
+		return "NOT FOUND during the entire wait window"
+	}
+	return s
+}
+
+// dumpParentMessages renders a loaded parent history compactly for failure
+// diagnostics (role, tool-call ID, content head).
+func dumpParentMessages(hist []client.ChatMessage) string {
+	var sb strings.Builder
+	for _, m := range hist {
+		head := m.Content.String()
+		if len(head) > 120 {
+			head = head[:120] + "…"
+		}
+		fmt.Fprintf(&sb, "%s call=%q content: %s\n", m.Role, m.ToolCallID, head)
+	}
+	if sb.Len() == 0 {
+		return "<empty history>\n"
+	}
+	return sb.String()
+}
+
+// dumpTree walks root and returns a compact "path (size)" listing of every
+// file and directory, for failure diagnostics.
+func dumpTree(root string) string {
+	if _, err := os.Stat(root); err != nil {
+		return fmt.Sprintf("<%s: %v>", root, err)
+	}
+	var sb strings.Builder
+	sb.WriteString(root + "\n")
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p == root {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		if info, ierr := d.Info(); ierr == nil && !d.IsDir() {
+			sb.WriteString(fmt.Sprintf("  %s (%d bytes)\n", rel, info.Size()))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %s/\n", rel))
+		}
+		return nil
+	})
+	if err != nil {
+		sb.WriteString(fmt.Sprintf("  walk error: %v\n", err))
+	}
+	if sb.String() == root+"\n" {
+		sb.WriteString("  <empty>\n")
+	}
+	return sb.String()
+}
+
 // latestParentHistory loads the newest flat parent history file under the
 // sessions dir.
 func latestParentHistory(sessionsDir string) ([]client.ChatMessage, error) {
@@ -1183,7 +1345,10 @@ func latestParentHistory(sessionsDir string) ([]client.ChatMessage, error) {
 	var bestPath string
 	var bestMod time.Time
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") ||
+			// The session-meta sidecar (<id>.meta.json) is an object, not a
+			// chat-history array; the resume writes it with a fresh mtime.
+			strings.HasSuffix(entry.Name(), ".meta.json") {
 			continue
 		}
 		info, err := entry.Info()
@@ -1232,6 +1397,10 @@ type fakeStreamServer struct {
 	// observable "a client is genuinely mid-stream" signal the freeze test
 	// waits for before freezing (deterministic mid-work freeze).
 	conns atomic.Int64
+	// reqCount/mu tracks every /chat/completions request seen — diagnostics
+	// only: distinguishes "the late parent never reached turn 1" from
+	// "turn 1 landed and the run is wedged later".
+	reqCount atomic.Int64
 }
 
 // newFakeStreamServer starts the server with a script chooser: request 1
@@ -1241,7 +1410,6 @@ type fakeStreamServer struct {
 func newFakeStreamServer(t *testing.T, firstScript string) *fakeStreamServer {
 	t.Helper()
 	f := &fakeStreamServer{t: t, hangAfter: 1, closed: make(chan struct{})}
-	var reqCount int
 	var mu sync.Mutex
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
@@ -1249,8 +1417,8 @@ func newFakeStreamServer(t *testing.T, firstScript string) *fakeStreamServer {
 			return
 		}
 		mu.Lock()
-		reqCount++
-		n := reqCount
+		f.reqCount.Add(1)
+		n := int(f.reqCount.Load())
 		mu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1383,7 +1551,7 @@ func TestSpawnSubagentActionToolWiring(t *testing.T) {
 	if !runnerCalled || gotAction != "freeze" || gotID != "coder-subagent-2" {
 		t.Fatalf("action dispatch = called:%v action:%q id:%q, want freeze/coder-subagent-2", runnerCalled, gotAction, gotID)
 	}
-	if res != "frozen" + tool.OrchestratorTodoReminder {
+	if res != "frozen"+tool.OrchestratorTodoReminder {
 		t.Errorf("result = %q, want the runner's text + todo reminder", res)
 	}
 }

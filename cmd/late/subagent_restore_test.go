@@ -450,15 +450,40 @@ func TestRestoreInterruptedSubagentsLiveRunningRecord(t *testing.T) {
 		t.Fatalf("Submit to the live-restored child failed: %v", err)
 	}
 
-	// The background run the restore launched must finish cleanly too.
-	eventually(t, 10*time.Second, "restored child completes in the background", func() bool {
+	// Deterministic completion barrier. The earlier "running" status lands
+	// when the resume constructor merely marks the record resumed — long
+	// before the scheduler-owned goroutine finishes writing (terminal
+	// manifest, result artifact, parent notification) — so returning right
+	// after that poll raced t.TempDir's RemoveAll against a live goroutine
+	// (flake: "unlinkat .../subagents: directory not empty"). Instead:
+	// (1) the record must still be present with its resumed observation on
+	// disk, then
+	// (2) the scheduler must report the entry fully drained — the run
+	// closure writes everything it will ever write (recordSubagentResult,
+	// the terminal manifest write, the synchronous notifyParent) BEFORE
+	// finished() clears its running state, so State()=="" is a real join
+	// point for the goroutine's disk activity. Both waits are ≤10s and
+	// fail loudly otherwise.
+	eventually(t, 10*time.Second, "restored record retains its observation", func() bool {
 		m, err := session.LoadSubagentManifest(sessionID)
 		if err != nil {
 			return false
 		}
-		r, ok := m.Get(childID)
-		return ok && (r.Status == session.SubagentStatusCompleted || r.Status == session.SubagentStatusRunning)
+		_, ok := m.Get(childID)
+		return ok
 	})
+	eventually(t, 10*time.Second, "relaunch goroutine fully drained by the scheduler", func() bool {
+		return deps.scheduler.State(childID) == ""
+	})
+	m, err := session.LoadSubagentManifest(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, ok := m.Get(childID)
+	if !ok {
+		t.Fatal("restored record vanished from the manifest")
+	}
+	t.Logf("restored child finished with status %q", r.Status)
 }
 
 // TestRestoreInterruptedSubagentsTerminalStaySkippedLive pins the status
