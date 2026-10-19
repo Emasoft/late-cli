@@ -70,7 +70,7 @@ func (r *transcriptRowRenderer) prose(source string) []string {
 				}
 				for line := range strings.SplitSeq(ansi.Wrap(paragraph, assistantReplyContentWidth(r.width), ""), "\n") {
 					rows = append(rows, r.cached("plain:", line, func() string {
-						return r.answer.Foreground(lipgloss.Color("#E6EDF3")).Render(line)
+						return r.answer.Foreground(textColor).Render(line)
 					})...)
 				}
 			}

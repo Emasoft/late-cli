@@ -1,10 +1,10 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"late/internal/client"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -30,6 +30,7 @@ type transcriptState struct {
 	welcome      bool
 	rows         []string
 	blocks       []RenderBlock
+	toolRows     map[int]string // first row of an expandable tool call -> its call id
 	cache        map[string][]string
 	fragments    map[string][]string
 	offset       int
@@ -39,6 +40,7 @@ type transcriptState struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 }
 
 type transcriptRenderedMsg struct {
@@ -51,15 +53,68 @@ type transcriptRenderedMsg struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 	rows         []string
 	blocks       []RenderBlock
+	toolRows     map[int]string
 	cache        map[string][]string
 	fragments    map[string][]string
 }
 
 type transcriptLabel struct {
+	// rendered is the label's rows joined by newlines: one badge row, plus the
+	// detail rows when the call is expanded.
 	rendered string
 	activity string
+	// id is the tool call this label belongs to when a click on its first row
+	// should expand or collapse it; empty for labels that cannot expand.
+	id string
+}
+
+// height is the number of rows the label occupies.
+func (l transcriptLabel) height() int { return strings.Count(l.rendered, "\n") + 1 }
+
+// toolExpanded reports whether the detail of a finished tool call is shown:
+// the global setting, flipped for calls the user toggled individually.
+func (m *Model) toolExpanded(s *AppState, id string) bool {
+	return m.ShowToolOutput != s.ToggledTools[id]
+}
+
+// toolResultsAfter collects the results of the tool calls made by history[i]:
+// tool messages follow their assistant message directly.
+func toolResultsAfter(history []client.ChatMessage, i int) map[string]string {
+	var results map[string]string
+	for _, h := range history[i+1:] {
+		if h.Role != "tool" {
+			break
+		}
+		if results == nil {
+			results = make(map[string]string)
+		}
+		results[h.ToolCallID] = h.Content.String()
+	}
+	return results
+}
+
+// toolDetail returns the rows shown under an expanded tool call.
+func (m *Model) toolDetail(tc client.ToolCall, result string, width int) []string {
+	if tc.Function.Name != "spawn_subagent" {
+		return toolDetailRows(tc.Function.Name, tc.Function.Arguments, result, width)
+	}
+	// A subagent's report is Markdown; render it once per theme and width.
+	inner := max(10, width-toolDetailLead)
+	key := fmt.Sprintf("%s|%d|%s", m.SelectedTheme, inner, tc.ID)
+	rendered, ok := m.reportCache[key]
+	if !ok {
+		rendered = m.renderMarkdownBlock(result, inner)
+		if len(m.reportCache) >= 64 {
+			clear(m.reportCache)
+		}
+		if m.reportCache != nil {
+			m.reportCache[key] = rendered
+		}
+	}
+	return reportDetailRows(rendered, width)
 }
 
 type transcriptEntry struct {
@@ -69,6 +124,11 @@ type transcriptEntry struct {
 	content   string
 	reasoning string
 	labels    []transcriptLabel
+	// raw is a block that is already styled and wrapped for the box it is
+	// drawn in. It follows the Markdown rendering of content in "approval"
+	// entries.
+	raw       string
+	timestamp string // RFC3339 receive time from the history message; empty for ephemeral/legacy entries
 }
 
 const (
@@ -85,6 +145,25 @@ func assistantReplyStyle(width int) lipgloss.Style {
 
 func assistantReplyContentWidth(width int) int {
 	return max(1, width-assistantReplyPadding*2)
+}
+
+// noticeBoxStyle is the bordered box notices and approval prompts are drawn in.
+func noticeBoxStyle() lipgloss.Style {
+	return aiMsgStyle.MarginLeft(1).Border(boxBorderStyle).BorderForeground(warningColor)
+}
+
+// approvalBoxStyle is the notice box with a one-column inset, so a diff or a
+// command does not sit hard against the border.
+func approvalBoxStyle() lipgloss.Style {
+	return noticeBoxStyle().Padding(0, 1)
+}
+
+// approvalInnerWidth is the number of columns of text that fit inside the
+// approval box when the transcript is width columns wide. The box is sized to
+// width minus its frame, and that size already includes the border and padding.
+func approvalInnerWidth(width int) int {
+	style := approvalBoxStyle()
+	return max(1, width-style.GetHorizontalFrameSize()-style.GetHorizontalBorderSize()-style.GetHorizontalPadding())
 }
 
 func thoughtBodyStyle(width int) lipgloss.Style {
@@ -248,7 +327,9 @@ func (m *Model) applyTranscript(result transcriptRenderedMsg) {
 	t.fragments = result.fragments
 	t.thinking, t.thinkingLine = result.thinking, result.thinkingLine
 	t.activities = result.activities
+	t.toolRows = result.toolRows
 	t.width, t.theme = result.width, result.theme
+	t.timestamps = result.timestamps
 	t.offset = min(t.offset, max(0, len(t.rows)-m.Viewport.Height()))
 	s.RenderBlocks = result.blocks
 	if result.partial {
@@ -268,7 +349,11 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		styles = LateTheme
 	}
 	width := max(1, m.Viewport.Width())
-	if t.width != width || t.theme != string(styles) {
+	// The timestamps flag participates in the render-invalidation checks:
+	// toggling /timestamps must discard cached block rows so prefixes are
+	// added or removed on the next pass.
+	timestampsChanged := t.timestamps != m.ShowTimestamps
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		t.dirty = true
 	}
 	if t.busy || !t.dirty {
@@ -279,11 +364,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	id, generation := m.Focused.ID(), t.generation
 	oldCache := t.cache
 	oldFragments := t.fragments
-	if t.width != width || t.theme != string(styles) {
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		oldCache = nil
 		oldFragments = nil
 	}
 	theme := string(styles)
+	showTimestamps := m.ShowTimestamps
 	entries := make([]transcriptEntry, 0, len(m.Focused.History())+3)
 	toolWidth := toolCallWidth(width)
 	toolLabels := func(calls []client.ToolCall, active bool) []transcriptLabel {
@@ -320,6 +406,10 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		isLatestAssistant := (i == len(history)-1) || (i == len(history)-2 && history[len(history)-1].Role == "tool")
 		calls := msg.ToolCalls
 		labels := make([]transcriptLabel, 0, len(calls))
+		var results map[string]string
+		if len(calls) > 0 {
+			results = toolResultsAfter(history, i)
+		}
 		for _, tc := range calls {
 			label := tc.Function.Name
 			if registry := m.Focused.Registry(); registry != nil {
@@ -327,28 +417,29 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 					label = tool.CallString([]byte(tc.Function.Arguments))
 				}
 			}
+			result, hasResult := results[tc.ID]
 			isActive := false
-			if isLatestAssistant && (s.State == StateThinking || s.State == StateStreaming) {
-				hasResult := false
-				for _, h := range history[i+1:] {
-					if h.Role == "tool" && h.ToolCallID == tc.ID {
-						hasResult = true
-						break
-					}
-				}
-				if !hasResult {
-					isActive = true
-					hasActiveTool = true
-				}
+			if isLatestAssistant && (s.State == StateThinking || s.State == StateStreaming) && !hasResult {
+				isActive = true
+				hasActiveTool = true
 			}
 			item := transcriptLabel{rendered: m.renderToolBadge(tc.Function.Name, label, false, toolWidth)}
-			if isActive {
+			switch {
+			case isActive:
 				item.activity = toolBadgeText(tc.Function.Name, label) + " · running"
 				item.rendered = m.renderActivityAt(item.activity, toolWidth, time.Unix(0, 0))
+			case hasResult:
+				outcome := summarizeToolOutcome(tc.Function.Name, tc.Function.Arguments, result)
+				expanded := m.toolExpanded(s, tc.ID)
+				item.id = tc.ID
+				item.rendered = toolBadgeWithOutcome(label, outcome, expanded, toolWidth)
+				if expanded {
+					item.rendered += "\n" + strings.Join(m.toolDetail(tc, result, toolWidth), "\n")
+				}
 			}
 			labels = append(labels, item)
 		}
-		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels}
+		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels, timestamp: msg.Timestamp}
 		if len(msg.AttachedFiles) > 0 {
 			names := make([]string, len(msg.AttachedFiles))
 			for j, f := range msg.AttachedFiles {
@@ -374,12 +465,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 	}
 	if s.State == StateConfirmTool && s.PendingConfirm != nil {
-		tc := s.PendingConfirm.ToolCall
-		name := tc.Function.Name
-		if runtime.GOOS == "windows" && name == "bash" {
-			name = "PowerShell"
+		preview := s.PendingConfirm.preview
+		if preview == nil {
+			preview = buildApprovalPreview(s.PendingConfirm.ToolCall)
 		}
-		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: fmt.Sprintf("The agent wants to execute **%s**.\n\n```json\n%s\n```\n\n**[y]** Allow once · **[s]** Session · **[p]** Project · **[g]** Global · **[n]** Deny", name, tc.Function.Arguments)})
+		maxRows := min(60, max(8, m.Viewport.Height()-14))
+		entries = append(entries, transcriptEntry{index: -1, role: "approval", content: preview.heading, raw: preview.render(approvalInnerWidth(width), maxRows)})
 	}
 	if s.State == StateContextWarning {
 		entries = append(entries, transcriptEntry{index: -1, role: "notice", content: "**Context Limit Warning**\n\nOver 90% of the context is used. Press Enter again to proceed, or start a new session."})
@@ -403,7 +494,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	// Glamour renderer; only immutable strings and cached rows cross threads.
 	headerStyle := thoughtHeaderStyle
 	queueStyle := queuedMsgStyle
-	noticeStyle := aiMsgStyle.MarginLeft(1).Border(boxBorderStyle).BorderForeground(warningColor)
+	noticeStyle := noticeBoxStyle()
 	errorStyle := noticeStyle.BorderForeground(errorBorderColor)
 	bg := appBgColor
 	activityHeader := m.renderActivityAt("thinking...", toolWidth, time.Unix(0, 0))
@@ -414,7 +505,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		var renderer *glamour.TermRenderer
 		var rendererErr error
 		initialized := false
-		result := transcriptRenderedMsg{activities: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
+		result := transcriptRenderedMsg{activities: make(map[int]string), toolRows: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if !initialized {
 				renderer, rendererErr = glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
@@ -431,7 +522,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		r := transcriptRowRenderer{width: width, background: bg, answer: answerStyle, thought: reasoningStyle, markdown: markdown, plainTheme: plainTheme, old: oldFragments, next: make(map[string][]string)}
 		for _, entry := range entries {
-			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels)
+			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.raw, entry.timestamp)
 			rows, ok := oldCache[key]
 			if ok && entry.active {
 				// An unchanged entry still owns its reusable rows. The maps are
@@ -440,6 +531,17 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			if !ok {
 				parts := make([]string, 0, 4)
+				// The receive time (HH:MM:SS) renders as a quiet footer inside
+				// the message surface, never as a row of its own on user
+				// cards and never ahead of the text: bottom-right of the
+				// prompt card, right-aligned under the reply. Legacy messages
+				// without a timestamp stay unstamped.
+				stamp := ""
+				if showTimestamps && entry.timestamp != "" {
+					if ts, err := time.Parse(time.RFC3339, entry.timestamp); err == nil {
+						stamp = ts.Format("15:04:05")
+					}
+				}
 				switch entry.role {
 				case "user":
 					text := strings.TrimRight(entry.content, "\r\n")
@@ -454,7 +556,15 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 								block += "\n" + label.rendered
 							}
 						}
-						parts = append(parts, "\n"+userPromptStyle(width).Render(block)+"\n")
+						card := userPromptStyle(width)
+						if stamp != "" {
+							// The stamp takes the card's bottom padding row, so
+							// toggling timestamps never changes the card height.
+							pad := max(0, innerWidth-lipgloss.Width(stamp))
+							block += "\n" + strings.Repeat(" ", pad) + userStampStyle.Render(stamp)
+							card = card.PaddingBottom(0)
+						}
+						parts = append(parts, "\n"+card.Render(block)+"\n")
 					}
 				case "assistant":
 					appendPart := func(text string) { rows = append(rows, r.normalize(text)...) }
@@ -479,6 +589,9 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						} else {
 							rendered := markdown(entry.content)
 							appendPart(answerStyle.Render(strings.Trim(rendered, "\r\n")))
+							if stamp != "" {
+								appendPart(answerStyle.Align(lipgloss.Right).Render(replyStampStyle.Render(stamp)))
+							}
 						}
 					}
 					if len(entry.labels) > 0 {
@@ -499,6 +612,13 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						style = errorStyle
 					}
 					parts = append(parts, style.Width(max(1, width-style.GetHorizontalFrameSize())).Render(markdown(entry.content)))
+				case "approval":
+					body := strings.Trim(markdown(entry.content), "\r\n")
+					if entry.raw != "" {
+						body += "\n\n" + entry.raw
+					}
+					box := approvalBoxStyle()
+					parts = append(parts, box.Width(max(1, width-box.GetHorizontalFrameSize())).Render(body))
 				case "queued":
 					parts = append(parts, queueStyle.Width(max(1, width-queueStyle.GetHorizontalMargins())).Render(entry.content))
 				case "raw":
@@ -525,9 +645,18 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 				result.activities[start] = "thinking..."
 			}
 			if len(entry.labels) > 0 {
-				for j, label := range entry.labels {
-					if label.activity != "" {
-						result.activities[start+len(rows)-1-len(entry.labels)+j] = label.activity
+				// The labels are the last rows of the entry, followed by one
+				// spacer row. Walk back from there: expanded labels span several
+				// rows, so each label's first row is found by subtracting the
+				// heights of the labels after it.
+				row := start + len(rows) - 1
+				for j := len(entry.labels) - 1; j >= 0; j-- {
+					row -= entry.labels[j].height()
+					if entry.labels[j].activity != "" {
+						result.activities[row] = entry.labels[j].activity
+					}
+					if entry.labels[j].id != "" {
+						result.toolRows[row] = entry.labels[j].id
 					}
 				}
 			}
@@ -555,6 +684,16 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 
 func transcriptError(err error) string {
 	text := err.Error()
+	// Typed context exhaustion (the executor guard's terminal error, the
+	// finish_reason=length wrap, or the provider classification) renders the
+	// dedicated card: the error text itself carries the compaction outcome
+	// ("context limit hit — auto-compacted (saved ~N tokens), …") and the
+	// manual recovery steps, so the card shows what late already tried.
+	if errors.Is(err, client.ErrContextExceeded) {
+		return fmt.Sprintf("**Context Limit Exceeded**\n\n%s", text)
+	}
+	// Legacy text matching: pre-dating the typed sentinel, some surfaces
+	// (saved transcripts, replayed errors) only carry the raw strings.
 	if strings.Contains(text, "exceeds the available context size") || strings.Contains(text, "context_length_exceeded") {
 		return "**Context Limit Exceeded**\n\nThis session has hit the model's absolute context limit. Please **start a new session** to continue your work."
 	}

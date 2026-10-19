@@ -107,7 +107,7 @@ The orchestrator’s context grows primarily from what actually matters: your in
 | **Startup Time** | **Instant (<10ms native Go, feels like `htop`)** | 1s–3s+ (Node.js / Python runtimes) |
 | **System Prompt** | **~1,000 tokens (Lean & focused)** | 3,000–10,000+ tokens (From No-Workflow to Over-Constrained Bloat) |
 | **Sandboxing** | **Native rootless devcontainers (`late-podman`)** | No equivalent built-in workflow |
-| **Setup Required** | **None (Automatic `llama-server` on `:8080`)** | Requires provider/config setup |
+| **Setup Required** | **None (Automatic `llama-server` on `:9931`)** | Requires provider/config setup |
 | **Telemetry** | **None** | Telemetry by default |
 
 <p align="center"><b>If Late makes your model feel smarter, <a href="https://github.com/mlhher/late-cli">give it a ⭐ on GitHub</a></b></p>
@@ -164,7 +164,7 @@ Late is engineered as an end-to-end harness:
 
 **Does Late work with local models?**
 
-Zero config. Point `llama-server` at any GGUF and Late connects on `:8080` automatically.
+Zero config. Point `llama-server` at any GGUF and Late connects on `:9931` automatically.
 
 ---
 
@@ -173,7 +173,7 @@ Zero config. Point `llama-server` at any GGUF and Late connects on `:8080` autom
 Late is completely model-agnostic.
 
 **Local Models (Zero Config):**
-No configuration required. Late targets `llama.cpp` on port `:8080` (the default for `llama-server`).
+No configuration required. Late targets `llama.cpp` on port `:9931` (the default for `llama-server`).
 
 **Cloud Providers (DeepSeek, Claude, GPT, Kimi, GLM, OpenRouter):**
 
@@ -195,6 +195,7 @@ export OPENAI_MODEL="model-name"
   * `/compose`: Pop open your preferred `$EDITOR` (Neovim, Vim, Helix, VS Code) to draft complex, multi-line instructions.
   * `/rewind`: Visual history scrubber to roll back turns and branch conversational states.
   * `/infobar`: Toggle the info footer (version, model, context, subagents, skills, uptime); the toggle persists to `config.json`.
+  * `/timestamps`: Toggle quiet `HH:MM:SS` message timestamps; the toggle persists to `config.json`.
   * `late --prompt "..."`: Start a session with a pre-given prompt, useful for running it from other scripts.
 * **Auditable Subagent History:** Full subagent conversation transcripts and metadata are persisted to disk for total transparency and debugging—without poisoning the orchestrator's active context window. Opt-in persistence protects your disk space while ensuring you can debug overnight autopilot runs.
 * **Exact-Match Diffs & Autonomous Healing:** Strict `search`/`replace` editing with automatic self-healing on mismatch. Edits fail loud; files are never silently corrupted.

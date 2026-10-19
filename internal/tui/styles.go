@@ -24,6 +24,17 @@ var (
 	borderColor  = lipgloss.Color("#1C1F26") // Hairline Divider
 	activeBorder = lipgloss.Color("#2D323E") // Focused / Active Border
 
+	// Diff row tints (tool approval previews)
+	diffAddBgColor = lipgloss.Color("#10241C") // Added line: emerald-tinted obsidian
+	diffDelBgColor = lipgloss.Color("#2A1519") // Removed line: coral-tinted obsidian
+
+	todoTitleColor = lipgloss.Color("#7D56F4") // Violet title of the todo pane
+
+	// Accents that are derived from the palette instead of being free-standing
+	// hex values, so they can never drift away from it.
+	peakColor = lipgloss.Lighten(secondaryColor, 0.2) // crest of the streaming equalizer
+	auraColor = lipgloss.Darken(primaryColor, 0.15)   // glow around the thinking scanner
+
 	// Centralized Border Styles & Colors
 	boxBorderStyle   = lipgloss.RoundedBorder()
 	modalBorderColor = secondaryColor // Primary border color for dialogs & overlays (/help, /themes, commit detail)
@@ -108,6 +119,14 @@ var (
 	attachmentStyle = lipgloss.NewStyle().
 			Foreground(subtextColor).
 			Italic(true)
+
+	// Optional message timestamps (HH:MM:SS): quiet footers, never italic.
+	userStampStyle = lipgloss.NewStyle().
+			Foreground(subtextColor).
+			Background(cardBgColor)
+	replyStampStyle = lipgloss.NewStyle().
+			Foreground(subtextColor).
+			Background(appBgColor)
 
 	// AI Response
 	aiMsgStyle = baseStyle.Copy().
