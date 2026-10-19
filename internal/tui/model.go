@@ -101,6 +101,8 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		AppConfig:           cfg,
 		SelectedTheme:       "default",
 		activeThemeStyles:   LateTheme,
+		ShowInfoBar:         cfg != nil && cfg.ShowInfoBar,
+		turn:                &turnTimer{},
 		ShowTimestamps:      cfg != nil && cfg.ShowTimestamps,
 	}
 

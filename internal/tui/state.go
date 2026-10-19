@@ -48,6 +48,10 @@ const (
 const (
 	StatusBarHeight = 2
 	AppPadding      = 0
+	// InfoBarHeight is the extra footer row reserved when the info bar is
+	// shown (toggled via /infobar). The info bar is a borderless single
+	// line rendered below the status bar.
+	InfoBarHeight = 1
 )
 
 // CommandDef defines a slash command and its description.
@@ -60,6 +64,7 @@ type CommandDef struct {
 var AvailableCommands = []CommandDef{
 	{Name: "/compose", Description: "Compose a message with an editor"},
 	{Name: "/help", Description: "Show help and shortcuts"},
+	{Name: "/infobar", Description: "Toggle the info bar"},
 	{Name: "/log", Description: "View git commit log"},
 	{Name: "/model", Description: "Select AI model for agents"},
 	{Name: "/new", Description: "Start fresh conversation"},
@@ -195,6 +200,14 @@ type Model struct {
 	ShowTodoPane     bool
 	TodoPaneFocused  bool
 	TodoScrollOffset int
+
+	// Info bar (toggled via /infobar, persisted as config show-info-bar).
+	// A view-level setting, not per-agent. PermissionMode is the resolved
+	// config.PermissionMode* value, set once from cmd/late/main.go. turn
+	// times the current or last user turn across all agents.
+	ShowInfoBar    bool
+	PermissionMode string
+	turn           *turnTimer
 
 	// Timestamps (toggled via /timestamps, persisted as config
 	// show-timestamps). A view-level setting, not per-agent: when set,
@@ -332,6 +345,16 @@ func (m *Model) GetAgentState(id string) *AppState {
 	}
 	m.AgentStates[id] = s
 	return s
+}
+
+// infoBarHeight returns the number of extra footer rows the info bar
+// occupies right now. It mirrors the status bar's own visibility rule: the
+// bar is hidden while the file picker is open, so no row is reserved.
+func (m *Model) infoBarHeight() int {
+	if m.ShowInfoBar && !m.ShowFilePicker {
+		return InfoBarHeight
+	}
+	return 0
 }
 
 func (m *Model) hasActiveAgent() bool {

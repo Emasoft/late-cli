@@ -721,6 +721,8 @@ func main() {
 	model.ShowCWD = *showCWDReq
 	model.LazyHistory = true
 
+	model.PermissionMode = permissionMode
+
 	pOpts := []tea.ProgramOption{
 		tea.WithFPS(tui.FrameRate),
 	}
