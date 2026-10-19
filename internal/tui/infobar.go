@@ -17,16 +17,28 @@ import (
 // the live row (activity, focus, speed, context); this one carries what the
 // session is made of and how it is going:
 //
-//	provider · model   approval ask   todos 3/7   subagents 2 running          turn 1m42s
+//	host · model   approval ask   todos 3/7   subagents 2 running          turn 1m42s
 //
 // Model and approval mode are always shown; the rest are there when they have
 // something to say. When the window is too narrow, whole segments are dropped
-// (turn time first, then todos, subagents, approval) instead of being cut in
-// half; the model name is the last thing truncated.
+// (the endpoint host first, then turn time, todos, subagents, approval)
+// instead of being cut in half; the model name is the last thing truncated.
 
 // infoBarGap is the minimum space kept between the left cluster and the turn
 // time.
 const infoBarGap = 2
+
+// Caps that keep a long endpoint host or model name from taking the whole row
+// on a wide terminal.
+const (
+	infoBarHostMax  = 24
+	infoBarModelMax = 40
+)
+
+// clipInfo shortens s to at most n columns, marking the cut with an ellipsis.
+func clipInfo(s string, n int) string {
+	return ansi.Truncate(s, n, "…")
+}
 
 // infoBarSegment is one rendered piece of the row.
 type infoBarSegment struct {
@@ -91,11 +103,14 @@ func (m *Model) infoBarView() string {
 	warn := bg(warningColor).Bold(true)
 	sep := label.Render("  ·  ")
 
-	// Model: the one segment that is never dropped. Truncated last.
-	ref, name := m.focusedModelInfo()
-	modelText := strong.Render(name)
-	if ref != "" {
-		modelText = value.Render(ref) + label.Render(" · ") + modelText
+	// Model: the one segment that is never dropped, truncated last. The
+	// endpoint host in front of it is the first thing to go when space runs
+	// out.
+	host, name := m.focusedModelInfo()
+	bareModel := strong.Render(clipInfo(name, infoBarModelMax))
+	fullModel := bareModel
+	if host != "" {
+		fullModel = value.Render(clipInfo(host, infoBarHostMax)) + label.Render(" · ") + bareModel
 	}
 
 	// Approval mode: always shown, loud when nothing asks first.
@@ -143,7 +158,7 @@ func (m *Model) infoBarView() string {
 		seg  infoBarSegment
 		keep int
 	}
-	candidates := []candidate{{newInfoBarSegment(modelText), 0}}
+	candidates := []candidate{{newInfoBarSegment(fullModel), 0}}
 	candidates = append(candidates, candidate{newInfoBarSegment(approval), 4})
 	candidates = append(candidates, candidate{newInfoBarSegment(todos), 2})
 	if subagents != "" {
@@ -169,8 +184,15 @@ func (m *Model) infoBarView() string {
 		}
 		return total
 	}
-	// Drop the turn time first, then the lowest-priority left segments.
+	// Drop the host first, then the turn time, then the lowest-priority left
+	// segments.
+	hostShown := host != ""
 	for layoutWidth() > avail {
+		if hostShown {
+			hostShown = false
+			candidates[0].seg = newInfoBarSegment(bareModel)
+			continue
+		}
 		if right.width > 0 {
 			right = infoBarSegment{}
 			continue

@@ -169,7 +169,7 @@ func TestInfoBarRenderContents(t *testing.T) {
 	m.Focused = &typedOrchestrator{mockOrchestrator{}, "researcher-subagent-0"}
 
 	plain := ansi.Strip(m.infoBarView())
-	for _, want := range []string{"provider-a · gpt-test", "approval ask", "todos –"} {
+	for _, want := range []string{"a.example · gpt-test", "approval ask", "todos –"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("expected %q in %q", want, plain)
 		}
@@ -189,6 +189,61 @@ func TestInfoBarRenderContents(t *testing.T) {
 	plain = ansi.Strip(m.infoBarView())
 	if !strings.Contains(plain, "subagents 2 running, 1 awaiting approval") {
 		t.Errorf("expected subagent summary in %q", plain)
+	}
+}
+
+func TestEndpointHost(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://api.deepseek.com", "api.deepseek.com"},
+		{"https://API.DeepSeek.com/v1/", "api.deepseek.com"},
+		{"http://localhost:9931", "localhost:9931"},
+		{"http://localhost:9931/v1", "localhost:9931"},
+		{"localhost:9931", "localhost:9931"},
+		{"https://user:secret@host.example:8443/x", "host.example:8443"},
+		{"http://[::1]:8080/v1", "[::1]:8080"},
+		{"", ""},
+		{"   ", ""},
+		{"http://bad host/", ""},
+	}
+	for _, tc := range cases {
+		if got := endpointHost(tc.in); got != tc.want {
+			t.Errorf("endpointHost(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestInfoBarClipsLongHostAndModel(t *testing.T) {
+	cfg := &config.Config{
+		Models:      []config.ModelSetting{{ID: "x", URL: "https://a-very-long-internal-hostname.corp.example.com", Model: strings.Repeat("m", 60)}},
+		AgentModels: map[string]string{"orchestrator": "x"},
+	}
+	m := NewModel(&mockOrchestrator{}, nil, cfg)
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
+	m.ShowInfoBar = true
+	m.Width = 200
+	plain := ansi.Strip(m.infoBarView())
+	if strings.Contains(plain, "corp.example.com") || strings.Contains(plain, strings.Repeat("m", 41)) {
+		t.Errorf("host and model should be clipped to their caps: %q", plain)
+	}
+	if strings.Count(plain, "…") != 2 {
+		t.Errorf("expected one ellipsis for the host and one for the model: %q", plain)
+	}
+}
+
+func TestInfoBarFallbackHostFollowsResolvedEndpoints(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "http://main.test:1")
+	t.Setenv("LATE_SUBAGENT_BASE_URL", "http://sub.test:2")
+	m := NewModel(&mockOrchestrator{}, nil, &config.Config{})
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, common.MainAgentID}
+	m.ModelName = "main-model"
+	m.SubagentInfo = "sub-model"
+
+	if host, name := m.focusedModelInfo(); host != "main.test:1" || name != "main-model" {
+		t.Errorf("orchestrator = (%q, %q), want (main.test:1, main-model)", host, name)
+	}
+	m.Focused = &typedOrchestrator{mockOrchestrator{}, "coder-subagent-0"}
+	if host, name := m.focusedModelInfo(); host != "sub.test:2" || name != "sub-model" {
+		t.Errorf("subagent = (%q, %q), want (sub.test:2, sub-model)", host, name)
 	}
 }
 
@@ -344,6 +399,7 @@ func TestTurnDuration(t *testing.T) {
 }
 
 func TestInfoBarDropsWholeSegmentsWhenNarrow(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "http://h.test:1")
 	m := NewModel(&mockOrchestrator{}, nil, &config.Config{})
 	m.ShowInfoBar = true
 	m.ModelName = "model-x"
@@ -354,7 +410,10 @@ func TestInfoBarDropsWholeSegmentsWhenNarrow(t *testing.T) {
 	m.turn.observe(true, t0)
 
 	widths := map[int][]string{
-		120: {"model-x", "approval ask", "todos", "subagents 1 running", "turn 1m30s"},
+		120: {"h.test:1 · model-x", "approval ask", "todos", "subagents 1 running", "turn 1m30s"},
+		86:  {"h.test:1 · model-x", "approval ask", "todos", "subagents 1 running", "turn 1m30s"},
+		80:  {"model-x", "approval ask", "todos", "subagents 1 running", "turn 1m30s"},
+		70:  {"model-x", "approval ask", "todos", "subagents 1 running"},
 		62:  {"model-x", "approval ask", "todos", "subagents 1 running"},
 		50:  {"model-x", "approval ask", "subagents 1 running"},
 		44:  {"model-x", "approval ask"},
@@ -372,6 +431,12 @@ func TestInfoBarDropsWholeSegmentsWhenNarrow(t *testing.T) {
 			if !strings.Contains(plain, want) {
 				t.Errorf("width %d: expected %q in %q", w, want, plain)
 			}
+		}
+		if w < 86 && strings.Contains(plain, "h.test:1") {
+			t.Errorf("width %d: the host should be the first thing dropped: %q", w, plain)
+		}
+		if w < 80 && strings.Contains(plain, "turn") {
+			t.Errorf("width %d: the turn time should be dropped before todos: %q", w, plain)
 		}
 		if strings.Contains(plain, "…") && w >= 30 {
 			t.Errorf("width %d: segments should drop whole, not truncate: %q", w, plain)

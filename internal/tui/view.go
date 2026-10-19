@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"late/internal/common"
+	"late/internal/config"
 	"late/internal/pathutil"
 
 	"charm.land/bubbles/v2/spinner"
@@ -767,30 +769,52 @@ func agentTypeForID(id string) string {
 	return ""
 }
 
-// focusedModelInfo resolves the provider/profile reference and model name
-// shown for the focused agent. An explicit config.AgentModels entry for the
-// focused agent's type wins (ModelSetting.Reference is the stable ID the
-// /model picker stores); otherwise the orchestrator model surfaced by
-// main.go (ModelName, kept current by the picker) is used. For a subagent
-// without its own entry, SubagentInfo names the subagent backend when it is
-// a single model (it is a comma-joined "type:model" list only when several
-// subagent types have explicit entries).
-func (m *Model) focusedModelInfo() (ref, name string) {
+// focusedModelInfo resolves the endpoint host and model name shown for the
+// focused agent. An explicit config.AgentModels entry for the focused agent's
+// type wins; otherwise the orchestrator model surfaced by main.go (ModelName,
+// kept current by the picker) is used, with the endpoint resolved the same way
+// main.go and the picker resolve it. For a subagent without its own entry,
+// SubagentInfo names the subagent backend when it is a single model (it is a
+// comma-joined "type:model" list only when several subagent types have
+// explicit entries).
+func (m *Model) focusedModelInfo() (host, name string) {
 	agentType := agentTypeForID(m.Focused.ID())
 	if agentType != "" && m.AppConfig != nil {
 		if setting, ok := m.AppConfig.GetModelForAgent(agentType); ok {
-			return setting.Reference(), setting.Model
+			return endpointHost(setting.URL), setting.Model
 		}
 	}
+	openAI := config.ResolveOpenAISettings(m.AppConfig)
+	baseURL := openAI.BaseURL
 	name = m.ModelName
 	if agentType != "orchestrator" && m.SubagentInfo != "" &&
 		!strings.Contains(m.SubagentInfo, ":") && !strings.Contains(m.SubagentInfo, ",") {
 		name = m.SubagentInfo
+		baseURL = config.ResolveSubagentSettings(m.AppConfig, openAI).BaseURL
 	}
 	if name == "" {
 		name = "default"
 	}
-	return "", name
+	return endpointHost(baseURL), name
+}
+
+// endpointHost reduces a base URL to the part that tells endpoints apart:
+// host[:port] without scheme, credentials or path. A port appears only when
+// the URL spells one out, so a hosted API reads api.example.com and a local
+// server reads localhost:9931. Anything unparseable yields "".
+func endpointHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
 }
 
 func (m *Model) updateViewport() {
