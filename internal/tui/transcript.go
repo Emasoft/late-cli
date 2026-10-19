@@ -40,6 +40,7 @@ type transcriptState struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 }
 
 type transcriptRenderedMsg struct {
@@ -52,6 +53,7 @@ type transcriptRenderedMsg struct {
 	generation   uint64
 	width        int
 	theme        string
+	timestamps   bool
 	rows         []string
 	blocks       []RenderBlock
 	toolRows     map[int]string
@@ -125,7 +127,8 @@ type transcriptEntry struct {
 	// raw is a block that is already styled and wrapped for the box it is
 	// drawn in. It follows the Markdown rendering of content in "approval"
 	// entries.
-	raw string
+	raw       string
+	timestamp string // RFC3339 receive time from the history message; empty for ephemeral/legacy entries
 }
 
 const (
@@ -326,6 +329,7 @@ func (m *Model) applyTranscript(result transcriptRenderedMsg) {
 	t.activities = result.activities
 	t.toolRows = result.toolRows
 	t.width, t.theme = result.width, result.theme
+	t.timestamps = result.timestamps
 	t.offset = min(t.offset, max(0, len(t.rows)-m.Viewport.Height()))
 	s.RenderBlocks = result.blocks
 	if result.partial {
@@ -345,7 +349,11 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		styles = LateTheme
 	}
 	width := max(1, m.Viewport.Width())
-	if t.width != width || t.theme != string(styles) {
+	// The timestamps flag participates in the render-invalidation checks:
+	// toggling /timestamps must discard cached block rows so prefixes are
+	// added or removed on the next pass.
+	timestampsChanged := t.timestamps != m.ShowTimestamps
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		t.dirty = true
 	}
 	if t.busy || !t.dirty {
@@ -356,11 +364,12 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 	id, generation := m.Focused.ID(), t.generation
 	oldCache := t.cache
 	oldFragments := t.fragments
-	if t.width != width || t.theme != string(styles) {
+	if t.width != width || t.theme != string(styles) || timestampsChanged {
 		oldCache = nil
 		oldFragments = nil
 	}
 	theme := string(styles)
+	showTimestamps := m.ShowTimestamps
 	entries := make([]transcriptEntry, 0, len(m.Focused.History())+3)
 	toolWidth := toolCallWidth(width)
 	toolLabels := func(calls []client.ToolCall, active bool) []transcriptLabel {
@@ -430,7 +439,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			labels = append(labels, item)
 		}
-		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels}
+		entry := transcriptEntry{index: i, role: msg.Role, content: content, reasoning: msg.ReasoningContent, labels: labels, timestamp: msg.Timestamp}
 		if len(msg.AttachedFiles) > 0 {
 			names := make([]string, len(msg.AttachedFiles))
 			for j, f := range msg.AttachedFiles {
@@ -496,7 +505,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		var renderer *glamour.TermRenderer
 		var rendererErr error
 		initialized := false
-		result := transcriptRenderedMsg{activities: make(map[int]string), toolRows: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, cache: make(map[string][]string, len(entries))}
+		result := transcriptRenderedMsg{activities: make(map[int]string), toolRows: make(map[int]string), partial: partial, welcome: welcome, id: id, generation: generation, width: width, theme: theme, timestamps: showTimestamps, cache: make(map[string][]string, len(entries))}
 		markdown := func(source string) string {
 			if !initialized {
 				renderer, rendererErr = glamour.NewTermRenderer(glamour.WithStylesFromJSONBytes([]byte(theme)), glamour.WithWordWrap(assistantReplyContentWidth(width)), glamour.WithPreservedNewLines())
@@ -513,7 +522,7 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 		}
 		r := transcriptRowRenderer{width: width, background: bg, answer: answerStyle, thought: reasoningStyle, markdown: markdown, plainTheme: plainTheme, old: oldFragments, next: make(map[string][]string)}
 		for _, entry := range entries {
-			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.raw)
+			key := fmt.Sprintf("%t:%d:%s:%d:%s:%d:%s:%v:%s:%s", entry.active, len(entry.role), entry.role, len(entry.content), entry.content, len(entry.reasoning), entry.reasoning, entry.labels, entry.raw, entry.timestamp)
 			rows, ok := oldCache[key]
 			if ok && entry.active {
 				// An unchanged entry still owns its reusable rows. The maps are
@@ -522,6 +531,17 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			if !ok {
 				parts := make([]string, 0, 4)
+				// The receive time (HH:MM:SS) renders as a quiet footer inside
+				// the message surface, never as a row of its own on user
+				// cards and never ahead of the text: bottom-right of the
+				// prompt card, right-aligned under the reply. Legacy messages
+				// without a timestamp stay unstamped.
+				stamp := ""
+				if showTimestamps && entry.timestamp != "" {
+					if ts, err := time.Parse(time.RFC3339, entry.timestamp); err == nil {
+						stamp = ts.Format("15:04:05")
+					}
+				}
 				switch entry.role {
 				case "user":
 					text := strings.TrimRight(entry.content, "\r\n")
@@ -536,7 +556,15 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 								block += "\n" + label.rendered
 							}
 						}
-						parts = append(parts, "\n"+userPromptStyle(width).Render(block)+"\n")
+						card := userPromptStyle(width)
+						if stamp != "" {
+							// The stamp takes the card's bottom padding row, so
+							// toggling timestamps never changes the card height.
+							pad := max(0, innerWidth-lipgloss.Width(stamp))
+							block += "\n" + strings.Repeat(" ", pad) + userStampStyle.Render(stamp)
+							card = card.PaddingBottom(0)
+						}
+						parts = append(parts, "\n"+card.Render(block)+"\n")
 					}
 				case "assistant":
 					appendPart := func(text string) { rows = append(rows, r.normalize(text)...) }
@@ -561,6 +589,9 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						} else {
 							rendered := markdown(entry.content)
 							appendPart(answerStyle.Render(strings.Trim(rendered, "\r\n")))
+							if stamp != "" {
+								appendPart(answerStyle.Align(lipgloss.Right).Render(replyStampStyle.Render(stamp)))
+							}
 						}
 					}
 					if len(entry.labels) > 0 {

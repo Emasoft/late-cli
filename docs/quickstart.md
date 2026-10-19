@@ -164,6 +164,13 @@ Every finished tool call shows its outcome on the same row: `✓ +3 -1` for an e
 
 ---
 
+## Message Timestamps
+
+* `/timestamps` toggles quiet `HH:MM:SS` timestamps on transcript messages (bottom-right of your prompt card, right-aligned under each reply).
+* The toggle persists to `config.json` (`show-timestamps`).
+
+---
+
 ## Tool Approval
 
 Potentially destructive commands and file changes require approval unless you have already granted permission for that scope.

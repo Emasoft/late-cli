@@ -119,6 +119,12 @@ type Config struct {
 	Models      []ModelSetting    `json:"models,omitempty"`
 	AgentModels map[string]string `json:"agent_models,omitempty"`
 
+	// ShowTimestamps toggles the HH:MM:SS stamp rendered at the foot
+	// of each transcript message block. Toggled at runtime with the
+	// /timestamps slash command, which persists the new value back to
+	// config.json.
+	ShowTimestamps bool `json:"show-timestamps,omitempty"`
+
 	// Degraded is set by LoadConfig when config.json exists but could not
 	// be read or parsed: the returned config is a fallback default, not
 	// the user's real settings. SaveConfig refuses to persist a degraded
