@@ -445,10 +445,11 @@ func main() {
 	}
 	resolvedSubagentConfig := appconfig.ResolveSubagentSettings(appConfig, resolvedOpenAIConfig)
 
-	// Resolve the startup state of the todos side pane. The panel is open
-	// by default; config.json "show-todo-pane": false starts with it
-	// closed. Width handling happens in the TUI (see model.ShowTodoPane).
+	// Resolve the todos side pane: closed until the first todos are created
+	// (then it opens by itself), unless config.json "show-todo-pane" says
+	// otherwise. Width handling happens in the TUI (see model.ShowTodoPane).
 	showTodoPane := appConfig.ResolveShowTodoPane()
+	autoOpenTodoPane := appConfig.AutoOpenTodoPane()
 
 	// Validate --suppress-thinking-words: only allowed in homogeneous setups
 	if err := validateSuppressThinkingWords(*suppressThinkingWordsReq, resolvedClientConfig.Model, resolvedSubagentConfig.Model, appConfig); err != nil {
@@ -732,6 +733,7 @@ func main() {
 	// size cannot be detected here, the initial WindowSizeMsg runs the same
 	// updateLayout path.
 	model.ShowTodoPane = showTodoPane
+	model.TodoPaneAuto = autoOpenTodoPane
 	model.LazyHistory = true
 
 	model.PermissionMode = permissionMode

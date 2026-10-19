@@ -115,10 +115,11 @@ type Config struct {
 
 	SkillsDir string `json:"skills_dir,omitempty"`
 
-	// ShowTodoPane controls whether the todos side pane starts open.
-	// The todos panel is open by default; set false to start with it
-	// closed. Terminals narrower than 85 columns always start with the
-	// pane closed; it can be opened later with /todos.
+	// ShowTodoPane controls the todos side pane. Absent (the default): the
+	// pane starts closed and opens by itself the first time todos are
+	// created. true: it starts open. false: it starts closed and never opens
+	// by itself. Terminals narrower than 85 columns keep it closed; /todos
+	// toggles it either way.
 	ShowTodoPane *bool `json:"show-todo-pane,omitempty"`
 
 	Theme       string            `json:"theme,omitempty"`
@@ -354,17 +355,19 @@ func ResolvePermissionMode(cfg *Config, askFlag, unsupervisedFlag bool) (mode st
 }
 
 // ResolveShowTodoPane returns whether the todos side pane should be open
-// when the TUI starts. The todos panel is open by default; set
-// "show-todo-pane": false in config.json to start with it closed.
-// An absent entry (nil pointer) resolves to true, an explicit false to
-// false, and an explicit true to true. A nil config also resolves to the
-// open default. Terminal width is not considered here: the TUI silently
-// keeps the pane closed below 85 columns.
+// when the TUI starts: only an explicit "show-todo-pane": true opens it at
+// startup. Absent, the pane starts closed and AutoOpenTodoPane opens it once
+// todos exist. Terminal width is not considered here: the TUI keeps the pane
+// closed below 85 columns.
 func (cfg *Config) ResolveShowTodoPane() bool {
-	if cfg == nil || cfg.ShowTodoPane == nil {
-		return true
-	}
-	return *cfg.ShowTodoPane
+	return cfg != nil && cfg.ShowTodoPane != nil && *cfg.ShowTodoPane
+}
+
+// AutoOpenTodoPane returns whether the pane opens by itself the first time
+// todos are created. That is the default (entry absent); an explicit
+// "show-todo-pane" value, true or false, takes that decision away.
+func (cfg *Config) AutoOpenTodoPane() bool {
+	return cfg == nil || cfg.ShowTodoPane == nil
 }
 
 func nonEmptyEnv(lookup EnvLookup, key string) (string, bool) {

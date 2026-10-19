@@ -77,8 +77,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	if nm, ok := next.(Model); ok {
 		nm.turn.observe(nm.hasActiveAgent(), time.Now())
+		return nm.autoOpenTodoPane(), cmd
 	}
 	return next, cmd
+}
+
+// autoOpenTodoPane opens the todos pane the first time the orchestrator has
+// todos, when the pane is armed (show-todo-pane unset) and the terminal is
+// wide enough. If the terminal is too narrow it stays armed, so widening the
+// window later opens it. Opening reflows the transcript to the narrower
+// width, exactly like /todos.
+func (m Model) autoOpenTodoPane() Model {
+	if !m.TodoPaneAuto || m.ShowTodoPane || m.Width < 85 || len(m.todoItems()) == 0 {
+		return m
+	}
+	m.TodoPaneAuto = false
+	m.ShowTodoPane = true
+	m.TodoPaneFocused = false
+	m.TodoScrollOffset = 0
+	for _, s := range m.AgentStates {
+		s.RenderedHistory = nil
+	}
+	m.updateLayout()
+	m.updateViewport()
+	m.screenDirty = true
+	return m
 }
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1228,6 +1251,7 @@ func (m Model) updateChat(msg tea.Msg) (Model, tea.Cmd) {
 					return m, clearCmd
 				}
 				m.ShowTodoPane = !m.ShowTodoPane
+				m.TodoPaneAuto = false // the user has taken control
 				m.TodoPaneFocused = false
 				m.TodoScrollOffset = 0
 				for _, s := range m.AgentStates {

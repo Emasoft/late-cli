@@ -134,13 +134,13 @@ func newTodoPaneStartupModel(t *testing.T, todos []tool.Todo) Model {
 	return NewModel(root, nil, nil)
 }
 
-func TestTodoPaneOpenByDefaultAtStartup(t *testing.T) {
+func TestTodoPaneOpenAtStartupWhenConfigured(t *testing.T) {
 	todos := []tool.Todo{
 		{Text: "Scaffold the parser"},
 		{Text: "Wire the CLI flags", Done: true},
 	}
 	m := newTodoPaneStartupModel(t, todos)
-	m.ShowTodoPane = true // resolved default: show-todo-pane absent -> open
+	m.ShowTodoPane = true // show-todo-pane explicitly true -> open at startup
 	m.SetSize(100, 30)
 
 	if !m.ShowTodoPane {

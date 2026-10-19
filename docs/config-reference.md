@@ -140,7 +140,7 @@ Late prefers a located error over silently accepting a typo'd config:
 | `theme` | string | `""` | `--theme` | Plugin theme id (`plugin:name` or bare name); precedence `--theme` > `LATE_THEME` env > this entry > bundled base; persisted by `/themes`. |
 | `show-timestamps` | boolean | `false` | — | Show an `HH:MM:SS` timestamp on each transcript message (bottom-right of your prompt card, right-aligned under each reply); toggled and persisted by `/timestamps`. |
 | `show-info-bar` | boolean | `false` | — | Show the single-line info bar below the status bar (model, approval mode, todo progress, running subagents, turn time); toggled and persisted by `/infobar`. |
-| `show-todo-pane` | boolean | `true` | — | Start with the todos side pane open (it stays closed on terminals narrower than 85 columns); `/todos` toggles it during a session. |
+| `show-todo-pane` | boolean | unset | — | Unset: the todos side pane starts closed and opens by itself the first time todos are created. `true`: it starts open. `false`: it stays closed and never opens by itself. It stays closed on terminals narrower than 85 columns; `/todos` toggles it during a session. |
 
 ### Legacy entries
 

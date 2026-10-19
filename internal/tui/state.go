@@ -198,6 +198,7 @@ type Model struct {
 	AttachedFiles    []string
 	ShowFilePicker   bool
 	ShowTodoPane     bool
+	TodoPaneAuto     bool // opens the pane once todos exist; any manual /todos toggle disarms it
 	TodoPaneFocused  bool
 	TodoScrollOffset int
 
