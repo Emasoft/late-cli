@@ -111,7 +111,7 @@ late
 | **启动时间**      | **即时启动（原生 Go，<10ms，像 `htop` 一样轻快）**          | 1s–3s+（Node.js / Python 运行时）                |
 | **系统 Prompt** | **约 1,000 tokens（精简且专注）**                    | 3,000–10,000+ tokens（从毫无工作流到过度约束的臃肿 prompt） |
 | **沙箱**        | **原生 rootless devcontainers（`late-podman`）** | 无等价的内置工作流                                   |
-| **所需配置**      | **无（自动连接 `:8080` 上的 `llama-server`）**        | 需要配置 provider / 模型                          |
+| **所需配置**      | **无（自动连接 `:9931` 上的 `llama-server`）**        | 需要配置 provider / 模型                          |
 | **遥测**        | **无**                                        | 默认启用遥测                                      |
 
 <p align="center"><b>如果 Late 让你的模型感觉更聪明，<a href="https://github.com/mlhher/late-cli">欢迎在 GitHub 上给它一个 ⭐</a></b></p>
@@ -176,7 +176,7 @@ Late 被设计成一个端到端的 agent harness：
 
 **Late 支持本地模型吗？**
 
-零配置。让 `llama-server` 加载任意 GGUF，Late 就会自动连接到 `:8080`。
+零配置。让 `llama-server` 加载任意 GGUF，Late 就会自动连接到 `:9931`。
 
 ---
 
@@ -186,7 +186,7 @@ Late 完全与模型无关。
 
 **本地模型（零配置）：**
 
-无需任何配置。Late 默认连接端口 `:8080` 上的 `llama.cpp`（即 `llama-server` 的默认端口）。
+无需任何配置。Late 默认连接端口 `:9931` 上的 `llama.cpp`（即 `llama-server` 的默认端口）。
 
 **云端 Provider（DeepSeek、Claude、GPT、Kimi、GLM、OpenRouter）：**
 

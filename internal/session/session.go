@@ -318,6 +318,8 @@ func (s *Session) StartStream(ctx context.Context, extraBody map[string]any, onC
 					ToolCalls:        toolCalls,
 					Usage:            chunk.Usage,
 					FinishReason:     finishReason,
+					Timings:          chunk.Timings,
+					Progress:         chunk.PromptProgress,
 				}
 
 				select {
