@@ -19,7 +19,7 @@ import (
 
 func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *config.Config) Model {
 	ti := textarea.New()
-	ti.Placeholder = "Ask Late to build, refactor, search, run bash... (Type / for commands)"
+	ti.Placeholder = "Ask Late to build, refactor, search, run bash... (/ commands, @ files)"
 	ti.Focus()
 	ti.CharLimit = 100000 // Allow pasting large code blocks
 	ti.SetWidth(72)
@@ -76,16 +76,16 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 	}
 
 	m := Model{
-		Mode:                ViewChat,
-		Root:                root,
-		Focused:             root,
-		Input:               ti,
-		Viewport:            vp,
-		Renderer:            renderer,
-		Width:               80,
-		Height:              24, // Default start height
-		AgentStates:         make(map[string]*AppState),
-		InspectingTool:      false,
+		Mode:           ViewChat,
+		Root:           root,
+		Focused:        root,
+		Input:          ti,
+		Viewport:       vp,
+		Renderer:       renderer,
+		Width:          80,
+		Height:         24, // Default start height
+		AgentStates:    make(map[string]*AppState),
+		InspectingTool: false,
 		Spinner: spinner.New(spinner.WithSpinner(spinner.Spinner{
 			Frames: spinner.Dot.Frames,
 			FPS:    40 * time.Millisecond,
@@ -97,9 +97,13 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		GitBranch:           git.CurrentBranch(cwd),
 		cachedRendererWidth: -1, // Force first creation
 		Pastes:              make(map[string]string),
+		reportCache:         make(map[string]string),
 		AppConfig:           cfg,
 		SelectedTheme:       "default",
 		activeThemeStyles:   LateTheme,
+		ShowInfoBar:         cfg != nil && cfg.ShowInfoBar,
+		turn:                &turnTimer{},
+		ShowTimestamps:      cfg != nil && cfg.ShowTimestamps,
 	}
 
 	fp := filepicker.New()

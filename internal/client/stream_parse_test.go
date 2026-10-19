@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,34 @@ func TestChatCompletionStream_DataLineVariants(t *testing.T) {
 	}
 }
 
+// TestChatCompletionStream_EmptyDataKeepaliveDoesNotEndStream pins the
+// keepalive fix: a bare "data:" line (nothing after the colon) is an SSE
+// comment/keepalive, not end-of-stream. Treating it as the end ended the turn
+// early on servers that interleave keepalives with real chunks — a truncated
+// response with no error for any retry tier to see. The keepalive here sits
+// between two real chunks: the stream must continue and complete.
+func TestChatCompletionStream_EmptyDataKeepaliveDoesNotEndStream(t *testing.T) {
+	body := "data: " + sampleChunkHello + "\n\n" +
+		"data: \n\n" + // keepalive: bare "data:" with nothing after the colon
+		"data: " + sampleChunkWorld + "\n\n" +
+		"data: [DONE]\n"
+
+	st := newStreamTest(t)
+	defer st.Close()
+	st.Handle(sseBodyHandler(body))
+
+	chunks, err := collectStream(t, context.Background(), st.client, defaultRequest())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2 — the keepalive must not end the stream", len(chunks))
+	}
+	if got := accumulateContent(chunks); got != "Hello world" {
+		t.Errorf("content after keepalive = %q, want %q", got, "Hello world")
+	}
+}
+
 // TestChatCompletion_BOMBodyDecodes pins BOM tolerance on the non-streaming
 // path: encoding/json rejects a UTF-8 BOM outright, so an unstripped BOM turns
 // an otherwise healthy completion into a confusing parse error.
@@ -119,18 +148,81 @@ func TestChatCompletion_BOMBodyDecodes(t *testing.T) {
 // TestChatCompletion_OversizedBodyIsBounded pins the success-path body cap: a
 // broken or hostile server streaming an unbounded 200 body must fail the
 // bounded decode instead of being slurped into memory without limit (the
-// error path is already bounded by maxErrorBodyBytes).
+// error path is already bounded by maxErrorBodyBytes). The failure is the
+// typed BodyTooLargeError — not a silent-truncation decode error.
 func TestChatCompletion_OversizedBodyIsBounded(t *testing.T) {
 	// 9 MiB of JSON string content: beyond maxCompletionBodyBytes, so the
-	// bounded read truncates it and the decode fails with unexpected EOF.
+	// bounded read detects the overrun and reports it as size.
 	huge := `{"id":"` + strings.Repeat("a", 9<<20) + `"}`
 
 	server := httptest.NewServer(http.HandlerFunc(jsonBodyHandler(huge, "application/json")))
 	defer server.Close()
 
 	c := NewClient(Config{BaseURL: server.URL})
-	if _, err := c.ChatCompletion(context.Background(), defaultRequest()); err == nil {
-		t.Fatal("expected the bounded decode to fail on an oversized body, got nil error")
+	_, err := c.ChatCompletion(context.Background(), defaultRequest())
+	var tooLarge *BodyTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("expected *BodyTooLargeError for an oversized body, got %v", err)
+	}
+	if tooLarge.Limit != maxCompletionBodyBytes {
+		t.Errorf("Limit = %d, want %d", tooLarge.Limit, maxCompletionBodyBytes)
+	}
+	if want := "response body too large"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err.Error(), want)
+	}
+}
+
+// TestChatCompletion_OversizedBodyByOneByte pins the boundary: a body of
+// exactly maxCompletionBodyBytes+1 bytes is the smallest possible violation,
+// and it must still produce the clear typed error rather than the
+// "unexpected end of JSON input" the silently truncated read used to yield.
+func TestChatCompletion_OversizedBodyByOneByte(t *testing.T) {
+	// Valid JSON prefix {"id":"aaa...a} trimmed so the raw body length is
+	// exactly maxCompletionBodyBytes+1: decode would fail anyway, but the
+	// size check must fire first with the actionable error.
+	over := maxCompletionBodyBytes + 1
+	prefix := `{"id":"`
+	body := prefix + strings.Repeat("a", over-len(prefix))
+	if len(body) != over {
+		t.Fatalf("test body is %d bytes, want exactly %d", len(body), over)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(jsonBodyHandler(body, "application/json")))
+	defer server.Close()
+
+	c := NewClient(Config{BaseURL: server.URL})
+	_, err := c.ChatCompletion(context.Background(), defaultRequest())
+	var tooLarge *BodyTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("expected *BodyTooLargeError for a (max+1)-byte body, got %v", err)
+	}
+	if tooLarge.Limit != maxCompletionBodyBytes {
+		t.Errorf("Limit = %d, want %d", tooLarge.Limit, maxCompletionBodyBytes)
+	}
+}
+
+// TestChatCompletion_BodyAtLimitStillDecodes pins the other side of the
+// boundary: a body of exactly maxCompletionBodyBytes bytes is legal and must
+// decode normally — the +1 probe exists so at-limit responses are not
+// rejected.
+func TestChatCompletion_BodyAtLimitStillDecodes(t *testing.T) {
+	// {"id":"aaa...a"} sized to exactly maxCompletionBodyBytes.
+	prefix, suffix := `{"id":"`, `"}`
+	body := prefix + strings.Repeat("a", maxCompletionBodyBytes-len(prefix)-len(suffix)) + suffix
+	if len(body) != maxCompletionBodyBytes {
+		t.Fatalf("test body is %d bytes, want exactly %d", len(body), maxCompletionBodyBytes)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(jsonBodyHandler(body, "application/json")))
+	defer server.Close()
+
+	c := NewClient(Config{BaseURL: server.URL})
+	resp, err := c.ChatCompletion(context.Background(), defaultRequest())
+	if err != nil {
+		t.Fatalf("at-limit body must still decode, got error: %v", err)
+	}
+	if resp.ID == "" {
+		t.Error("at-limit body decoded to an empty ID")
 	}
 }
 

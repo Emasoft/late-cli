@@ -24,7 +24,7 @@ Manual binaries for Linux, macOS, and native Windows are available from the [Git
 
 ## Local Models: Zero Configuration
 
-Late automatically looks for an OpenAI-compatible `llama-server` on `localhost:8080`.
+Late automatically looks for an OpenAI-compatible `llama-server` on `localhost:9931`.
 
 Start `llama-server` with your GGUF model as usual, then launch Late from your project:
 
@@ -33,7 +33,7 @@ cd your-project
 late
 ```
 
-That's it. If `llama-server` is already running on `:8080` (its default port) Late will connect with no configuration required.
+That's it. If `llama-server` is already running on `:9931` (its default port) Late will connect with no configuration required.
 
 ---
 
@@ -75,7 +75,7 @@ Configuration precedence is:
 2. `config.json`
 3. Late defaults
 
-For the standard local `llama-server` setup on `localhost:8080`, you do not need to create a configuration file.
+For the standard local `llama-server` setup on `localhost:9931`, you do not need to create a configuration file.
 
 ### Tool Approval Mode (`permission-mode`)
 
@@ -115,13 +115,13 @@ You can change models interactively using `/model` inside the TUI, or persist yo
     },
     {
       "id": "local-qwen",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "qwen3.6-35b-a3b"
     },
     {
       "id": "local-gemma",
-      "url": "http://localhost:8080",
+      "url": "http://localhost:9931",
       "key": "",
       "model": "gemma-4-e4b"
     }
@@ -148,6 +148,7 @@ The essentials:
 | ------------------- | ---------------------------------------------------- |
 | `Tab`               | Switch between the orchestrator and active subagents |
 | `Ctrl+O`            | Attach a file                                        |
+| `Ctrl+R` / click    | Expand or collapse tool output (all / one call)      |
 | `Esc` / `Ctrl+G`    | Stop the currently running agent                     |
 | `/model`            | Change orchestrator or worker models                 |
 | `/rewind`           | Rewind to an earlier point in the conversation       |
@@ -155,9 +156,35 @@ The essentials:
 | `/compose`          | Draft a longer instruction in your `$EDITOR`         |
 | `Ctrl+D` / `Ctrl+C` | Quit                                                 |
 
-Type `/` at any time to open the command picker.
+Type `/` at any time to open the command picker, and `@` anywhere in your prompt to pick a project file by name (fuzzy, `Tab`/`Enter` to insert; files ignored by `.gitignore`/`.llmignore` are not offered).
 
 When Late creates subagents, each appears in its own tab while it works and disappears after completing its task.
+
+Every finished tool call shows its outcome on the same row: `✓ +3 -1` for an edit, `✗ exit 1 · FAIL` for a failing command, `⊘ denied` for a call you refused. Click a row (or press `Ctrl+R` for all of them) to see the detail behind it: the diff of an edit, the output of a command, or a subagent's full report. Subagent tabs close when the subagent finishes, but its report stays reachable this way in the orchestrator's transcript.
+
+---
+
+## Message Timestamps
+
+* `/timestamps` toggles quiet `HH:MM:SS` timestamps on transcript messages (bottom-right of your prompt card, right-aligned under each reply).
+* The toggle persists to `config.json` (`show-timestamps`).
+
+---
+
+## Info Bar
+
+* `/infobar` toggles a single-line row under the status bar. Left to right: the focused agent's endpoint host and model (`localhost:9931 · qwen3.5-4b`), the approval mode (`approval ask`, or `approval off` when running unsupervised), todo progress (`todos 3/7`), and the subagents that are running or waiting for your approval (shown only while there are any).
+* On the right, `turn 1m42s` times the current turn: it starts when you send a message, runs while any agent is working, and freezes when they are all idle, so it keeps showing how long the last turn took until you send the next message.
+* On a narrow terminal whole segments are dropped (the host first, then turn time, todos, subagents, approval) rather than cut in half; very long hosts and model names are clipped with an ellipsis.
+* The toggle persists to `config.json` (`show-info-bar`).
+
+---
+
+## Todos Pane
+
+* The todos pane starts open on the right side of the transcript and shows the orchestrator's todo list. Set `"show-todo-pane": false` in `config.json` to start with it closed; `/todos` toggles it during a session.
+* Terminals narrower than 85 columns keep it closed.
+* Click inside the pane (or press `Ctrl+T`) to focus it for scrolling; a focused pane is highlighted and marked `[focused · esc to unfocus]`. `Esc` or a click anywhere outside releases focus, and so does the first printable key you type, which still lands in the input, so the pane never swallows your typing.
 
 ---
 
@@ -171,6 +198,10 @@ When prompted, you can approve:
 * for the current session;
 * for the current project;
 * globally.
+
+The prompt shows what is about to happen: the command and its working directory for shell commands, and a line-by-line diff (with line numbers) for file edits and writes. It also lists exactly what `s`, `p` and `g` would trust beyond this one call, for example `go test (flags: -race)`.
+
+To deny, press `n`. To deny *and tell the agent why*, type your reply and press `Enter`: the agent receives it together with the denial and can change course instead of guessing.
 
 Read-only operations are generally handled automatically.
 

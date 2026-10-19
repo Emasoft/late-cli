@@ -17,7 +17,7 @@ import (
 // parameter correctly prepends the <|think|> token to the system prompt
 func TestNewSubagentOrchestratorWithGemmaThinking(t *testing.T) {
 	// Create a mock client
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	// Create a mock parent session. Spawning a subagent reserves the parent's
@@ -104,7 +104,7 @@ func TestNewSubagentOrchestratorWithGemmaThinking(t *testing.T) {
 // TestNewSubagentOrchestratorGemmaThinkingWithCWD verifies that gemmaThinking
 // works correctly together with injectCWD
 func TestNewSubagentOrchestratorGemmaThinkingWithCWD(t *testing.T) {
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	// Spawning a subagent persists the parent's .meta.json sidecar (see
@@ -178,7 +178,7 @@ func TestNewSubagentOrchestratorID(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 	mockSession := session.New(c, filepath.Join(tmp, "mock-session.json"), []client.ChatMessage{}, "mock system prompt", true)
 	parent := orchestrator.NewBaseOrchestrator("parent", mockSession, nil, 100)
@@ -215,7 +215,7 @@ func TestNewSubagentOrchestrator_ConcurrentSpawn(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	// Create a shared mock parent session and orchestrator
@@ -312,7 +312,7 @@ func TestNewSubagentOrchestrator_PersistsWhenOptedIn(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	mockSession := session.New(c, "/tmp/mock-session.json", []client.ChatMessage{}, "mock system prompt", true)
@@ -387,7 +387,7 @@ func TestNewSubagentOrchestrator_RejectsUnsafeParentSessionID(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	mockSession := session.New(c, "/tmp/mock-session.json", []client.ChatMessage{}, "mock system prompt", true)
@@ -431,7 +431,7 @@ func TestNewSubagentOrchestrator_InMemoryByDefault(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	mockSession := session.New(c, "/tmp/mock-session.json", []client.ChatMessage{}, "mock system prompt", true)
@@ -470,7 +470,7 @@ func TestNewSubagentOrchestrator_SecondSpawnGetsNextID(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	mockSession := session.New(c, "/tmp/mock-session.json", []client.ChatMessage{}, "mock system prompt", true)
@@ -513,7 +513,7 @@ func TestNewSubagentOrchestrator_ResumedParentUsesNextHistoryPath(t *testing.T) 
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	c := client.NewClient(client.Config{BaseURL: "http://localhost:8080"})
+	c := client.NewClient(client.Config{BaseURL: "http://localhost:9931"})
 	historyPath := filepath.Join(tmp, "session-test.json")
 	saveHistories := true
 	parentSession := session.New(c, historyPath, nil, "mock system prompt", true)
@@ -570,7 +570,7 @@ func TestSubagentRegistryHasNoTodoTools(t *testing.T) {
 	tmp := t.TempDir()
 	setSessionDirForTest(t, tmp)
 
-	cfg := client.Config{BaseURL: "http://localhost:8080"}
+	cfg := client.Config{BaseURL: "http://localhost:9931"}
 	c := client.NewClient(cfg)
 
 	mockSession := session.New(c, filepath.Join(tmp, "mock-session.json"), []client.ChatMessage{}, "mock system prompt", true)

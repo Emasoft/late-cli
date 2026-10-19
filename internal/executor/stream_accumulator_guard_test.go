@@ -10,7 +10,9 @@ import (
 // TestStreamAccumulator_AppendNegativeToolCallIndexDoesNotPanic pins the
 // malformed-input guard: a provider delta carrying a negative tool-call index
 // would previously index a.ToolCalls[-1] and panic, killing the whole CLI.
-// A delta that matches no slot is appended as its own entry instead.
+// Identity-based slot lookup never indexes the slice by the delta's index, so
+// a delta whose Index matches no slot is appended as its own entry, and one
+// that matches an existing slot (even a malformed negative one) merges there.
 func TestStreamAccumulator_AppendNegativeToolCallIndexDoesNotPanic(t *testing.T) {
 	acc := StreamAccumulator{}
 	// A panic here fails the test run — that is the regression signal.
@@ -26,18 +28,62 @@ func TestStreamAccumulator_AppendNegativeToolCallIndexDoesNotPanic(t *testing.T)
 		t.Errorf("expected name 'read_file', got %q", acc.ToolCalls[0].Function.Name)
 	}
 
-	// Negative-index deltas never merge by slot (no slot can match a
-	// negative index): each appends, and nothing panics or corrupts.
+	// Deltas that share an index merge by identity, even a malformed
+	// negative one: identity-based lookup can neither panic nor cross-merge,
+	// and a repeated index denotes the same (broken) slot.
 	acc.Append(common.StreamResult{
 		ToolCalls: []client.ToolCall{
 			{Index: -1, Function: client.FunctionCall{Arguments: `: "a.go"`}},
 		},
 	})
-	if len(acc.ToolCalls) != 2 {
-		t.Fatalf("expected the second negative-index delta to append, got %d entries", len(acc.ToolCalls))
+	if len(acc.ToolCalls) != 1 {
+		t.Fatalf("expected the second negative-index delta to merge by Index identity, got %d entries", len(acc.ToolCalls))
 	}
-	if acc.ToolCalls[0].Function.Arguments != `{"path"` {
-		t.Errorf("first entry corrupted: %q", acc.ToolCalls[0].Function.Arguments)
+	if got := acc.ToolCalls[0].Function.Arguments; got != `{"path": "a.go"` {
+		t.Errorf("merged arguments = %q, want %q", got, `{"path": "a.go"`)
+	}
+}
+
+// TestStreamAccumulator_AppendOneBasedInterleavedFragmentsMergeByIndex pins
+// the review fix: some providers number tool calls from 1 and interleave
+// fragments (create call 1, create call 2, fragment for 1, fragment for 2).
+// The previous position-based lookup treated the index as a slice offset, so
+// each fragment landed as an extra entry with no ID and no name instead of
+// merging into its own call. Slot lookup by the Index field merges by
+// identity regardless of the numbering base.
+func TestStreamAccumulator_AppendOneBasedInterleavedFragmentsMergeByIndex(t *testing.T) {
+	acc := StreamAccumulator{}
+	acc.Append(common.StreamResult{
+		ToolCalls: []client.ToolCall{
+			{Index: 1, ID: "a", Function: client.FunctionCall{Name: "read_file", Arguments: `{"path"`}},
+		},
+	})
+	acc.Append(common.StreamResult{
+		ToolCalls: []client.ToolCall{
+			{Index: 2, ID: "b", Function: client.FunctionCall{Name: "write_file", Arguments: `{"path"`}},
+		},
+	})
+	acc.Append(common.StreamResult{
+		ToolCalls: []client.ToolCall{
+			{Index: 1, Function: client.FunctionCall{Arguments: `: "a.go"}`}},
+		},
+	})
+	acc.Append(common.StreamResult{
+		ToolCalls: []client.ToolCall{
+			{Index: 2, Function: client.FunctionCall{Arguments: `: "b.go"}`}},
+		},
+	})
+
+	if len(acc.ToolCalls) != 2 {
+		t.Fatalf("expected interleaved fragments to merge into 2 calls, got %d entries: %+v", len(acc.ToolCalls), acc.ToolCalls)
+	}
+	first := acc.ToolCalls[0]
+	if first.Index != 1 || first.ID != "a" || first.Function.Name != "read_file" || first.Function.Arguments != `{"path": "a.go"}` {
+		t.Errorf("call 1 merged wrong: %+v", first)
+	}
+	second := acc.ToolCalls[1]
+	if second.Index != 2 || second.ID != "b" || second.Function.Name != "write_file" || second.Function.Arguments != `{"path": "b.go"}` {
+		t.Errorf("call 2 merged wrong: %+v", second)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"unicode/utf8"
 
 	"late/internal/common"
+	"late/internal/config"
+	"late/internal/pathutil"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -97,6 +100,11 @@ func (m Model) buildScreen() tea.View {
 		content += "\n" + aStr
 	}
 	content += "\n" + iStr + "\n" + sStr
+	// Info bar sits below the status bar (one extra footer row, reserved by
+	// updateLayout via infoBarHeight). Empty while the file picker is open.
+	if infoStr := m.infoBarView(); infoStr != "" {
+		content += "\n" + infoStr
+	}
 
 	v := tea.NewView(sanitizeVTE(content, m.Width))
 	v.AltScreen = true
@@ -170,7 +178,7 @@ func (m *Model) inputView() string {
 	if s.State == StateThinking || s.State == StateStreaming || showPluginAction {
 		ms := float64(time.Now().UnixNano()) / 1e6
 		pulse := (math.Sin(ms/250.0) + 1.0) / 2.0
-		borderGrad := lipgloss.Blend1D(100, lipgloss.Color("#232329"), lipgloss.Color("#62B3D5"))
+		borderGrad := lipgloss.Blend1D(100, borderColor, secondaryColor) // rest -> active
 		outerStyle = outerStyle.BorderForeground(borderGrad[int(pulse*99)])
 	} else if s.State == StateConfirmTool {
 		outerStyle = outerStyle.BorderForeground(warnBorderColor)
@@ -229,6 +237,10 @@ func (m *Model) autocompleteView() string {
 	var lines []string
 	for i := start; i < end; i++ {
 		item := m.AutocompleteItems[i]
+		if m.AutocompleteKind == autocompleteFile {
+			lines = append(lines, fileSuggestionLine(item, m.autocompleteQuery, i == m.AutocompleteIndex, w-2))
+			continue
+		}
 		prefix := "  "
 		nameStyle := lipgloss.NewStyle().
 			Foreground(subtextColor).
@@ -395,7 +407,7 @@ func (m *Model) renderMinimalEqualizerAt(now time.Time) string {
 
 	bracketStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 	equalizerStyle := lipgloss.NewStyle().Foreground(secondaryColor).Background(appBgColor)
-	peakStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Bold(true).Background(appBgColor)
+	peakStyle := lipgloss.NewStyle().Foreground(peakColor).Bold(true).Background(appBgColor)
 
 	var sb strings.Builder
 	sb.WriteString(bracketStyle.Render("["))
@@ -487,7 +499,7 @@ func (m *Model) renderScannerTrackAt(symbol string, symbolColor color.Color, now
 	bracketStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 	headStyle := lipgloss.NewStyle().Foreground(symbolColor).Bold(true).Background(appBgColor)
 	trailSparkStyle := lipgloss.NewStyle().Foreground(symbolColor).Background(appBgColor)
-	auraBulletStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#C48D46")).Background(appBgColor)
+	auraBulletStyle := lipgloss.NewStyle().Foreground(auraColor).Background(appBgColor)
 	dotStyle := lipgloss.NewStyle().Foreground(mutedTextColor).Background(appBgColor)
 
 	var sb strings.Builder
@@ -595,7 +607,7 @@ func (m *Model) statusBarView() string {
 		statePart = m.renderMinimalEqualizer()
 	case StateConfirmTool:
 		statePart = m.renderIdleEqualizer()
-		statusText = "authorize execution (y/s/p/g/n)"
+		statusText = "authorize execution (y/s/p/g/n) · or type a reply to deny"
 	default:
 		if m.BootstrapStatus != "" {
 			statePart = m.renderScannerTrack("✦", primaryColor)
@@ -687,6 +699,11 @@ func (m *Model) statusBarView() string {
 
 	// Right: Context, Attachments
 	var rightItems []string
+	if w >= perfMinWidth {
+		if chip := perfChip(&s.Perf, time.Now()); chip != "" {
+			rightItems = append(rightItems, chip)
+		}
+	}
 	maxTokens := m.Focused.MaxTokens()
 	if s.CumulativeTokenCount > 0 {
 		rightItems = append(rightItems, m.renderContextBar(s.CumulativeTokenCount, maxTokens))
@@ -697,6 +714,7 @@ func (m *Model) statusBarView() string {
 	}
 
 	rightSection := strings.Join(rightItems, "  ")
+	rightSection = m.withWorkerTokens(rightSection, lipgloss.Width(leftSection), max(w-2, 1))
 
 	// Layout spacing
 	usableW := w - 2
@@ -749,6 +767,54 @@ func agentTypeForID(id string) string {
 		return id[:idx]
 	}
 	return ""
+}
+
+// focusedModelInfo resolves the endpoint host and model name shown for the
+// focused agent. An explicit config.AgentModels entry for the focused agent's
+// type wins; otherwise the orchestrator model surfaced by main.go (ModelName,
+// kept current by the picker) is used, with the endpoint resolved the same way
+// main.go and the picker resolve it. For a subagent without its own entry,
+// SubagentInfo names the subagent backend when it is a single model (it is a
+// comma-joined "type:model" list only when several subagent types have
+// explicit entries).
+func (m *Model) focusedModelInfo() (host, name string) {
+	agentType := agentTypeForID(m.Focused.ID())
+	if agentType != "" && m.AppConfig != nil {
+		if setting, ok := m.AppConfig.GetModelForAgent(agentType); ok {
+			return endpointHost(setting.URL), setting.Model
+		}
+	}
+	openAI := config.ResolveOpenAISettings(m.AppConfig)
+	baseURL := openAI.BaseURL
+	name = m.ModelName
+	if agentType != "orchestrator" && m.SubagentInfo != "" &&
+		!strings.Contains(m.SubagentInfo, ":") && !strings.Contains(m.SubagentInfo, ",") {
+		name = m.SubagentInfo
+		baseURL = config.ResolveSubagentSettings(m.AppConfig, openAI).BaseURL
+	}
+	if name == "" {
+		name = "default"
+	}
+	return endpointHost(baseURL), name
+}
+
+// endpointHost reduces a base URL to the part that tells endpoints apart:
+// host[:port] without scheme, credentials or path. A port appears only when
+// the URL spells one out, so a hosted API reads api.example.com and a local
+// server reads localhost:9931. Anything unparseable yields "".
+func endpointHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
 }
 
 func (m *Model) updateViewport() {
@@ -818,10 +884,13 @@ func (m *Model) updateViewport() {
   **enter**           Submit prompt
   **alt+enter**       Insert newline into prompt
   **/compose**        Draft prompt in external $EDITOR
+  **@path**           Mention a project file (tab / enter completes)
 
 ### Attachments & Tools
   **ctrl+o**          Toggle file / image attachment picker
   **ctrl+x**          Clear attached files
+  **ctrl+r**          Expand / collapse all tool output
+  **click**           Click a tool call to expand or collapse it
   **ctrl+g** / **esc** Interrupt / stop active agent
 
 ### Slash Commands
@@ -1443,8 +1512,20 @@ func (m *Model) renderModelPickerView() {
 	lines = append(lines, header, "")
 
 	if len(m.ModelPickerModels) <= 1 && (m.AppConfig == nil || len(m.AppConfig.Models) == 0) {
-		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render("No models configured in ~/.config/late/config.json"))
-		lines = append(lines, "", viewEmptyStyle.Render("Please add a 'models' array to your config file first."))
+		// Point the user at the real OS config location; fall back to the
+		// literal only if the platform config dir cannot be resolved.
+		configPath := "~/.config/late/config.json"
+		if cfgDir, dirErr := pathutil.LateConfigDir(); dirErr == nil {
+			configPath = filepath.Join(cfgDir, "config.json")
+		}
+		emptyMsg := fmt.Sprintf("No models configured in %s", configPath)
+		hint := "Please add a 'models' array to your config file first."
+		if m.AppConfig != nil && m.AppConfig.Degraded {
+			emptyMsg = fmt.Sprintf("config.json could not be loaded; fix %s first", configPath)
+			hint = "Your settings cannot be saved until the config file is fixed."
+		}
+		lines = append(lines, viewEmptyStyle.Copy().Foreground(warnBorderColor).Render(emptyMsg))
+		lines = append(lines, "", viewEmptyStyle.Render(hint))
 	} else {
 		// Instructions
 		lines = append(lines, viewEmptyStyle.Render("Use ↑/↓ to choose an agent, and ←/→ to select a model."), "")
@@ -1651,7 +1732,7 @@ func todoContentLines(todos []common.TodoItem, innerWidth int) []string {
 		itemStyle := lipgloss.NewStyle().Foreground(textColor)
 		if td.Done {
 			icon = "✓"
-			itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#549B68"))
+			itemStyle = lipgloss.NewStyle().Foreground(accentEmerald)
 		}
 
 		prefix := fmt.Sprintf(" %2d  %s  ", i+1, icon)
@@ -1693,13 +1774,13 @@ func (m Model) todoPaneView(height int) string {
 	}
 	title := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#7D56F4")).
+		Foreground(todoTitleColor).
 		Render("  Todos" + focusMarker)
 	lines = append(lines, title)
 
 	if len(todos) == 0 {
 		emptyMsg := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#4A4B50")).
+			Foreground(mutedTextColor).
 			Italic(true).
 			Render("  No todos created yet.\n  Waiting for plan…")
 		lines = append(lines, strings.Split(emptyMsg, "\n")...)
@@ -1719,7 +1800,7 @@ func (m Model) todoPaneView(height int) string {
 			help = fmt.Sprintf("%d–%d/%d · %s", offset+1, end, len(content), help)
 		}
 		lines = append(lines, lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#67686E")).
+			Foreground(subtextColor).
 			Render("  "+help))
 	}
 
@@ -1734,7 +1815,7 @@ func (m Model) todoPaneView(height int) string {
 	content := strings.Join(lines, "\n")
 	// The pane must be visibly different while focused: elevated background
 	// (applied to the whole box, content lines included) plus a brighter border.
-	bg, border := appBgColor, lipgloss.Color("#232329")
+	bg, border := appBgColor, activeBorder
 	if m.TodoPaneFocused {
 		bg, border = todoFocusedBg, primaryColor
 	}
