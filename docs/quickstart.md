@@ -163,7 +163,7 @@ When Late creates subagents, each appears in its own tab while it works and disa
 
 ## Message Timestamps
 
-* `/timestamps` toggles `[HH:MM:SS]` prefixes on transcript message blocks.
+* `/timestamps` toggles quiet `HH:MM:SS` timestamps on transcript messages (bottom-right of your prompt card, right-aligned under each reply).
 * The toggle persists to `config.json` (`show-timestamps`).
 
 ---

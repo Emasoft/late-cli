@@ -109,6 +109,14 @@ var (
 			Foreground(subtextColor).
 			Italic(true)
 
+	// Optional message timestamps (HH:MM:SS): quiet footers, never italic.
+	userStampStyle = lipgloss.NewStyle().
+			Foreground(subtextColor).
+			Background(cardBgColor)
+	replyStampStyle = lipgloss.NewStyle().
+			Foreground(subtextColor).
+			Background(appBgColor)
+
 	// AI Response
 	aiMsgStyle = baseStyle.Copy().
 			Background(appBgColor)

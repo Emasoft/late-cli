@@ -14,10 +14,12 @@ import (
 	"late/internal/config"
 )
 
-// Rendered transcript blocks are prefixed with [HH:MM:SS] from the message's
-// recorded receive time when ShowTimestamps is on. Messages without a
-// timestamp (legacy history entries) always render unprefixed.
-func TestTranscriptTimestampPrefix(t *testing.T) {
+// Stamped transcript blocks carry a quiet HH:MM:SS footer from the message's
+// recorded receive time when ShowTimestamps is on: inside the prompt card for
+// user messages, right-aligned under the reply for assistant messages.
+// Messages without a timestamp (legacy history entries) never render one, and
+// the stamp never adds a row to a user card.
+func TestTranscriptTimestampFooter(t *testing.T) {
 	history := []client.ChatMessage{
 		{Role: "user", Content: client.TextContent("TIMESTAMPEDPROMPT"), Timestamp: "2025-01-02T03:04:05Z"},
 		{Role: "assistant", Content: client.TextContent("TIMESTAMPEDREPLY"), Timestamp: "2025-01-02T03:04:06Z"},
@@ -25,54 +27,61 @@ func TestTranscriptTimestampPrefix(t *testing.T) {
 	}
 	m, s := newViewportBenchmarkModel(history)
 
-	// Off (default): no prefixes anywhere.
-	if content := testTranscriptContent(m); strings.Contains(ansi.Strip(content), "[03:04:05]") || strings.Contains(ansi.Strip(content), "[03:04:06]") {
-		t.Fatalf("timestamps rendered while ShowTimestamps is off:\n%s", ansi.Strip(content))
+	off := ansi.Strip(testTranscriptContent(m))
+	if strings.Contains(off, "03:04:05") || strings.Contains(off, "03:04:06") {
+		t.Fatalf("timestamps rendered while ShowTimestamps is off:\n%s", off)
 	}
+	offUserHeight := blockHeight(t, s, 0)
 
-	// On: the stamped user and assistant blocks carry their prefixes; the
-	// legacy block stays unprefixed.
 	m.ShowTimestamps = true
-	content := ansi.Strip(testTranscriptContent(m))
-	if !strings.Contains(content, "[03:04:05]") {
-		t.Fatalf("missing [03:04:05] user prefix:\n%s", content)
-	}
-	if !strings.Contains(content, "[03:04:06]") {
-		t.Fatalf("missing [03:04:06] assistant prefix:\n%s", content)
-	}
-	assertBlockPrefix(t, s, 0, "[03:04:05]")
-	assertBlockPrefix(t, s, 1, "[03:04:06]")
-	assertBlockWithoutPrefix(t, s, 2)
-}
-
-// assertBlockPrefix checks that the first row of the block for the history
-// message at index starts with the expected [HH:MM:SS] prefix.
-func assertBlockPrefix(t *testing.T, s *AppState, index int, want string) {
-	t.Helper()
-	block := renderBlockForIndex(s, index)
-	if block == nil {
-		t.Fatalf("no rendered block for history index %d", index)
-	}
-	first := strings.TrimSpace(ansi.Strip(s.Transcript.rows[block.StartLine]))
-	if !strings.HasPrefix(first, want) {
-		t.Fatalf("block %d starts with %q, want prefix %q", index, first, want)
-	}
-}
-
-// assertBlockWithoutPrefix checks that no row of the block for the history
-// message at index carries a timestamp prefix ([HH:MM:SS] is 10 characters).
-func assertBlockWithoutPrefix(t *testing.T, s *AppState, index int) {
-	t.Helper()
-	block := renderBlockForIndex(s, index)
-	if block == nil {
-		t.Fatalf("no rendered block for history index %d", index)
-	}
-	for _, row := range s.Transcript.rows[block.StartLine : block.EndLine+1] {
-		trimmed := strings.TrimSpace(ansi.Strip(row))
-		if len(trimmed) == 10 && strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			t.Fatalf("legacy block %d unexpectedly carries timestamp prefix %q", index, trimmed)
+	on := ansi.Strip(testTranscriptContent(m))
+	for _, want := range []string{"03:04:05", "03:04:06"} {
+		if !strings.Contains(on, want) {
+			t.Fatalf("missing %s stamp:\n%s", want, on)
 		}
 	}
+	if strings.Contains(on, "[03:") {
+		t.Fatalf("stamps must not be bracketed prefixes:\n%s", on)
+	}
+	if got := blockHeight(t, s, 0); got != offUserHeight {
+		t.Fatalf("user card height changed with timestamps: %d -> %d", offUserHeight, got)
+	}
+	// The user stamp sits on the card's last row, right-aligned.
+	userRows := blockRows(t, s, 0)
+	last := ""
+	for _, row := range userRows {
+		if r := strings.TrimRight(ansi.Strip(row), " "); r != "" {
+			last = r
+		}
+	}
+	if !strings.HasSuffix(last, "03:04:05") {
+		t.Fatalf("user stamp not on the card's last row, got %q", last)
+	}
+	// The reply stamp is its own right-aligned row after the text.
+	replyRows := blockRows(t, s, 1)
+	replyLast := strings.TrimRight(ansi.Strip(replyRows[len(replyRows)-1]), " ")
+	if !strings.HasSuffix(replyLast, "03:04:06") || strings.Contains(replyLast, "TIMESTAMPEDREPLY") {
+		t.Fatalf("reply stamp row malformed: %q", replyLast)
+	}
+	for _, row := range blockRows(t, s, 2) {
+		if strings.Contains(ansi.Strip(row), ":") && strings.Contains(ansi.Strip(row), "03:") {
+			t.Fatalf("legacy block unexpectedly carries a stamp: %q", ansi.Strip(row))
+		}
+	}
+}
+
+func blockRows(t *testing.T, s *AppState, index int) []string {
+	t.Helper()
+	block := renderBlockForIndex(s, index)
+	if block == nil {
+		t.Fatalf("no rendered block for history index %d", index)
+	}
+	return s.Transcript.rows[block.StartLine : block.EndLine+1]
+}
+
+func blockHeight(t *testing.T, s *AppState, index int) int {
+	t.Helper()
+	return len(blockRows(t, s, index))
 }
 
 func renderBlockForIndex(s *AppState, index int) *RenderBlock {

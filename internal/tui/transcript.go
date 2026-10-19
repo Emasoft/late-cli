@@ -449,14 +449,15 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 			}
 			if !ok {
 				parts := make([]string, 0, 4)
-				// The [HH:MM:SS] prefix is rendered as its own muted row at
-				// the start of user and assistant message blocks, from the
-				// receive time the session recorded when the message was
-				// added. Legacy messages without a timestamp stay unprefixed.
-				prefix := ""
+				// The receive time (HH:MM:SS) renders as a quiet footer inside
+				// the message surface, never as a row of its own on user
+				// cards and never ahead of the text: bottom-right of the
+				// prompt card, right-aligned under the reply. Legacy messages
+				// without a timestamp stay unstamped.
+				stamp := ""
 				if showTimestamps && entry.timestamp != "" {
 					if ts, err := time.Parse(time.RFC3339, entry.timestamp); err == nil {
-						prefix = attachmentStyle.Render("[" + ts.Format("15:04:05") + "]")
+						stamp = ts.Format("15:04:05")
 					}
 				}
 				switch entry.role {
@@ -473,16 +474,18 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 								block += "\n" + label.rendered
 							}
 						}
-						if prefix != "" {
-							parts = append(parts, prefix)
+						card := userPromptStyle(width)
+						if stamp != "" {
+							// The stamp takes the card's bottom padding row, so
+							// toggling timestamps never changes the card height.
+							pad := max(0, innerWidth-lipgloss.Width(stamp))
+							block += "\n" + strings.Repeat(" ", pad) + userStampStyle.Render(stamp)
+							card = card.PaddingBottom(0)
 						}
-						parts = append(parts, "\n"+userPromptStyle(width).Render(block)+"\n")
+						parts = append(parts, "\n"+card.Render(block)+"\n")
 					}
 				case "assistant":
 					appendPart := func(text string) { rows = append(rows, r.normalize(text)...) }
-					if prefix != "" {
-						appendPart(prefix)
-					}
 					if entry.reasoning != "" {
 						header := headerStyle.Render("· thinking")
 						if entry.active && entry.content == "" && len(entry.labels) == 0 {
@@ -504,6 +507,9 @@ func (m *Model) renderTranscriptCmd() tea.Cmd {
 						} else {
 							rendered := markdown(entry.content)
 							appendPart(answerStyle.Render(strings.Trim(rendered, "\r\n")))
+							if stamp != "" {
+								appendPart(answerStyle.Align(lipgloss.Right).Render(replyStampStyle.Render(stamp)))
+							}
 						}
 					}
 					if len(entry.labels) > 0 {
