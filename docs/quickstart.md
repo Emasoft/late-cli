@@ -173,7 +173,9 @@ Every finished tool call shows its outcome on the same row: `✓ +3 -1` for an e
 
 ## Info Bar
 
-* `/infobar` toggles a single-line footer under the status bar: Late version, project folder, focused model, context usage, running subagents, discovered skills, tokens to the context threshold (80% of the model's context size), and session uptime.
+* `/infobar` toggles a single-line row under the status bar. Left to right: the focused agent's provider and model, the approval mode (`approval ask`, or `approval off` when running unsupervised), todo progress (`todos 3/7`), and the subagents that are running or waiting for your approval (shown only while there are any).
+* On the right, `turn 1m42s` times the current turn: it starts when you send a message, runs while any agent is working, and freezes when they are all idle, so it keeps showing how long the last turn took until you send the next message.
+* On a narrow terminal whole segments are dropped (turn time first, then todos, subagents, approval) rather than cut in half.
 * The toggle persists to `config.json` (`show-info-bar`).
 
 ---

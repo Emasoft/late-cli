@@ -64,7 +64,7 @@ type CommandDef struct {
 var AvailableCommands = []CommandDef{
 	{Name: "/compose", Description: "Compose a message with an editor"},
 	{Name: "/help", Description: "Show help and shortcuts"},
-	{Name: "/infobar", Description: "Toggle the info bar footer"},
+	{Name: "/infobar", Description: "Toggle the info bar"},
 	{Name: "/log", Description: "View git commit log"},
 	{Name: "/model", Description: "Select AI model for agents"},
 	{Name: "/new", Description: "Start fresh conversation"},
@@ -151,12 +151,6 @@ type AppState struct {
 	ContextWarningShown bool // Whether the preflight context warning has been shown for the current input
 	Error               error
 
-	// CreatedAt is when this agent state was created (session start for the
-	// root agent). It backs the info bar's "up <elapsed>" segment and is
-	// deliberately not reset by /new: it measures session uptime, not
-	// conversation age.
-	CreatedAt time.Time
-
 	// RetryVerb records the failure class of the retry an agent is in:
 	// retryVerbConnectionLost ("connection lost") for infra failures or
 	// retryVerbRejectedByAPI ("request rejected by the API") for HTTP 400s.
@@ -168,17 +162,6 @@ type AppState struct {
 	// ToggledTools holds the tool calls whose expansion differs from the
 	// global ShowToolOutput setting; a click on a call's row flips its entry.
 	ToggledTools map[string]bool
-}
-
-// SkillsInfo summarizes the agent skills discovered at startup (user +
-// project skills directories, the same source executor.RegisterTools uses to
-// build the activate_skill tool). Count is the number of skills; Tokens is
-// the estimated token footprint of their instruction bodies, computed once in
-// cmd/late/main.go with the common token estimator so the info bar can show
-// it without touching disk per frame.
-type SkillsInfo struct {
-	Count  int
-	Tokens int
 }
 
 type Model struct {
@@ -219,11 +202,12 @@ type Model struct {
 	TodoScrollOffset int
 
 	// Info bar (toggled via /infobar, persisted as config show-info-bar).
-	// A view-level setting, not per-agent. SkillsInfo summarizes the
-	// agent skills discovered at startup so the info bar can show how much
-	// skill content is on disk without re-reading it on every frame.
-	ShowInfoBar bool
-	SkillsInfo  SkillsInfo
+	// A view-level setting, not per-agent. PermissionMode is the resolved
+	// config.PermissionMode* value, set once from cmd/late/main.go. turn
+	// times the current or last user turn across all agents.
+	ShowInfoBar    bool
+	PermissionMode string
+	turn           *turnTimer
 
 	// Timestamps (toggled via /timestamps, persisted as config
 	// show-timestamps). A view-level setting, not per-agent: when set,
@@ -358,7 +342,6 @@ func (m *Model) GetAgentState(id string) *AppState {
 		State:       StateIdle,
 		StatusText:  "Ready",
 		PendingStop: false,
-		CreatedAt:   time.Now(),
 	}
 	m.AgentStates[id] = s
 	return s

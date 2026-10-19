@@ -25,7 +25,6 @@ import (
 	"late/internal/pathutil"
 	"late/internal/plugin"
 	"late/internal/session"
-	"late/internal/skill"
 	"late/internal/tool"
 	"late/internal/tui"
 
@@ -722,11 +721,7 @@ func main() {
 	model.ShowCWD = *showCWDReq
 	model.LazyHistory = true
 
-	// SkillsInfo: estimated size of the skill surface for the TUI info bar.
-	// executor.RegisterTools builds the activate_skill map from the same
-	// directories; re-discovering here (read-only) keeps the executor API
-	// untouched while giving the TUI the same view of the skills on disk.
-	model.SkillsInfo = skillsInfoForTUI()
+	model.PermissionMode = permissionMode
 
 	pOpts := []tea.ProgramOption{
 		tea.WithFPS(tui.FrameRate),
@@ -921,30 +916,6 @@ func newModelClient(ctx context.Context, setting appconfig.ModelSetting, enableI
 	}
 	c.DiscoverBackend(ctx)
 	return c
-}
-
-// skillsInfoForTUI estimates the token footprint of the skill instructions
-// available to agents (user + project skills directories, the same source
-// executor.RegisterTools uses) so the TUI info bar can display it without
-// re-reading skill files per frame. Count is the number of discovered
-// skills; Tokens uses the common cl100k estimator over each skill's
-// instruction body.
-func skillsInfoForTUI() tui.SkillsInfo {
-	info := tui.SkillsInfo{}
-	skillDirs := []string{}
-	if userSkillsDir, err := pathutil.LateSkillsDir(); err == nil {
-		skillDirs = append(skillDirs, userSkillsDir)
-	}
-	skillDirs = append(skillDirs, pathutil.LateProjectSkillsDir())
-	skills, err := skill.DiscoverSkills(skillDirs)
-	if err != nil {
-		return info
-	}
-	for _, s := range skills {
-		info.Count++
-		info.Tokens += common.EstimateTokenCount(s.Instructions)
-	}
-	return info
 }
 
 func validateSuppressThinkingWords(suppressThinkingWords bool, orchestratorModel, subagentModel string, appConfig *appconfig.Config) error {

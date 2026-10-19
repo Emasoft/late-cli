@@ -102,6 +102,7 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		SelectedTheme:       "default",
 		activeThemeStyles:   LateTheme,
 		ShowInfoBar:         cfg != nil && cfg.ShowInfoBar,
+		turn:                &turnTimer{},
 		ShowTimestamps:      cfg != nil && cfg.ShowTimestamps,
 	}
 
@@ -133,7 +134,6 @@ func NewModel(root common.Orchestrator, renderer *glamour.TermRenderer, cfg *con
 		StatusText:           "Ready",
 		CumulativeTokenCount: cumulativeTokens,
 		CachedWidth:          -1,
-		CreatedAt:            time.Now(),
 	}
 
 	return m

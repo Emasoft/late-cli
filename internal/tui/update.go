@@ -69,7 +69,18 @@ type messageHookResultMsg struct {
 // StartPromptMsg submits a prompt as soon as the TUI is ready.
 type StartPromptMsg string
 
+// Update handles one message and then lets the info bar's turn timer see
+// whether any agent is busy, so it starts and freezes on the exact update in
+// which the work begins or ends.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	if nm, ok := next.(Model); ok {
+		nm.turn.observe(nm.hasActiveAgent(), time.Now())
+	}
+	return next, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch event := msg.(type) {
 	case transcriptFrameMsg:
 		return m.transcriptFrame()

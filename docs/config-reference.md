@@ -139,7 +139,7 @@ Late prefers a located error over silently accepting a typo'd config:
 | `skills_dir` | string | `""` | — | Legacy entry, currently unused: skill discovery reads the platform skills directory (`~/.config/late/skills/` etc.) and project-local `.late/skills/`, not this value. |
 | `theme` | string | `""` | `--theme` | Plugin theme id (`plugin:name` or bare name); precedence `--theme` > `LATE_THEME` env > this entry > bundled base; persisted by `/themes`. |
 | `show-timestamps` | boolean | `false` | — | Show an `HH:MM:SS` timestamp on each transcript message (bottom-right of your prompt card, right-aligned under each reply); toggled and persisted by `/timestamps`. |
-| `show-info-bar` | boolean | `false` | — | Show the single-line info bar below the status bar; toggled and persisted by `/infobar`. |
+| `show-info-bar` | boolean | `false` | — | Show the single-line info bar below the status bar (model, approval mode, todo progress, running subagents, turn time); toggled and persisted by `/infobar`. |
 
 ### Legacy entries
 
