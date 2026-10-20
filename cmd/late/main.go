@@ -1750,6 +1750,16 @@ func main() {
 			if err != nil {
 				return "", err
 			}
+			// Tool-call↔record correlation (Step 8): bind the freshly minted
+			// manifest record to the exact spawn_subagent tool-call ID the
+			// executor stamped into the request. Best-effort (like
+			// saveSpawnRecord): losing the binding only degrades resume to
+			// the descend heuristic. The first patch wins.
+			if request.SpawnCallID != "" {
+				if err := sess.PatchSubagentSpawnCallID(child.ID(), request.SpawnCallID); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to bind spawn call %s to subagent %s in the manifest: %v\n", request.SpawnCallID, child.ID(), err)
+				}
+			}
 
 			// Execution mode (validated by the tool; "" normalized to the
 			// sync default). Sync keeps the historical blocking path;

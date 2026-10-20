@@ -96,6 +96,32 @@ type SubagentSpawnRequest struct {
 	// execution schema description). Ignored for resume requests, which
 	// always run synchronously.
 	Execution string `json:"execution"`
+	// SpawnCallID is the parent history's tool-call ID for the spawn_subagent
+	// call that produced this request. It is NOT a model-facing argument
+	// (json:"-"): the executor stamps it into the call's context
+	// (WithToolCallID) and Execute copies it here, so the spawn orchestrator
+	// can bind the manifest record to the exact tool call. Empty for direct
+	// runner invocations (tests, internal relaunches).
+	SpawnCallID string `json:"-"`
+}
+
+// toolCallIDCtxKey carries the current tool call's ID through a tool's
+// Execute context. Per-call context values (not package variables): two
+// tool calls never share one, and concurrent calls each get their own
+// derived context from the executor.
+type toolCallIDCtxKey struct{}
+
+// WithToolCallID returns a context carrying tcID for tool implementations
+// that need to correlate their run with the calling tool call.
+func WithToolCallID(ctx context.Context, tcID string) context.Context {
+	return context.WithValue(ctx, toolCallIDCtxKey{}, tcID)
+}
+
+// ToolCallIDFromContext returns the tool-call ID stamped by
+// WithToolCallID, or "" when there is none (direct runner invocations).
+func ToolCallIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(toolCallIDCtxKey{}).(string)
+	return id
 }
 
 // IsResume reports whether this request restores an existing child instead
@@ -180,6 +206,10 @@ func (t SpawnSubagentTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %v", err)
 	}
+	// Correlation stamp (Step 8): whatever the args say, the executor's
+	// context value is authoritative — the model must not be able to inject
+	// a tool-call ID through the argument JSON.
+	params.SpawnCallID = ToolCallIDFromContext(ctx)
 
 	// Lifecycle actions short-circuit before every spawn/resume surface:
 	// they carry no goal and must never touch the worktree or timeout

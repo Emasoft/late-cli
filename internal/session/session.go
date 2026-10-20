@@ -228,7 +228,11 @@ func (s *Session) ExecuteTool(ctx context.Context, tc client.ToolCall) (string, 
 	if t == nil {
 		return "", fmt.Errorf("tool not found: %s", tc.Function.Name)
 	}
-	return t.Execute(ctx, json.RawMessage(tc.Function.Arguments))
+	// Stamp the tool-call ID so tools that must correlate their run with the
+	// exact history call (spawn_subagent → manifest record, Step 8) can read
+	// it from their context. A call without an ID ("") stamps empty; tool
+	// behavior falls back to the pre-correlation path.
+	return t.Execute(tool.WithToolCallID(ctx, tc.ID), json.RawMessage(tc.Function.Arguments))
 }
 
 // appendMessage is the single path every Add* helper uses to record a

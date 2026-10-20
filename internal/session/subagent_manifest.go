@@ -153,6 +153,12 @@ type SubagentRecord struct {
 	// routing). Empty when the child ran on the default subagent model (no
 	// agent_models entry) — which also means the parallel gate was closed.
 	Model string `json:"model,omitempty"`
+	// SpawnCallID is the parent history's tool-call ID of the spawn_subagent
+	// call that created this record, when the runtime could capture it.
+	// Restore correlation prefers an exact match here over the positional
+	// descend heuristic; empty (legacy manifests) means only the descend
+	// heuristic applies.
+	SpawnCallID string `json:"spawn_call_id,omitempty"`
 }
 
 // SubagentManifest is the JSON document persisted at
@@ -435,6 +441,35 @@ func (s *Session) MarkSubagentStatus(id, status, cause, resultPreview, transcrip
 		return nil
 	}
 	manifest.MarkStatus(id, status, cause, resultPreview, transcriptPath)
+	return manifest.Save()
+}
+
+// PatchSubagentSpawnCallID binds one record to the exact tool-call ID of the
+// spawn_subagent call that launched it (Step 8 correlation). Only an
+// unpatched record (empty SpawnCallID) is stamped: a later non-empty write
+// keeps the FIRST binding, so a re-launch or restore race cannot move an
+// established correlation. Unknown IDs are a no-op — the patch may only
+// refine an existing spawn record, never invent one. It is a no-op for an
+// in-memory session or when the manifest cannot be loaded, mirroring
+// MarkSubagentStatus.
+func (s *Session) PatchSubagentSpawnCallID(id, callID string) error {
+	sessionID := s.sessionSubagentRecordID()
+	if sessionID == "" || callID == "" {
+		return nil
+	}
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	manifest, err := LoadSubagentManifest(sessionID)
+	if err != nil {
+		return err
+	}
+	manifest.SessionID = sessionID
+	rec, ok := manifest.Get(id)
+	if !ok || rec.SpawnCallID != "" {
+		return nil
+	}
+	rec.SpawnCallID = callID
 	return manifest.Save()
 }
 

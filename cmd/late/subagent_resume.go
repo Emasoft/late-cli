@@ -40,9 +40,14 @@ const spawnSubagentToolName = "spawn_subagent"
 // spawn (if any) will still append its own result later.
 //
 // Correlation: manifest records are keyed by child ID, dangling history
-// calls by tool-call ID — two different namespaces with no stored link (the
-// runner never sees the tool-call ID). A dangling call is therefore matched
-// to an unconsumed record by its spawn arguments (agent_type, then goal):
+// calls by tool-call ID. When the manifest record carries a non-empty
+// spawn_call_id (runtime-stamped at launch — the executor hands the tool
+// call's ID into the spawn request), a dangling call whose ID matches is
+// bound EXACTLY, which is the only correct answer for repeated identical
+// (type, goal) spawns. Records with an empty_or_mismatched spawn_call_id —
+// legacy manifests, and any record the exact match did not claim — fall
+// back to the positional descend heuristic: a dangling call is matched to
+// an unconsumed record by its spawn arguments (agent_type, then goal):
 // every spawn creates exactly one record, so this is exact except for
 // repeated identical (type, goal) pairs, where the wording is equally true
 // of either record. Unmatched calls fall back to the generic interrupted
@@ -593,6 +598,15 @@ func matchSpawnRecord(manifest *session.SubagentManifest, tc client.ToolCall, co
 			return rec
 		}
 		return best(core)
+	}
+
+	// Exact tier (Step 8): a record explicitly bound to THIS tool call wins
+	// before any argument matching. A record bound to a DIFFERENT call never
+	// matches here — it stays eligible for the descend heuristic only, which
+	// is today's behavior (two same-goal spawns whose ids match different
+	// records resolve by arguments exactly as they did before the field).
+	if rec := tier(func(rec *session.SubagentRecord) bool { return rec.SpawnCallID != "" && rec.SpawnCallID == tc.ID }); rec != nil {
+		return rec
 	}
 
 	if rec := tier(func(rec *session.SubagentRecord) bool { return matchesType(rec) && matchesGoal(rec) }); rec != nil {
