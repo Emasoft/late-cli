@@ -57,6 +57,16 @@ func SubagentManifestPath(sessionID string) (string, error) {
 	return filepath.Join(dir, manifestFileName), nil
 }
 
+// SchedulerStatePath returns the full path of a session's scheduler queue
+// snapshot: <sessionsDir>/<sessionID>/subagents/scheduler_state.json.
+func SchedulerStatePath(sessionID string) (string, error) {
+	dir, err := SubagentHistoryDir(sessionID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "scheduler_state.json"), nil
+}
+
 // subagentResultFileSuffix marks a background child's full-result artifact
 // inside the subagents folder: <childID>.result.txt sits next to the child's
 // <childID>.json history and the manifest, distinguishable from any future

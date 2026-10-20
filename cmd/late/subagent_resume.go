@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -234,10 +235,28 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 	if root == nil || manifest == nil {
 		return
 	}
+	// Collect FIRST, feed the scheduler SECOND: the persisted scheduler
+	// queue snapshot (Step 4) reorders the relaunch batch so the children
+	// resume in the launch order the interrupted run had — serial queue
+	// order, then parallel batch membership — instead of manifest order.
+	// Manifest order is the manifest write order, which bears no relation
+	// to the queue; without the reorder a resume could launch serial child
+	// B before serial child A and invert a deliberate sequencing.
+	batch := make([]*session.SubagentRecord, 0)
 	for i := range manifest.Records {
 		rec := &manifest.Records[i]
 		if !isInterruptedSubagentStatus(rec.Status) || restored[rec.ID] {
 			continue
+		}
+		batch = append(batch, rec)
+	}
+	var modesOf map[string]string
+	if deps != nil && deps.sessionID != "" {
+		batch, modesOf, _ = consumeSchedulerSnapshotForRestore(deps.sessionID, batch)
+	}
+	for _, rec := range batch {
+		if restored[rec.ID] {
+			continue // unreachable today; guards future batch builds
 		}
 		restored[rec.ID] = true
 		if rec.HistoryPath == "" {
@@ -245,7 +264,7 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 			continue
 		}
 		if deps != nil && deps.root != nil && deps.scheduler != nil && deps.defaultClient != nil && deps.runEnv != nil {
-			if restoreInterruptedSubagentLive(deps, rec) {
+			if restoreInterruptedSubagentLive(deps, rec, restoreLaunchMode(modesOf, rec.ID)) {
 				continue
 			}
 			// Live restore failed for this record: fall through to the
@@ -259,6 +278,94 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 		root.AddChild(child)
 		common.LogErrorf("subagent-restore", "restored subagent %s (%s) into the TUI read-only with %d preserved message(s) (live restore unavailable)", rec.ID, rec.AgentType, len(child.History()))
 	}
+}
+
+// restoreUnorderedSlot is the sort slot for children absent from the
+// scheduler snapshot: they launch after every snapshot-ordered child, in
+// manifest order (best-effort ordering, never a drop).
+const restoreUnorderedSlot = 1 << 32
+
+// consumeSchedulerSnapshotForRestore folds the persisted scheduler queue
+// snapshot into launch order for an interrupted batch and CONSUMES the
+// snapshot: the file is removed as soon as its ordering has been captured in
+// memory (before any relaunch) so a second restore pass reads no stale
+// snapshot, and the scheduler's own persistence hooks immediately write a
+// fresh snapshot describing the resumed queue. The reorder is purely
+// additive: unknown children keep manifest order at the back and no child is
+// ever dropped. A missing snapshot changes nothing; a corrupt one is logged
+// and treated as absent. Returns the reordered batch and each child's
+// restored scheduling mode ("" when the snapshot says nothing — callers use
+// the historical parallel default).
+func consumeSchedulerSnapshotForRestore(sessionID string, batch []*session.SubagentRecord) ([]*session.SubagentRecord, map[string]string, error) {
+	state, err := session.LoadSchedulerState(sessionID)
+	if err != nil {
+		// Corrupt snapshot: log-and-treat-as-empty (same degrade rule the
+		// scheduler's own persistence follows) — but do NOT delete a file we
+		// could not read, so the broken state stays inspectable.
+		common.LogErrorf("subagent-restore", "scheduler queue snapshot unreadable; relaunching the batch without the persisted order: %v", err)
+		return batch, nil, err
+	}
+	rendezvous := len(state.SerialQueue) + len(state.ParallelQueue) + len(state.Running)
+	orders := make(map[string]int, rendezvous)
+	modes := make(map[string]string, rendezvous)
+	register := func(id string, order int, mode string) {
+		if _, seen := orders[id]; seen || id == "" {
+			return // first slot wins; also guarded by SaveSchedulerState's dedupe
+		}
+		orders[id] = order
+		modes[id] = mode
+	}
+	for _, id := range state.Running {
+		// A snapshot-running child keeps the historical live-resume launch
+		// (parallel) and is the first relaunch priority: it was mid-work.
+		register(id, -1, tool.SubagentExecutionParallel)
+	}
+	serialSlot := 0
+	for _, id := range state.SerialQueue {
+		register(id, serialSlot, tool.SubagentExecutionSerial)
+		serialSlot++
+	}
+	parallelSlot := serialSlot // serial queue order always precedes the batch
+	for _, id := range state.ParallelQueue {
+		register(id, parallelSlot, tool.SubagentExecutionParallel)
+		parallelSlot++
+	}
+	// Stable sort: preserved relative order inside a slot group (manifest
+	// order for the unordered tail), preserving the serialized FIFO order.
+	sort.SliceStable(batch, func(a, b int) bool {
+		slotA, okA := orders[batch[a].ID]
+		if !okA {
+			slotA = restoreUnorderedSlot
+		}
+		slotB, okB := orders[batch[b].ID]
+		if !okB {
+			slotB = restoreUnorderedSlot
+		}
+		return slotA < slotB
+	})
+	modesFor := modes
+	// Consume: the snapshot's whole purpose is this relaunch batch's order;
+	// delete it (best-effort, atomic-delete style — remove and tolerate a
+	// missing file) so later passes never reorder against a stale snapshot.
+	if path, pathErr := session.SchedulerStatePath(sessionID); pathErr != nil {
+		common.LogErrorf("subagent-restore", "scheduler queue snapshot cannot be resolved for removal: %v", pathErr)
+	} else if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		common.LogErrorf("subagent-restore", "failed to remove consumed scheduler queue snapshot: %v", rmErr)
+	}
+	return batch, modesFor, nil
+}
+
+// restoreLaunchMode maps a child's snapshot slot to the scheduling mode the
+// restore relaunch uses: serial-queued children relaunch serial (their
+// persisted position in the serial FIFO is only meaningful under serial
+// scheduling — parallel would shatter the sequencing the snapshot
+// preserves); everything else (snapshot running, snapshot-parallel,
+// absent-from-snapshot) keeps the historical parallel relaunch.
+func restoreLaunchMode(modes map[string]string, childID string) string {
+	if mode, ok := modes[childID]; ok && mode != "" {
+		return mode
+	}
+	return tool.SubagentExecutionParallel
 }
 
 // restoreInterruptedSubagentLive relaunches ONE interrupted child in the
@@ -278,7 +385,11 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 // a crash mid-relaunch reads as interrupted again. Returns false when the
 // live relaunch is impossible for this record (validation failure, empty
 // history, constructor error) and the read-only fallback should take over.
-func restoreInterruptedSubagentLive(deps *liveRestoreDeps, rec *session.SubagentRecord) bool {
+// mode is the EFFECTIVE scheduling mode this relaunch uses: the persisted
+// scheduler snapshot slots serial-queued children as serial so their FIFO
+// position means something; every other slot relaunches parallel (the
+// historical restore behavior). See restoreLaunchMode.
+func restoreInterruptedSubagentLive(deps *liveRestoreDeps, rec *session.SubagentRecord, mode string) bool {
 	if rec.ID == "" {
 		return false
 	}
@@ -313,9 +424,13 @@ func restoreInterruptedSubagentLive(deps *liveRestoreDeps, rec *session.Subagent
 	// Status surface: the resumed child's TUI tab seeds with "resumed from
 	// interruption" (agent.RestoredResumedStatus) when first focused, and
 	// the run's own status takes over from the first turn.
+	effective := tool.SubagentExecutionParallel
+	if mode == tool.SubagentExecutionSerial {
+		effective = tool.SubagentExecutionSerial
+	}
 	scheduling := subagentScheduling{
-		Requested: tool.SubagentExecutionParallel,
-		Effective: tool.SubagentExecutionParallel,
+		Requested: effective,
+		Effective: effective,
 		ModelRef:  "",
 	}
 	if _, err := launchBackgroundSubagent(deps.scheduler, deps.runEnv, deps.sess, deps.sessionID, child,

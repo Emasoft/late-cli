@@ -80,6 +80,11 @@ type SubagentScheduler struct {
 	// sess is the parent session completion notifications are appended to
 	// (AddUserMessage — the established mid-loop harness-note shape).
 	sess *session.Session
+	// sessionID is the manifest namespace the queue snapshot persists under
+	// ("" disables scheduler_state.json writes — standalone tests). It is
+	// wired post-construction from the same effectiveSessionID the caller
+	// derived for the manifest bundle.
+	sessionID string
 	// statusWriter persists scheduler-driven manifest transitions
 	// (queued at enqueue, running at actual launch). Terminal statuses are
 	// written by the run closure itself via classifyAndReportSubagentOutcome.
@@ -160,7 +165,9 @@ func (s *SubagentScheduler) LaunchEntry(entry schedulerEntry) (launched bool, po
 	s.mu.Lock()
 	if s.canStartLocked(entry.mode) {
 		s.startLocked(entry)
+		state := s.queueSnapshotLocked()
 		s.mu.Unlock()
+		s.persistSchedulerState(state)
 		return true, 0
 	}
 	queue := &s.parallelQueue
@@ -169,10 +176,51 @@ func (s *SubagentScheduler) LaunchEntry(entry schedulerEntry) (launched bool, po
 	}
 	*queue = append(*queue, entry)
 	position = len(*queue)
+	state := s.queueSnapshotLocked()
 	s.mu.Unlock()
 
+	// Disk I/O after unlock: the snapshot write never delays a spawn.
 	s.writeStatus(entry.id, session.SubagentStatusQueued)
+	s.persistSchedulerState(state)
 	return false, position
+}
+
+// queueSnapshotLocked builds the persisted crash snapshot of the queue
+// state — ordered serial/parallel queue IDs plus the live running set,
+// deduplicated in first-seen order. Caller holds s.mu. It only clones ID
+// strings, so taking it under the state-machine lock is effectively free;
+// the disk write it feeds runs after the lock is released.
+func (s *SubagentScheduler) queueSnapshotLocked() session.SchedulerState {
+	state := session.SchedulerState{SerialQueue: []string{}, ParallelQueue: []string{}, Running: []string{}}
+	seen := make(map[string]bool)
+	add := func(dst *[]string, id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			*dst = append(*dst, id)
+		}
+	}
+	for _, entry := range s.serialQueue {
+		add(&state.SerialQueue, entry.id)
+	}
+	for _, entry := range s.parallelQueue {
+		add(&state.ParallelQueue, entry.id)
+	}
+	for id := range s.running {
+		add(&state.Running, id)
+	}
+	return state
+}
+
+// persistSchedulerState writes the snapshot best-effort: log-and-continue,
+// never a scheduling failure ("queue persistence is best-effort" contract —
+// a failed write degrades to exactly the pre-persistence resume behavior).
+func (s *SubagentScheduler) persistSchedulerState(state session.SchedulerState) {
+	if s.sess == nil || s.sessionID == "" {
+		return
+	}
+	if err := session.SaveSchedulerState(s.sessionID, state); err != nil {
+		common.LogErrorf("subagent-scheduler", "failed to persist scheduler queue snapshot: %v", err)
+	}
 }
 
 // canStartLocked applies the scheduling rules. Caller holds s.mu. Both
@@ -263,7 +311,13 @@ func (s *SubagentScheduler) finished(entry schedulerEntry, completion subagentCo
 		s.parallelRunning--
 	}
 	drained = s.drainLocked()
+	state := s.queueSnapshotLocked()
 	s.mu.Unlock()
+
+	// writeStatus after unlock: disk I/O never under the state machine. The
+	// queue snapshot rides the same rule — snapshot under the lock, write
+	// beside it.
+	s.persistSchedulerState(state)
 
 	// writeStatus after unlock: disk I/O never under the state machine.
 	// Drained entries re-mark "running" — an immediate launch already says
@@ -365,7 +419,12 @@ func (s *SubagentScheduler) RequestFreeze(id string) bool {
 		return false
 	}
 	s.freezeRequested[id] = true
+	state := s.queueSnapshotLocked()
 	s.mu.Unlock()
+
+	// Best-effort: the freeze's own manifest write carries the truth; the
+	// snapshot is only the queue-order shadow.
+	s.persistSchedulerState(state)
 
 	if child, live := s.LookupRunning(id); live {
 		common.LogErrorf("subagent-freeze", "freeze requested for %s (%s) — cancelling its run context", id, mode)

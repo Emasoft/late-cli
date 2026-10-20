@@ -1507,6 +1507,11 @@ func main() {
 		scheduler := newSubagentScheduler(sess, func(id, status string) error {
 			return sess.MarkSubagentStatus(id, status, "", "", "")
 		})
+		// The scheduler persists its queue snapshot under the same manifest
+		// namespace every other subagent sidecar uses. Best-effort: leaving
+		// it empty (tests, or a session without a manifest) degrades to the
+		// pre-persistence resume behavior.
+		scheduler.sessionID = effectiveSessionID
 
 		// clientForAgentType resolves an agent type's routed client (the
 		// agent_models entry, falling back to the default subagent client):
