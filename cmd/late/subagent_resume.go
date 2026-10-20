@@ -119,7 +119,15 @@ func synthesizeDanglingSpawnResults(sess *session.Session) (*session.SubagentMan
 	// explicit persisted status — frozen — replaces the "still running at
 	// read time" idiom and gives the subagent_results tool a status to
 	// report. Persisted so later resumes see frozen, not a stale running.
-	frozen := freezeInterruptedRecords(manifest)
+	// PID-liveness bake (Step 6): a "running" record whose owner process is
+	// still alive is NOT interrupted — another late process owns that child
+	// and will land its terminal status. Its PID file (written at launch)
+	// keeps its live/running semantics: freezing it here would let a second
+	// resume relaunch it alongside the live original, and stealing the slot
+	// would split one conversation across two processes.
+	liveOwners := subagentLiveOwnerIDs(effectiveSessionID, manifest)
+
+	frozen := freezeInterruptedRecords(manifest, liveOwners)
 	if frozen > 0 {
 		if err := manifest.Save(); err != nil {
 			// Non-fatal: the in-memory copy still says frozen for the TUI
@@ -128,19 +136,91 @@ func synthesizeDanglingSpawnResults(sess *session.Session) (*session.SubagentMan
 		}
 		common.LogErrorf("subagent-manifest", "resume marked %d interrupted subagent record(s) frozen in session %s", frozen, effectiveSessionID)
 	}
+	// Stale PID files of interrupted records are removed best-effort: the
+	// interrupted-frozen state is canonical now, and a leftover owner-dead
+	// PID file would only ever re-disambiguate a record that no longer says
+	// running. Errors are logged, never fatal.
+	removeStaleSubagentPIDs(effectiveSessionID, manifest, liveOwners)
 	return manifest, nil
+}
+
+// subagentLiveOwnerIDs returns the IDs of manifest-"running" records whose
+// PID file reports a still-alive owner process (nil when the session has no
+// folder). Every other errno condition — missing file, dead owner, EPERM —
+// falls on the interrupted side, and a liveness-read error logs and falls
+// on the interrupted side too: a corrupt PID file must never orphanize a
+// resumable child in the other direction (the PID files are advisory; the
+// manifest write is the commit).
+//
+// The same-exception first: on the WINDOWS build kill(pid, 0) is
+// unavailable, so a present PID file reads as alive — the launch/remove
+// lifecycle is the signal there (documented degradation in internal/
+// session/subagent_pid.go).
+func subagentLiveOwnerIDs(sessionID string, manifest *session.SubagentManifest) map[string]bool {
+	if sessionID == "" || manifest == nil {
+		return nil
+	}
+	var live map[string]bool
+	for i := range manifest.Records {
+		rec := &manifest.Records[i]
+		if rec.Status != session.SubagentStatusRunning || rec.ID == "" {
+			continue
+		}
+		alive, err := session.IsSubagentAlive(sessionID, rec.ID)
+		if err != nil {
+			common.LogErrorf("subagent-manifest", "subagent %s liveness check failed: %v", rec.ID, err)
+			continue
+		}
+		if alive {
+			if live == nil {
+				live = make(map[string]bool)
+			}
+			live[rec.ID] = true
+		}
+	}
+	return live
+}
+
+// removeStaleSubagentPIDs best-effort deletes the PID files of interruptible
+// (non-terminal, non-live) records after the freeze synthesis; a queued
+// child never had one, so ErrNotExist is the common case. liveOwners holds
+// the IDs left running and untouched.
+func removeStaleSubagentPIDs(sessionID string, manifest *session.SubagentManifest, liveOwners map[string]bool) {
+	if sessionID == "" || manifest == nil {
+		return
+	}
+	for i := range manifest.Records {
+		rec := &manifest.Records[i]
+		if rec.ID == "" || liveOwners[rec.ID] {
+			continue
+		}
+		if rec.Status != session.SubagentStatusRunning &&
+			rec.Status != session.SubagentStatusQueued &&
+			rec.Status != session.SubagentStatusInterrupted &&
+			rec.Status != session.SubagentStatusFrozen {
+			continue // terminal never carried a PID file at this point
+		}
+		if err := session.RemoveSubagentPID(sessionID, rec.ID); err != nil {
+			common.LogErrorf("subagent-manifest", "failed to remove stale pid file for %s: %v", rec.ID, err)
+		}
+	}
 }
 
 // freezeInterruptedRecords flips every non-terminal record (running, queued)
 // in the in-memory manifest to frozen and returns how many flipped. Terminal
-// records are untouched.
-func freezeInterruptedRecords(manifest *session.SubagentManifest) int {
+// in the in-memory manifest to frozen and returns how many flipped. Terminal
+// records are untouched. Records in keepAlive (live owners per the PID
+// files — see subagentLiveOwnerIDs) are skipped and left "running".
+func freezeInterruptedRecords(manifest *session.SubagentManifest, keepAlive map[string]bool) int {
 	if manifest == nil {
 		return 0
 	}
 	frozen := 0
 	for i := range manifest.Records {
 		rec := &manifest.Records[i]
+		if keepAlive[rec.ID] {
+			continue
+		}
 		if rec.Status == session.SubagentStatusRunning ||
 			rec.Status == session.SubagentStatusQueued ||
 			rec.Status == session.SubagentStatusInterrupted {
@@ -257,6 +337,23 @@ func restoreInterruptedSubagents(root *orchestrator.BaseOrchestrator, manifest *
 	for _, rec := range batch {
 		if restored[rec.ID] {
 			continue // unreachable today; guards future batch builds
+		}
+		// Slot ownership (Step 6): a "running" record whose PID file still
+		// reports an alive owner is a LIVE child of another late process.
+		// Resume must not steal its slot — skip live-resume entirely (the
+		// owning process lands the terminal status and removes the PID
+		// file); a dead/absent owner falls through to the unchanged
+		// interrupted path. Frozen/queued records never carried a live
+		// owner and always take the interrupted path.
+		if deps != nil && deps.sessionID != "" && rec.Status == session.SubagentStatusRunning {
+			alive, aliveErr := session.IsSubagentAlive(deps.sessionID, rec.ID)
+			if aliveErr != nil {
+				common.LogErrorf("subagent-restore", "subagent %s liveness check failed: %v", rec.ID, aliveErr)
+			} else if alive {
+				common.LogErrorf("subagent-restore", "subagent %s is still owned by a live late process (pid file); leaving its slot untouched", rec.ID)
+				restored[rec.ID] = true
+				continue
+			}
 		}
 		restored[rec.ID] = true
 		if rec.HistoryPath == "" {

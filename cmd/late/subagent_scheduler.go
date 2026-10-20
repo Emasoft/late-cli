@@ -242,6 +242,7 @@ func (s *SubagentScheduler) canStartLocked(mode string) bool {
 // or forgotten between unlock and start. Caller holds s.mu.
 func (s *SubagentScheduler) startLocked(entry schedulerEntry) {
 	s.running[entry.id] = entry.mode
+	subagentPIDForLaunch(s.sessionID, entry.id)
 	if entry.mode == tool.SubagentExecutionSerial {
 		s.serialRunning = entry.id
 	} else {
@@ -302,6 +303,7 @@ func (s *SubagentScheduler) finished(entry schedulerEntry, completion subagentCo
 	var drained []schedulerEntry
 	s.mu.Lock()
 	delete(s.running, entry.id)
+	subagentPIDRemove(s.sessionID, entry.id)
 	delete(s.liveChildren, entry.id)
 	if entry.mode == tool.SubagentExecutionSerial {
 		if s.serialRunning == entry.id {
@@ -411,6 +413,40 @@ func (s *SubagentScheduler) writeStatus(id, status string) {
 // freeze-cancelled run is reported as frozen — never as "cancelled by the
 // user" — and the manifest record keeps the resumable status the freeze
 // write landed.
+// subagentPIDForLaunch writes the child's PID file at launch: background
+// children are goroutines inside THIS late process (the SubagentScheduler
+// runs them on scheduler-owned goroutines — there is no child OS process to
+// exec), so the recorded owner PID is os.Getpid(). The next process's
+// resume consults the file to distinguish "the previous process is still
+// alive and owns this child" from "the previous process is dead — this is
+// the familiar interrupted case" (see internal/session/subagent_pid.go and
+// cmd/late/subagent_resume.go). Best-effort: a write failure degrades the
+// next resume to the interrupted path — the orphan child of a STILL-alive
+// owner would then be frozen and resumable here too; it is logged, never
+// fatal. sessionID "" (in-memory session, standalone tests) disables the
+// write.
+func subagentPIDForLaunch(sessionID, childID string) {
+	if sessionID == "" {
+		return
+	}
+	if err := session.WriteSubagentPID(sessionID, childID, os.Getpid()); err != nil {
+		common.LogErrorf("subagent-scheduler", "failed to write pid file for %s: %v", childID, err)
+	}
+}
+
+// subagentPIDRemove deletes the child's PID file when it leaves the live
+// set (terminal completion OR freeze: frozen is not running). Best-effort
+// and idempotent — the owner process is the only writer, so ErrNotExist is
+// the ordinary race.
+func subagentPIDRemove(sessionID, childID string) {
+	if sessionID == "" {
+		return
+	}
+	if err := session.RemoveSubagentPID(sessionID, childID); err != nil {
+		common.LogErrorf("subagent-scheduler", "failed to remove pid file for %s: %v", childID, err)
+	}
+}
+
 func (s *SubagentScheduler) RequestFreeze(id string) bool {
 	s.mu.Lock()
 	mode, ok := s.running[id]
@@ -419,6 +455,11 @@ func (s *SubagentScheduler) RequestFreeze(id string) bool {
 		return false
 	}
 	s.freezeRequested[id] = true
+	// FROZEN IS NOT RUNNING (Step 6): the PID file goes with the freeze —
+	// the child leaves the live set the moment its context is cancelled,
+	// even though its run closure still has cleanup to do. A completed
+	// freeze must never read as a live owner at the next resume.
+	subagentPIDRemove(s.sessionID, id)
 	state := s.queueSnapshotLocked()
 	s.mu.Unlock()
 
