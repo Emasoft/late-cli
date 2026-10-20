@@ -1473,6 +1473,15 @@ func main() {
 		}()
 	}
 
+	// The exit-time interrupted-status flush (signals.go) is built before
+	// the run loop starts: the session side is known here; the scheduler
+	// side attaches inside the subagents block below (nil when subagents
+	// are disabled — the flush then reduces to root-history persistence).
+	signalDeps := signalFlushDeps{
+		sessionID: effectiveSessionID,
+		sess:      sess,
+	}
+
 	if resolvedEnableSubagents {
 
 		// runEnv bundles the startup-scope collaborators every spawned or
@@ -1578,6 +1587,12 @@ func main() {
 		if resumedManifest != nil {
 			restoreInterruptedSubagents(rootAgent, resumedManifest, restoredSubagents, liveRestore)
 		}
+
+		// The exit-time interrupted-status flush shares the scheduler's
+		// lifetime: it reads the scheduler's live/queued child registry
+		// and the parent session's manifest writers, so it is built here —
+		// exactly once, like the other startup-scope dependency bundles.
+		signalDeps.scheduler = scheduler
 
 		// resumeSubagent implements spawn_subagent's "resume" argument
 		// (Phase C): the parent asks for a dead/crashed subagent by ID and
@@ -1798,6 +1813,11 @@ func main() {
 			Lookup: subagentResultsLookup(sess, scheduler, effectiveSessionID),
 		})
 	}
+
+	// Install the signal trap right before the run loop starts: SIGINT /
+	// SIGTERM from here on flush the interrupted statuses (best effort, 2s
+	// bound) before re-raising so the exit code keeps its signal semantics.
+	installSignalTrap(signalDeps)
 
 	finalModel, runErr := p.Run()
 	if runErr != nil {

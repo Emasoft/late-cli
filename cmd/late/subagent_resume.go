@@ -140,7 +140,9 @@ func freezeInterruptedRecords(manifest *session.SubagentManifest) int {
 	frozen := 0
 	for i := range manifest.Records {
 		rec := &manifest.Records[i]
-		if rec.Status == session.SubagentStatusRunning || rec.Status == session.SubagentStatusQueued {
+		if rec.Status == session.SubagentStatusRunning ||
+			rec.Status == session.SubagentStatusQueued ||
+			rec.Status == session.SubagentStatusInterrupted {
 			rec.Status = session.SubagentStatusFrozen
 			frozen++
 		}
@@ -194,7 +196,8 @@ type liveRestoreDeps struct {
 func isInterruptedSubagentStatus(status string) bool {
 	return status == session.SubagentStatusRunning ||
 		status == session.SubagentStatusQueued ||
-		status == session.SubagentStatusFrozen
+		status == session.SubagentStatusFrozen ||
+		status == session.SubagentStatusInterrupted
 }
 
 // restoreInterruptedSubagents brings every manifest child that was

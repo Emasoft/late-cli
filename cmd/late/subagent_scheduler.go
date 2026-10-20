@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -382,6 +383,41 @@ func (s *SubagentScheduler) LookupRunning(id string) (common.Orchestrator, bool)
 	defer s.mu.Unlock()
 	child, ok := s.liveChildren[id]
 	return child, ok
+}
+
+// interruptibleChildren returns the child IDs whose work this process is
+// shepherding and that an abrupt exit would orphan: live running entries
+// (running and liveChildren — the same registry, keyed identically) plus
+// queued entries whose launch never happened. The exit-time signal flush
+// uses it to stamp every orphanable child "interrupted" in the manifest.
+func (s *SubagentScheduler) interruptibleChildren() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]bool)
+	var ids []string
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for id := range s.running {
+		add(id)
+	}
+	for id := range s.liveChildren {
+		add(id)
+	}
+	for _, entry := range s.serialQueue {
+		add(entry.id)
+	}
+	for _, entry := range s.parallelQueue {
+		add(entry.id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // FreezeRequested reports — and consumes — the freeze marker for id. The

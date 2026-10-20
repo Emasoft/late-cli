@@ -30,12 +30,20 @@ import (
 //     paths accept running, queued, and frozen alike for compatibility
 //     with manifests written before the field existed.
 const (
-	SubagentStatusRunning   = "running"
-	SubagentStatusQueued    = "queued"
-	SubagentStatusFrozen    = "frozen"
-	SubagentStatusCompleted = "completed"
-	SubagentStatusFailed    = "failed"
-	SubagentStatusCancelled = "cancelled"
+	SubagentStatusRunning = "running"
+	SubagentStatusQueued  = "queued"
+	SubagentStatusFrozen  = "frozen"
+	// SubagentStatusInterrupted is the best-effort exit-time stamp the late
+	// process writes itself when it receives SIGINT/SIGTERM (cmd/late
+	// signals.go): every live or queued child flips to interrupted so the
+	// NEXT process never reads these records as a live "running" idiom
+	// while nothing is alive. On the next resume the freeze synthesis
+	// normalizes interrupted to the canonical persisted interruption
+	// status (frozen), exactly like the running/queued-at-read idiom.
+	SubagentStatusInterrupted = "interrupted"
+	SubagentStatusCompleted   = "completed"
+	SubagentStatusFailed      = "failed"
+	SubagentStatusCancelled   = "cancelled"
 )
 
 // SubagentFrozenStatus is the model-facing status text a frozen child
